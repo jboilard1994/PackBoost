@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 
 template <typename T>
 __device__ __forceinline__ T butterfly_stage_xor(T val, int idx, int s) {

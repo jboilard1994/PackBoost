@@ -55,11 +55,11 @@ __global__ void _et_sample_1b(
 	}
 }
 
-void et_sample_1b(torch::Tensor X, // [bF, M] uint32
-		  torch::Tensor XS, // [nfeatsets, 32*M], uint32
-		  torch::Tensor Fsch, // [rounds, 32*nfeatsets], uint16
-		  int round
-		){
+torch::Tensor et_sample_1b(torch::Tensor X, // [bF, M] uint32
+          torch::Tensor XS, // [nfeatsets, 32*M], uint32
+          torch::Tensor Fsch, // [rounds, 32*nfeatsets], uint16
+          int round
+          ){
 	const int bF = (int)X.size(0), M = (int)X.size(1), nfeatsets = (int)XS.size(0);
 	const int strides = 256;
 	int stride = (int)((M + 32*strides - 1)/(32*strides));
@@ -74,7 +74,9 @@ void et_sample_1b(torch::Tensor X, // [bF, M] uint32
 			X.data_ptr<uint32_t>(),
 			XS.data_ptr<uint32_t>(),
 			Fsch.data_ptr<uint16_t>(),
-			F, M, nfeatsets, round,
+			bF, M, nfeatsets, round,
 			stride
 			);
+
+	return XS;
 }
