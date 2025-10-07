@@ -1,1 +1,0 @@
-Adhere to project.md
