@@ -27,12 +27,14 @@ __global__ void _et_sample_1b(
 	const uint32_t fr_lane = (uint32_t)Fsch[
         (size_t)round * (size_t)(32 * nfeatsets) + (size_t)32 * (size_t)f0 + (size_t)wi
     ];
+	__syncwarp();
 
 	for (int i = 0; i < stride; ++i) {
 		const int base_in = 32*(stride*bi + i); // first word-column in this tile
 		if (base_in >= M) continue;
 		const int i_in = base_in + wi; // this lane's word-column
 		const int K = min(32, M - base_in);
+		__syncwarp();
 		const unsigned mask = __activemask();
 
 		uint32_t T[32]; // T[k] = X[Fs[f0, k], base + wi]
