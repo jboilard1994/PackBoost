@@ -32,7 +32,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         weights = weights.view(1, 1, 32, 1)
 
         words = (bitplanes * weights).sum(dim=2, dtype=torch.int64).to(torch.uint32)    # [F, M, 4]
-        XB = words.permute(0, 2, 1).reshape(4 * F, M).contiguous()                       # [4F, M]
+        XB = words.permute(0, 2, 1).contiguous().reshape(4 * F, M)                       # [4F, M]
         return XB
 
 
