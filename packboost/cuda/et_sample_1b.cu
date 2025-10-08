@@ -77,23 +77,20 @@ extern "C" __global__ void _et_sample_1b_butterfly(
 
     if (f0 >= nfeatsets || blockDim.x != 32 || lane >= 32) return;
 
-    // Stage 32 feature-row indices for this feature-set into shared
-    const unsigned mask = __ballot_sync(__activemask(), true);               // all lanes participate in shuffles
+    const unsigned mask = __ballot_sync(__activemask(), true);
 
     __shared__ uint16_t fs[32];
     fs[lane] = Fsch[(size_t)round * (size_t)(32 * nfeatsets) + (size_t)(32 * f0 + lane)];
     __syncwarp();
 
-    const size_t rowstride = (size_t)32 * (size_t)M; // XS stride per feature-set
+    const size_t rowstride = (size_t)32 * (size_t)M;
 
-    // Iterate over 'stride' tiles of width 32 columns each
     for (int i = 0; i < stride; ++i) {
-        const int base = 32 * (stride * bi + i);      // first column in this tile
-        if (base >= M) continue;                         // warp-uniform tail guard
+        const int base = 32 * (stride * bi + i);      
+        if (base >= M) continue;                         
         const int  col_in = base + lane;
         const bool col_ok = (col_in < M);
 
-        // 1) Build register tile (column-major per lane), coalesced loads per k
         uint32_t T[32];
         #pragma unroll
         for (int k = 0; k < 32; ++k) {
@@ -111,13 +108,10 @@ extern "C" __global__ void _et_sample_1b_butterfly(
             const int ofs = 1 << s;
 
             uint32_t U[32];
-            #pragma unroll
             for (int i = 0; i < 32; ++i) U[i] = T[i];
-
-            #pragma unroll
             for (int i = 0; i < 32; ++i) {
                 // Bring the value from the *partner lane* at the *partner index*.
-                const uint32_t partner = __shfl_xor_sync(mask, T[i ^ ofs], ofs, 32);
+                const uint32_t partner = __shfl_xor_sync(mask, U[i ^ ofs], ofs, 32);
                 T[i] = (((lane ^ i) & ofs) ? partner : U[i]);
             }
         }
