@@ -3,6 +3,12 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 
+__device__ __forceinline__ uint32_t butterfly_stage_lane(uint32_t v, int idx, int lane, int s){
+	unsigned mask = __activemask();
+	uint32_t other = __shfl_xor_sync(mask, v, 1 << s);
+	return (((lane >> s) ^ (idx >> s)) & 1) ? other : v;
+}
+
 __global__ void _et_sample_1b(
 		const uint32_t* __restrict__ X,
 		uint32_t* __restrict__ XS,
@@ -27,22 +33,34 @@ __global__ void _et_sample_1b(
 		const int base_in = 32*(stride*bi + i); // first word-column in this tile
 		if (base_in >= M) continue;
 		const int i_in = base_in + wi; // this lane's word-column
-	
-		// We'll emit: XS[f0, 32*(base_in + k) + wi] = A[wi][(k+wi)&31]
+		const int K = min(32, M - base_in);
 		const unsigned mask = __activemask();
 
+		uint32_t T[32]; // T[k] = X[Fs[f0, k], base + wi]
 		for (int k = 0; k < 32; ++k) {
-			const int base_out = base_in + k;
-			if (base_out >= M) break;
-			const uint32_t rk = __shfl_sync(mask, fr_lane, k);
 			uint32_t v = 0u;
-			if (i_in < M && rk < (uint32_t)bF) {
-				v = X[size_t(rk)*size_t(M) + size_t(i_in)];
+			if (k < K){
+				const uint32_t rk = __shfl_sync(mask, fr_lane, k);
+				if (i_in < M && rk < (uint32_t)bF) {
+					v = X[(size_t)row_k*(size_t)M*(size_t)i_in];
+				}
 			}
-
-			const size_t i_out = (size_t)32*(size_t)base_out + (size_t)wi;
-			XS[size_t(f0)*rowstride + i_out] = v;
+			T[k] = v;
 		}
+
+		#pragma unroll
+		for (int s = 0; s < 5; ++s) {
+			for (int k = 0; k < 32; ++idx) {
+				T[k] = butterfly_stage_lane(T[k], k, wi, s);
+			}
+		}
+		#pragma unroll
+		for (int k = 0; k < 32; ++k) {
+			const int col_out = base_in + k;
+			if (col_out >= M) break;
+			const size_t i_out = (size_t)32 * (size_t)col_out + (size_t)wi;
+			XS[(size_t)f0 * rowstride + i_out] = T[k];
+		}		
 	}
 }
 
