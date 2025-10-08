@@ -14,8 +14,8 @@ def test_encode_cuts_matches_cpu_reference():
     pack_gpu = PackBoost(device="cuda")
 
     torch.manual_seed(0)
-    N, F = 123, 17  # deliberately not multiples of 32 to exercise padding
-    X_cpu = torch.randint(-8, 8, (N, F), dtype=torch.int8)
+    N, F = 2_700_000, 2376  # deliberately not multiples of 32 to exercise padding
+    X_cpu = torch.randint(0, 5, (N, F), dtype=torch.int8)
 
     ref = pack_cpu.encode_cuts(X_cpu)
     result = pack_gpu.encode_cuts(X_cpu.to("cuda"))
@@ -27,7 +27,7 @@ def test_encode_cuts_matches_cpu_reference():
 def test_et_sample_1b_matches_cpu_reference():
     pack_cpu = PackBoost(device="cpu")
     pack_gpu = PackBoost(device="cuda")
-    pack_cpu.nfeatsets = pack_gpu.nfeatsets = 4
+    pack_cpu.nfeatsets = pack_gpu.nfeatsets = 32
 
     torch.manual_seed(1)
     bF, M, rounds = 19, 7, 3
