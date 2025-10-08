@@ -50,7 +50,7 @@ __global__ void _et_sample_1b(
 
 		#pragma unroll
 		for (int s = 0; s < 5; ++s) {
-			for (int k = 0; k < 32; ++idx) {
+			for (int k = 0; k < 32; ++k) {
 				T[k] = butterfly_stage_lane(T[k], k, wi, s);
 			}
 		}
