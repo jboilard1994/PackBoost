@@ -88,7 +88,7 @@ extern "C" __global__ void _et_sample_1b_butterfly(
     // Iterate over 'stride' tiles of width 32 columns each
     for (int i = 0; i < stride; ++i) {
         const int base = 32 * (stride * bi + i);      // first column in this tile
-        if (base/32 >= M) break;                         // warp-uniform tail guard
+        if (base >= M) break;                         // warp-uniform tail guard
         const int  K      = (M - base >= 32) ? 32 : (M - base); // valid cols in tile
         const int  col_in = base + lane;
         const bool col_ok = (col_in < M);
@@ -96,9 +96,9 @@ extern "C" __global__ void _et_sample_1b_butterfly(
         // 1) Build register tile (column-major per lane), coalesced loads per k
         uint32_t T[32];
         #pragma unroll
-        for (int k = 0; k < K; ++k) {
+        for (int k = 0; k < 32; ++k) {
             uint32_t v = 0u;
-            if (col_ok && k < K) {
+            if (col_ok) {
                 const uint32_t row_k = (uint32_t)fs[k];
                 if (row_k < (uint32_t)bF) {
                     v = X[(size_t)row_k * (size_t)M + (size_t)col_in];
@@ -114,10 +114,10 @@ extern "C" __global__ void _et_sample_1b_butterfly(
 
             uint32_t U[32];
             #pragma unroll
-            for (int i = 0; i < K; ++i) U[i] = T[i];
+            for (int i = 0; i < 32; ++i) U[i] = T[i];
 
             #pragma unroll
-            for (int i = 0; i < K; ++i) {
+            for (int i = 0; i < 32; ++i) {
                 // Bring the value from the *partner lane* at the *partner index*.
                 const uint32_t partner = __shfl_xor_sync(mask, U[i ^ ofs], ofs, K);
 
@@ -130,8 +130,8 @@ extern "C" __global__ void _et_sample_1b_butterfly(
         // 3) Coalesced store of K columns (row == lane after transpose)
         const size_t base_out = (size_t)32 * (size_t)base;
         #pragma unroll
-        for (int k = 0; k < K; ++k) {
-            XS[(size_t)f0 * rowstride + (base_out + (size_t)(K * k + lane))] = T[k];
+        for (int k = 0; k < 32; ++k) {
+            XS[(size_t)f0 * rowstride + (base_out + (size_t)(32 * k + lane))] = T[k];
         }
     }
 }
