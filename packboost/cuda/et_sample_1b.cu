@@ -33,17 +33,14 @@ __global__ void _et_sample_1b(
 		const int base_in = 32*(stride*bi + i); // first word-column in this tile
 		if (base_in >= M) continue;
 		const int i_in = base_in + wi; // this lane's word-column
-		const int K = min(32, M - base_in);
 		const unsigned mask = 0xFFFFFFFFu; //__activemask();
 
 		uint32_t T[32]; // T[k] = X[Fs[f0, k], base + wi]
 		for (int k = 0; k < 32; ++k) {
 			uint32_t v = 0u;
-			if (k < K){
-				const uint32_t rk = __shfl_sync(mask, fr_lane, k);
-				if (i_in < M && rk < (uint32_t)bF) {
+			const uint32_t rk = __shfl_sync(mask, fr_lane, k);
+			if (i_in < M && rk < (uint32_t)bF) {
 					v = X[(size_t)rk*(size_t)M+(size_t)i_in];
-				}
 			}
 			T[k] = v;
 		}
