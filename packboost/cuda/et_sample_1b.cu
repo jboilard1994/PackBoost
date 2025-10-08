@@ -108,6 +108,8 @@ extern "C" __global__ void _et_sample_1b_butterfly(
         }
 
         // 2) Transpose 32×32 in registers via butterfly
+        uint32_t U[32];
+        for (int i = 0; i < 32; ++i) U[i] = T[i];
         #pragma unroll
         for (int s = 0; s < 5; ++s) {
             const int ofs = 1 << s;
