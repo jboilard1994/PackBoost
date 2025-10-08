@@ -132,7 +132,9 @@ extern "C" __global__ void _et_sample_1b_butterfly(
         const size_t base_out = (size_t)32 * (size_t)base;
         #pragma unroll
         for (int k = 0; k < 32; ++k) {
-            XS[(size_t)f0 * rowstride + (base_out + (size_t)(32 * k + lane))] = T[k];
+            if (base + k < M) {
+                XS[(size_t)f0 * rowstride + (base_out + (size_t)(32 * k + lane))] = T[k];
+            }
         }
     }
 }
