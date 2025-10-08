@@ -64,9 +64,9 @@ __global__ void _et_sample_1b_sm(
 }
 
 __global__ void _et_sample_1b_gather(
-    const uint32_t* __restrict__ X,
-    uint32_t* __restrict__ XS,
-    const uint16_t* __restrict__ Fsch,
+    const uint32_t* __restrict__ X,        // [bF, M]
+    uint32_t* __restrict__ XS,             // [nfeatsets, 32*M]
+    const uint16_t* __restrict__ Fsch,     // [rounds, 32*nfeatsets]
     int bF, int M, int nfeatsets, int round,
     int stride)
 {
@@ -76,48 +76,39 @@ __global__ void _et_sample_1b_gather(
 
     if (f0 >= nfeatsets || blockDim.x != 32 || lane >= 32) return;
 
-    const unsigned mask = __ballot_sync(0xFFFFFFFFu, true);
-
+    // Stage 32 feature indices for this feature-set into shared (readable by all lanes)
+    const unsigned mask = __ballot_sync(0xFFFFFFFFu, true);            // all lanes participate in shuffles
+    __syncwarp();
     __shared__ uint16_t fs[32];
     fs[lane] = Fsch[(size_t)round * (size_t)(32 * nfeatsets) + (size_t)(32 * f0 + lane)];
     __syncwarp();
 
-
     const size_t rowstride = (size_t)32 * (size_t)M; // XS stride per feature-set row
 
+    // Iterate over 'stride' tiles of width 32 columns each
     for (int i = 0; i < stride; ++i) {
-        const int base_in = 32 * (stride * bi + i);  // first column of this tile
-        if (base_in >= M) continue;                  // whole tile is out of range
+        const int base_in = 32 * (stride * bi + i);   // first column of this tile
+        if (base_in >= M) continue;                   // tile entirely OOB
 
-        const int col_in = base_in + lane;           // this lane's column within the tile
-        const bool col_ok = (col_in < M);
+        const int  col_in = base_in + lane;           // this lane's column within the tile
+        const int  K      = min(32, M - base_in);     // valid columns in this tile
+        
 
-        // 1) Compute this lane's row value v_row = X[ Fs[f0,lane], base + lane ]
-        //    using coalesced loads across r=0..31. Only keep the value when r == lane.
+        // 1) Single scattered load per lane (guarded)
         uint32_t v_row = 0u;
-        //#pragma unroll
-        for (int r = 0; r < 32; ++r) {
-            uint32_t v = 0u;
-            const uint32_t fr = (uint32_t)fs[r];
-            if (col_ok && fr < (uint32_t)bF) {
-                v = X[(size_t)fr * (size_t)M + (size_t)col_in];
-            }
-            if (r == lane) v_row = v;  // latch my row's value for my column
+        const uint32_t fr_lane = (uint32_t)fs[lane];
+        if (col_in < M && fr_lane < (uint32_t)bF) {
+            v_row = X[(size_t)fr_lane * (size_t)M + (size_t)col_in];
         }
 
-        // 2) Emit columns via direct-gather across lanes (one shuffle per output col)
+        // 2) Emit K columns by pulling from source lane k (coalesced stores)
         const size_t base_out = (size_t)32 * (size_t)base_in;
-        //#pragma unroll
-        for (int k = 0; k < 32; ++k) {
-            const int col_out = base_in + k;
-            //if (col_out >= M) break;
-            // Pull my-row value from source lane == k
-            const uint32_t emit = __shfl_sync(mask, v_row, k);
+        #pragma unroll
+        for (int k = 0; k < K; ++k) {
+            const uint32_t emit = __shfl_sync(mask, v_row, k, 32);
             XS[(size_t)f0 * rowstride + (base_out + (size_t)(32 * k + lane))] = emit;
         }
-        __syncthreads();
     }
-
 }
 // Host launcher — signature unchanged
 
