@@ -64,7 +64,7 @@ __global__ void _et_sample_1b_sm(
 }
 
 
-extern "C" __global__ void _et_sample_1b_butterfly(
+__global__ void _et_sample_1b_butterfly(
     const uint32_t* __restrict__ X,        // [bF, M]
     uint32_t* __restrict__ XS,             // [nfeatsets, 32*M]
     const uint16_t* __restrict__ Fsch,     // [rounds, 32*nfeatsets]
@@ -89,20 +89,19 @@ extern "C" __global__ void _et_sample_1b_butterfly(
         const int base = 32 * (stride * bi + i);      
         if (base >= M) continue;                         
         const int  col_in = base + lane;
-        const bool col_ok = (col_in < M);
 
         uint32_t T[32];
         #pragma unroll
         for (int k = 0; k < 32; ++k) {
             uint32_t v = 0u;
             const uint32_t row_k = (uint32_t)fs[k];
-            if (col_ok && row_k < (uint32_t)bF) {
+            if (col_in < M && row_k < (uint32_t)bF) {
                 v = X[(size_t)row_k * (size_t)M + (size_t)col_in];
             }
             T[k] = v;
         }
 
-        // 2) Transpose 32×32 in registers via butterfly
+        // Transpose 32×32 in registers via butterfly
         #pragma unroll
         for (int s = 0; s < 5; ++s) {              // s = 0..4  (ofs = 1,2,4,8,16)
             const int ofs = 1 << s;
@@ -110,15 +109,12 @@ extern "C" __global__ void _et_sample_1b_butterfly(
             uint32_t U[32];
             for (int i = 0; i < 32; ++i) U[i] = T[i];
             for (int i = 0; i < 32; ++i) {
-                // Bring the value from the *partner lane* at the *partner index*.
                 const uint32_t partner = __shfl_xor_sync(mask, U[i ^ ofs], ofs, 32);
                 T[i] = (((lane ^ i) & ofs) ? partner : U[i]);
             }
         }
 
-        // 3) Coalesced store of K columns (row == lane after transpose)
         const size_t base_out = (size_t)32 * (size_t)base;
-        #pragma unroll
         for (int k = 0; k < 32; ++k) {
             if (base + k < M) {
                 XS[(size_t)f0 * rowstride + (base_out + (size_t)(32 * k + lane))] = T[k];
