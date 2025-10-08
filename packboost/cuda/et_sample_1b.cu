@@ -76,9 +76,12 @@ __global__ void _et_sample_1b_gather(
 
     if (f0 >= nfeatsets || blockDim.x != 32 || lane >= 32) return;
 
+    const unsigned mask = __ballot_sync(0xFFFFFFFFu, true);
+
     __shared__ uint16_t fs[32];
     fs[lane] = Fsch[(size_t)round * (size_t)(32 * nfeatsets) + (size_t)(32 * f0 + lane)];
     __syncwarp();
+
 
     const size_t rowstride = (size_t)32 * (size_t)M; // XS stride per feature-set row
 
@@ -88,9 +91,6 @@ __global__ void _et_sample_1b_gather(
 
         const int col_in = base_in + lane;           // this lane's column within the tile
         const bool col_ok = (col_in < M);
-
-        // Freeze a stable mask for the entire tile; lanes with invalid column still participate
-        const unsigned mask = __ballot_sync(0xFFFFFFFFu, col_ok);
 
         // 1) Compute this lane's row value v_row = X[ Fs[f0,lane], base + lane ]
         //    using coalesced loads across r=0..31. Only keep the value when r == lane.
