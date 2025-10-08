@@ -42,13 +42,13 @@ __global__ void _et_sample_1b(
 			if (k < K){
 				const uint32_t rk = __shfl_sync(mask, fr_lane, k);
 				if (i_in < M && rk < (uint32_t)bF) {
-					v = X[(size_t)rk*(size_t)M*(size_t)i_in];
+					v = X[(size_t)rk*(size_t)M+(size_t)i_in];
 				}
 			}
 			T[k] = v;
 		}
 
-		/*
+		
 
 		#pragma unroll
 		for (int s = 0; s < 5; ++s) {
@@ -56,7 +56,7 @@ __global__ void _et_sample_1b(
 				T[k] = butterfly_stage_lane(T[k], k, wi, s);
 			}
 		}
-			*/
+			
 		#pragma unroll
 		for (int k = 0; k < 32; ++k) {
 			const int col_out = base_in + k;
