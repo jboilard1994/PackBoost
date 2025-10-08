@@ -52,12 +52,13 @@ __global__ void _et_sample_1b(
 
 		#pragma unroll
 		for (int s = 0; s < 5; ++s) {
+			uint32_t U[32];
+			for (int k = 0; k < 32; ++k) U[k] = T[k];
 			for (int k = 0; k < 32; ++k) {
-				T[k] = butterfly_stage_lane(T[k], k, wi, s);
+				T[k] = butterfly_stage_lane(U[k], k, wi, s);
 			}
 		}
 			
-		#pragma unroll
 		for (int k = 0; k < 32; ++k) {
 			const int col_out = base_in + k;
 			if (col_out >= M) break;
