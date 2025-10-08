@@ -63,11 +63,6 @@ __global__ void _et_sample_1b_sm(
     }
 }
 
-__device__ __forceinline__ void warp_transpose32(uint32_t A[32], int lane, unsigned mask) {
-    // We’ll ping-pong through a snapshot U each stage to avoid RAW hazards.
-    
-}
-
 
 extern "C" __global__ void _et_sample_1b_butterfly(
     const uint32_t* __restrict__ X,        // [bF, M]
@@ -119,7 +114,7 @@ extern "C" __global__ void _et_sample_1b_butterfly(
 
             uint32_t U[K];
             #pragma unroll
-            for (int i = 0; i < K; ++i) U[i] = A[i];
+            for (int i = 0; i < K; ++i) U[i] = T[i];
 
             #pragma unroll
             for (int i = 0; i < K; ++i) {
@@ -128,7 +123,7 @@ extern "C" __global__ void _et_sample_1b_butterfly(
 
                 // Decide ownership by the s-th bit of (lane XOR index).
                 // If that bit is 1, this element belongs in the "other half".
-                A[i] = (((lane ^ i) & ofs) ? partner : U[i]);
+                T[i] = (((lane ^ i) & ofs) ? partner : U[i]);
             }
         }
 
