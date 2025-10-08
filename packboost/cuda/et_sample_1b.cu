@@ -34,8 +34,7 @@ __global__ void _et_sample_1b(
 		if (base_in >= M) continue;
 		const int i_in = base_in + wi; // this lane's word-column
 		const int K = min(32, M - base_in);
-		__syncwarp();
-		const unsigned mask = __activemask();
+		const unsigned mask = 0xFFFFFFFFu; //__activemask();
 
 		uint32_t T[32]; // T[k] = X[Fs[f0, k], base + wi]
 		for (int k = 0; k < 32; ++k) {
@@ -49,23 +48,20 @@ __global__ void _et_sample_1b(
 			T[k] = v;
 		}
 
-		
-
-		#pragma unroll
+		//#pragma unroll
 		for (int s = 0; s < 5; ++s) {
-			uint32_t U[32];
-			for (int k = 0; k < 32; ++k) U[k] = T[k];
 			for (int k = 0; k < 32; ++k) {
-				T[k] = butterfly_stage_lane(U[k], k, wi, s, mask);
+				T[k] = butterfly_stage_lane(T[k], k, wi, s, mask);
 			}
 		}
 			
 		for (int k = 0; k < 32; ++k) {
 			const int col_out = base_in + k;
-			if (col_out >= M) break;
-			const size_t i_out = (size_t)32 * (size_t)col_out + (size_t)wi;
-			XS[(size_t)f0 * rowstride + i_out] = T[k];
-		}		
+			if (col_out < M) {
+				const size_t i_out = (size_t)32 * (size_t)col_out + (size_t)wi;
+				XS[(size_t)f0 * rowstride + i_out] = T[k];
+			}		
+		}
 	}
 }
 
