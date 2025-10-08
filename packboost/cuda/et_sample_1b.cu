@@ -90,7 +90,6 @@ extern "C" __global__ void _et_sample_1b_butterfly(
     for (int i = 0; i < stride; ++i) {
         const int base = 32 * (stride * bi + i);      // first column in this tile
         if (base >= M) continue;                         // warp-uniform tail guard
-        const int  K      = (M - base >= 32) ? 32 : (M - base); // valid cols in tile
         const int  col_in = base + lane;
         const bool col_ok = (col_in < M);
 
@@ -99,11 +98,9 @@ extern "C" __global__ void _et_sample_1b_butterfly(
         #pragma unroll
         for (int k = 0; k < 32; ++k) {
             uint32_t v = 0u;
-            if (col_ok) {
-                const uint32_t row_k = (uint32_t)fs[k];
-                if (row_k < (uint32_t)bF) {
-                    v = X[(size_t)row_k * (size_t)M + (size_t)col_in];
-                }
+            const uint32_t row_k = (uint32_t)fs[k];
+            if (col_ok && row_k < (uint32_t)bF) {
+                v = X[(size_t)row_k * (size_t)M + (size_t)col_in];
             }
             T[k] = v;
         }
@@ -120,10 +117,7 @@ extern "C" __global__ void _et_sample_1b_butterfly(
             #pragma unroll
             for (int i = 0; i < 32; ++i) {
                 // Bring the value from the *partner lane* at the *partner index*.
-                const uint32_t partner = __shfl_xor_sync(mask, U[i ^ ofs], ofs, 32);
-
-                // Decide ownership by the s-th bit of (lane XOR index).
-                // If that bit is 1, this element belongs in the "other half".
+                const uint32_t partner = __shfl_xor_sync(mask, T[i ^ ofs], ofs, 32);
                 T[i] = (((lane ^ i) & ofs) ? partner : U[i]);
             }
         }
