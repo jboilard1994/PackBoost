@@ -78,7 +78,7 @@ extern "C" __global__ void _et_sample_1b_butterfly(
     if (f0 >= nfeatsets || blockDim.x != 32 || lane >= 32) return;
 
     // Stage 32 feature-row indices for this feature-set into shared
-    const unsigned mask = __activemask();               // all lanes participate in shuffles
+    const unsigned mask = __ballot_sync(__activemask(), true);               // all lanes participate in shuffles
 
     __shared__ uint16_t fs[32];
     fs[lane] = Fsch[(size_t)round * (size_t)(32 * nfeatsets) + (size_t)(32 * f0 + lane)];
