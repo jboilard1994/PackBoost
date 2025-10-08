@@ -78,17 +78,18 @@ extern "C" __global__ void _et_sample_1b_butterfly(
     if (f0 >= nfeatsets || blockDim.x != 32 || lane >= 32) return;
 
     // Stage 32 feature-row indices for this feature-set into shared
+    const unsigned mask = __activemask();               // all lanes participate in shuffles
+
     __shared__ uint16_t fs[32];
     fs[lane] = Fsch[(size_t)round * (size_t)(32 * nfeatsets) + (size_t)(32 * f0 + lane)];
     __syncwarp();
 
     const size_t rowstride = (size_t)32 * (size_t)M; // XS stride per feature-set
-    const unsigned mask = 0xFFFFFFFFu;               // all lanes participate in shuffles
 
     // Iterate over 'stride' tiles of width 32 columns each
     for (int i = 0; i < stride; ++i) {
         const int base = 32 * (stride * bi + i);      // first column in this tile
-        if (base >= M) break;                         // warp-uniform tail guard
+        if (base >= M) continue;                         // warp-uniform tail guard
         const int  K      = (M - base >= 32) ? 32 : (M - base); // valid cols in tile
         const int  col_in = base + lane;
         const bool col_ok = (col_in < M);
@@ -109,7 +110,7 @@ extern "C" __global__ void _et_sample_1b_butterfly(
 
         // 2) Transpose 32×32 in registers via butterfly
         #pragma unroll
-        for (int s = 0; s < 6; ++s) {              // s = 0..4  (ofs = 1,2,4,8,16)
+        for (int s = 0; s < 5; ++s) {              // s = 0..4  (ofs = 1,2,4,8,16)
             const int ofs = 1 << s;
 
             uint32_t U[32];
