@@ -88,7 +88,7 @@ extern "C" __global__ void _et_sample_1b_butterfly(
     // Iterate over 'stride' tiles of width 32 columns each
     for (int i = 0; i < stride; ++i) {
         const int base = 32 * (stride * bi + i);      // first column in this tile
-        if (base >= M) continue;                         // warp-uniform tail guard
+        if (base/32 >= M) continue;                         // warp-uniform tail guard
         const int  K      = (M - base >= 32) ? 32 : (M - base); // valid cols in tile
         const int  col_in = base + lane;
         const bool col_ok = (col_in < M);
