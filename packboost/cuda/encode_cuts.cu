@@ -3,77 +3,99 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 
-// Shapes (internal):
-//   dX  : [F, N] int8     (we transpose at the API boundary)
-//   dXB : [4*F, M] uint32, where M = ceil_div(N, 32)
-// Spec per feature f and word w (32 samples per word):
-//   bit k in XB[4*f + t, w] is 1 iff  (uint8)dX[f, 32*w + k] > t,  for t in {0,1,2,3}.
+// Murky-accurate encode_cuts with shared-memory rotate, strides fixed at 64.
+// Shapes:
+//   API X: [N, F] int8
+//   Internal dX: [F, N] int8 (after transpose)
+//   Output dXB: [4*F, M] uint32, where M = ceil_div(N, 32)
+// Mapping:
+//   For feature f and word w (covering samples i=32*w..32*w+31),
+//   bit k in XB[4*f + t, w] = 1  iff  (uint8)X[f, 32*w + k] > t,  t∈{0,1,2,3}.
 
-__global__ void _encode_cuts_ballot(const int8_t* __restrict__ X, // [F,N]
-                                    uint32_t* __restrict__ XB,    // [4*F,M]
-                                    int F, int N, int tiles_per_block)
+__global__ void _encode_cuts(
+    const int8_t* __restrict__ X,  // [F, N]
+    uint32_t* __restrict__ XB,     // [4*F, M]
+    int F, int N, int stride)      // stride = ceil(N / (32*32*strides))
 {
-    const int f    = blockIdx.x;            // feature index
-    const int tb   = blockIdx.y;            // tile block along words
-    const int lane = threadIdx.x;           // 0..31
-    if (f >= F || lane >= 32) return;
+    const int f  = blockIdx.x;       // feature index
+    const int bi = blockIdx.y;       // tile block along N (words grouped by 32)
+    const int wi = threadIdx.x;      // lane 0..31
 
-    const int M = (N + 31) >> 5;            // words (ceil_div)
-    const unsigned FULL = 0xFFFFFFFFu;      // all 32 lanes active
+    if (f >= F || wi >= 32 || blockDim.x != 32) return;
 
-    const int tile_base = tb * tiles_per_block; // starting word for this block.y
+    // Shared memory tile and rotate, as in Murky
+    __shared__ uint32_t sm[32][32];  // tile[row, col]
 
-    #pragma unroll
-    for (int t = 0; t < tiles_per_block; ++t) {
-        const int w = tile_base + t;        // word index
-        if (w >= M) break;
+    // Each block.y iterates over 'stride' tiles
+    for (int i = 0; i < stride; ++i) {
+        // Input/sample side indexing
+        // i_in is the base column within the 32x32 tile for this lane
+        const int i_in  = 32*32*stride*bi + 32*32*i + wi;   // sample-column base for this lane
+        const int i_out =    32*stride*bi +    32*i + wi;   // output word index for this lane
 
-        const int i = (w << 5) + lane;      // sample index = 32*w + lane
+        // Accumulators for 4 bit-planes
+        uint32_t v0 = 0u, v1 = 0u, v2 = 0u, v3 = 0u;
 
-        // Load sample as uint8 for logical comparisons
-        uint32_t v = 0u;
-        if (i < N) {
-            v = (uint32_t)(uint8_t)X[(size_t)f * (size_t)N + (size_t)i];
+        // 1) Load a 32x32 tile into shared with rotated column index (k+wi)%32
+        //    Source: X[f, 32*k + i_in] if in range, else 0
+        #pragma unroll
+        for (int k = 0; k < 32; ++k) {
+            const int col = 32*k + i_in;
+            uint32_t v = 0u;
+            if (col < N) {
+                const size_t idx = (size_t)f * (size_t)N + (size_t)col;
+                v = (uint32_t)(uint8_t)X[idx]; // unsigned semantics
+            }
+            sm[wi][(k + wi) & 31] = v;
+        }
+        __syncwarp();
+
+        // 2) Read back rotated to realize the 32x32 transpose logic
+        #pragma unroll
+        for (int k = 0; k < 32; ++k) {
+            const uint32_t v = sm[k][(k + wi) & 31];
+            v0 |= ((v > 0u) ? 1u : 0u) << k;
+            v1 |= ((v > 1u) ? 1u : 0u) << k;
+            v2 |= ((v > 2u) ? 1u : 0u) << k;
+            v3 |= ((v > 3u) ? 1u : 0u) << k;
         }
 
-        // Four bit-planes via warp ballots
-        uint32_t m0 = __ballot_sync(FULL, v > 0u);
-        uint32_t m1 = __ballot_sync(FULL, v > 1u);
-        uint32_t m2 = __ballot_sync(FULL, v > 2u);
-        uint32_t m3 = __ballot_sync(FULL, v > 3u);
-
-        // Store once per word; any single lane can do it (use lane 0)
-        if (lane == 0) {
-            const size_t base = (size_t)4 * (size_t)f * (size_t)M + (size_t)w;
-            XB[base + 0*(size_t)M] = m0;
-            XB[base + 1*(size_t)M] = m1;
-            XB[base + 2*(size_t)M] = m2;
-            XB[base + 3*(size_t)M] = m3;
+        // 3) Store the four bit-planes for this feature/word (guard tail)
+        if (i_out < ( (N + 31) >> 5 )) { // M = ceil_div(N,32)
+            const size_t M = (size_t)((N + 31) >> 5);
+            const size_t base = (size_t)4 * (size_t)f * M + (size_t)i_out;
+            XB[base + 0*M] = v0;
+            XB[base + 1*M] = v1;
+            XB[base + 2*M] = v2;
+            XB[base + 3*M] = v3;
         }
+        __syncwarp();
     }
 }
 
-// Host launcher: transpose X to [F,N], compute tiling along words, and launch.
+// Host API: transpose X to [F,N], set strides=64, compute stride exactly like Murky, and launch.
 
 torch::Tensor encode_cuts(torch::Tensor X /* [N,F] int8 */) {
-    // Internal layout: [F,N]
+    // Internal layout matches Murky: work on [F,N]
     auto dX = X.transpose(0, 1).contiguous();
     const int F = (int)dX.size(0);
     const int N = (int)dX.size(1);
     const int M = (N + 31) >> 5;  // words
 
-    auto dXB = torch::empty({(long long)4*F, (long long)M}, dX.options().dtype(torch::kUInt32));
+    auto dXB = torch::empty({ (long long)4 * F, (long long)M },
+                             dX.options().dtype(torch::kUInt32));
 
-    // Tile policy along words (no hard-coded 64/256)
-    int tiles  = (M + 31) / 32;                    // 32 words per block.y step
-    int by     = tiles > 0 ? min(tiles, 256) : 1;  // grid.y
-    int stride = tiles > 0 ? (tiles + by - 1) / by : 1; // tiles_per_block
+    // Keep strides fixed at 64 (as requested)
+    const int strides = 64;                   // grid.y
+    // Murky's stride: ceil( N / (32^2 * strides) )
+    int stride = (N + (32*32*strides) - 1) / (32*32*strides);
+    if (stride < 1) stride = 1;
 
+    dim3 grid(F, strides, 1);
     dim3 block(32, 1, 1);
-    dim3 grid(F, by, 1);
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    _encode_cuts_ballot<<<grid, block, 0, stream.stream()>>>(
+    _encode_cuts<<<grid, block, 0, stream.stream()>>>(
         dX.data_ptr<int8_t>(), dXB.data_ptr<uint32_t>(), F, N, stride);
 
     return dXB;
