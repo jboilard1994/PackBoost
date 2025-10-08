@@ -31,7 +31,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         weights = (1 << torch.arange(32, dtype=torch.int64, device=X.device)).to(torch.uint32)  # [32]
         weights = weights.view(1, 1, 32, 1)
 
-        words = (bitplanes * weights).sum(dim=2, dtype=torch.uint64).to(torch.uint32)    # [F, M, 4]
+        words = (bitplanes * weights).sum(dim=2, dtype=torch.int64).to(torch.uint32)    # [F, M, 4]
         XB = words.permute(2, 0, 1).reshape(4 * F, M).contiguous()                       # [4F, M]
         return XB
 
@@ -43,6 +43,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
         M = X.shape[1]
         nfeatsets = self.nfeatsets
         Fs = Fsch[round].view(nfeatsets, 32).to(dtype=torch.long, device=X.device)
-        return X[Fs, :].transpose(1, 2).contiguous().view(nfeatsets, M*32)
+        return X.to(torch.int32)[Fs, :].transpose(1, 2).contiguous().view(nfeatsets, M*32).to(torch.uint32)
 
         
