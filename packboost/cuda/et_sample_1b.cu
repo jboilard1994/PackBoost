@@ -63,53 +63,79 @@ __global__ void _et_sample_1b_sm(
     }
 }
 
-__global__ void _et_sample_1b_gather(
+__device__ __forceinline__ void warp_transpose32(uint32_t A[32], int lane, unsigned mask){
+    uint32_t B[32];
+    #pragma unroll
+    for (int s = 0; s < 5; ++s) {
+        const int ofs = 1 << s; // 1,2,4,8,16
+        #pragma unroll
+        for (int idx = 0; idx < 32; ++idx) {
+            // Partner lane contributes its value from partner index (idx^ofs)
+            const uint32_t partner = __shfl_xor_sync(mask, A[idx ^ ofs], ofs, 32);
+            // Swap-on-bit: lanes with s-bit set take partner half; others keep theirs
+            B[idx] = ((lane >> s) & 1) ? partner : A[idx];
+        }
+        // Ping-pong
+        #pragma unroll
+        for (int idx = 0; idx < 32; ++idx) A[idx] = B[idx];
+    }
+}
+
+extern "C" __global__ void _et_sample_1b_butterfly(
     const uint32_t* __restrict__ X,        // [bF, M]
     uint32_t* __restrict__ XS,             // [nfeatsets, 32*M]
     const uint16_t* __restrict__ Fsch,     // [rounds, 32*nfeatsets]
     int bF, int M, int nfeatsets, int round,
     int stride)
 {
-    const int f0   = blockIdx.x;     // feature-set index
-    const int bi   = blockIdx.y;     // tile group along columns
-    const int lane = threadIdx.x;    // warp lane 0..31
+    const int f0   = blockIdx.x;      // feature-set index (0..nfeatsets-1)
+    const int bi   = blockIdx.y;      // tile group along columns
+    const int lane = threadIdx.x;     // warp lane 0..31
 
     if (f0 >= nfeatsets || blockDim.x != 32 || lane >= 32) return;
 
-    // Stage 32 feature indices for this feature-set into shared (readable by all lanes)
-    const unsigned mask = __ballot_sync(0xFFFFFFFFu, true);            // all lanes participate in shuffles
-    __syncwarp();
+    // Stage 32 feature-row indices for this feature-set into shared
     __shared__ uint16_t fs[32];
     fs[lane] = Fsch[(size_t)round * (size_t)(32 * nfeatsets) + (size_t)(32 * f0 + lane)];
     __syncwarp();
 
-    const size_t rowstride = (size_t)32 * (size_t)M; // XS stride per feature-set row
+    const size_t rowstride = (size_t)32 * (size_t)M; // XS stride per feature-set
+    const unsigned mask = 0xFFFFFFFFu;               // all lanes participate in shuffles
 
     // Iterate over 'stride' tiles of width 32 columns each
     for (int i = 0; i < stride; ++i) {
-        const int base_in = 32 * (stride * bi + i);   // first column of this tile
-        if (base_in >= M) continue;                   // tile entirely OOB
+        const int base = 32 * (stride * bi + i);      // first column in this tile
+        if (base >= M) break;                         // warp-uniform tail guard
+        const int  K      = (M - base >= 32) ? 32 : (M - base); // valid cols in tile
+        const int  col_in = base + lane;
+        const bool col_ok = (col_in < M);
 
-        const int  col_in = base_in + lane;           // this lane's column within the tile
-        const int  K      = min(32, M - base_in);     // valid columns in this tile
-        
-
-        // 1) Single scattered load per lane (guarded)
-        uint32_t v_row = 0u;
-        const uint32_t fr_lane = (uint32_t)fs[lane];
-        if (col_in < M && fr_lane < (uint32_t)bF) {
-            v_row = X[(size_t)fr_lane * (size_t)M + (size_t)col_in];
+        // 1) Build register tile (column-major per lane), coalesced loads per k
+        uint32_t T[32];
+        #pragma unroll
+        for (int k = 0; k < 32; ++k) {
+            uint32_t v = 0u;
+            if (col_ok && k < K) {
+                const uint32_t row_k = (uint32_t)fs[k];
+                if (row_k < (uint32_t)bF) {
+                    v = X[(size_t)row_k * (size_t)M + (size_t)col_in];
+                }
+            }
+            T[k] = v;
         }
 
-        // 2) Emit K columns by pulling from source lane k (coalesced stores)
-        const size_t base_out = (size_t)32 * (size_t)base_in;
+        // 2) Transpose 32×32 in registers via butterfly
+        warp_transpose32(T, lane, mask);
+
+        // 3) Coalesced store of K columns (row == lane after transpose)
+        const size_t base_out = (size_t)32 * (size_t)base;
         #pragma unroll
         for (int k = 0; k < K; ++k) {
-            const uint32_t emit = __shfl_sync(mask, v_row, k, 32);
-            XS[(size_t)f0 * rowstride + (base_out + (size_t)(32 * k + lane))] = emit;
+            XS[(size_t)f0 * rowstride + (base_out + (size_t)(32 * k + lane))] = T[k];
         }
     }
 }
+
 // Host launcher — signature unchanged
 
 torch::Tensor et_sample_1b(torch::Tensor X,
@@ -129,7 +155,7 @@ torch::Tensor et_sample_1b(torch::Tensor X,
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    _et_sample_1b_gather<<<grid, block, 0, stream.stream()>>>(
+    _et_sample_1b_butterfly<<<grid, block, 0, stream.stream()>>>(
         X.data_ptr<uint32_t>(),
         XS.data_ptr<uint32_t>(),
         Fsch.data_ptr<uint16_t>(),
