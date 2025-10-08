@@ -11,7 +11,7 @@
 //   XS[f0, 32*(base + k) + wi] = X[ Fsch[round, 32*f0 + wi], base + k ]
 // Coalesced-read strategy + SMEM 32x32 rotate to coalesced-write.
 
-__global__ void _et_sample_1b(
+__global__ void _et_sample_1b_sm(
     const uint32_t* __restrict__ X,
     uint32_t* __restrict__ XS,
     const uint16_t* __restrict__ Fsch,
@@ -63,6 +63,61 @@ __global__ void _et_sample_1b(
     }
 }
 
+__global__ void _et_sample_1b_gather(
+    const uint32_t* __restrict__ X,
+    uint32_t* __restrict__ XS,
+    const uint16_t* __restrict__ Fsch,
+    int bF, int M, int nfeatsets, int round,
+    int stride)
+{
+    const int f0   = blockIdx.x;     // feature-set index
+    const int bi   = blockIdx.y;     // tile group along columns
+    const int lane = threadIdx.x;    // warp lane 0..31
+
+    if (f0 >= nfeatsets || blockDim.x != 32 || lane >= 32) return;
+
+    __shared__ uint16_t fs[32];
+    fs[lane] = Fsch[(size_t)round * (size_t)(32 * nfeatsets) + (size_t)(32 * f0 + lane)];
+    __syncwarp();
+
+    const size_t rowstride = (size_t)32 * (size_t)M; // XS stride per feature-set row
+
+    for (int i = 0; i < stride; ++i) {
+        const int base_in = 32 * (stride * bi + i);  // first column of this tile
+        if (base_in >= M) continue;                  // whole tile is out of range
+
+        const int col_in = base_in + lane;           // this lane's column within the tile
+        const bool col_ok = (col_in < M);
+
+        // Freeze a stable mask for the entire tile; lanes with invalid column still participate
+        const unsigned mask = __ballot_sync(0xFFFFFFFFu, col_ok);
+
+        // 1) Compute this lane's row value v_row = X[ Fs[f0,lane], base + lane ]
+        //    using coalesced loads across r=0..31. Only keep the value when r == lane.
+        uint32_t v_row = 0u;
+        #pragma unroll
+        for (int r = 0; r < 32; ++r) {
+            uint32_t v = 0u;
+            const uint32_t fr = (uint32_t)fs[r];
+            if (col_ok && fr < (uint32_t)bF) {
+                v = X[(size_t)fr * (size_t)M + (size_t)col_in];
+            }
+            if (r == lane) v_row = v;  // latch my row's value for my column
+        }
+
+        // 2) Emit columns via direct-gather across lanes (one shuffle per output col)
+        const size_t base_out = (size_t)32 * (size_t)base_in;
+        #pragma unroll
+        for (int k = 0; k < 32; ++k) {
+            const int col_out = base_in + k;
+            if (col_out >= M) break;
+            // Pull my-row value from source lane == k
+            const uint32_t emit = __shfl_sync(mask, v_row, k, 32);
+            XS[(size_t)f0 * rowstride + (base_out + (size_t)(32 * k + lane))] = emit;
+        }
+    }
+
+}
 // Host launcher — signature unchanged
 
 torch::Tensor et_sample_1b(torch::Tensor X,
@@ -82,7 +137,7 @@ torch::Tensor et_sample_1b(torch::Tensor X,
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    _et_sample_1b<<<grid, block, 0, stream.stream()>>>(
+    _et_sample_1b_gather<<<grid, block, 0, stream.stream()>>>(
         X.data_ptr<uint32_t>(),
         XS.data_ptr<uint32_t>(),
         Fsch.data_ptr<uint16_t>(),
