@@ -65,24 +65,7 @@ __global__ void _et_sample_1b_sm(
 
 __device__ __forceinline__ void warp_transpose32(uint32_t A[32], int lane, unsigned mask) {
     // We’ll ping-pong through a snapshot U each stage to avoid RAW hazards.
-    #pragma unroll
-    for (int s = 0; s < 5; ++s) {              // s = 0..4  (ofs = 1,2,4,8,16)
-        const int ofs = 1 << s;
-
-        uint32_t U[32];
-        #pragma unroll
-        for (int i = 0; i < 32; ++i) U[i] = A[i];
-
-        #pragma unroll
-        for (int i = 0; i < 32; ++i) {
-            // Bring the value from the *partner lane* at the *partner index*.
-            const uint32_t partner = __shfl_xor_sync(mask, U[i ^ ofs], ofs, 32);
-
-            // Decide ownership by the s-th bit of (lane XOR index).
-            // If that bit is 1, this element belongs in the "other half".
-            A[i] = (((lane ^ i) & ofs) ? partner : U[i]);
-        }
-    }
+    
 }
 
 
@@ -130,7 +113,24 @@ extern "C" __global__ void _et_sample_1b_butterfly(
         }
 
         // 2) Transpose 32×32 in registers via butterfly
-        warp_transpose32(T, lane, mask);
+        #pragma unroll
+        for (int s = 0; s < 5; ++s) {              // s = 0..4  (ofs = 1,2,4,8,16)
+            const int ofs = 1 << s;
+
+            uint32_t U[K];
+            #pragma unroll
+            for (int i = 0; i < K; ++i) U[i] = A[i];
+
+            #pragma unroll
+            for (int i = 0; i < K; ++i) {
+                // Bring the value from the *partner lane* at the *partner index*.
+                const uint32_t partner = __shfl_xor_sync(mask, U[i ^ ofs], ofs, K);
+
+                // Decide ownership by the s-th bit of (lane XOR index).
+                // If that bit is 1, this element belongs in the "other half".
+                A[i] = (((lane ^ i) & ofs) ? partner : U[i]);
+            }
+        }
 
         // 3) Coalesced store of K columns (row == lane after transpose)
         const size_t base_out = (size_t)32 * (size_t)base;
