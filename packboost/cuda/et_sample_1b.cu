@@ -64,39 +64,27 @@ __global__ void _et_sample_1b_sm(
 }
 
 __device__ __forceinline__ void warp_transpose32(uint32_t A[32], int lane, unsigned mask) {
-    // A temporary register array for ping-ponging data between stages
-    uint32_t B[32];
-
+    // We’ll ping-pong through a snapshot U each stage to avoid RAW hazards.
     #pragma unroll
-    for (int s = 4; s >= 0; --s) { // Iterate through bit positions 4 down to 0
-        const int ofs = 1 << s;    // Partner lanes differ by ofs (16, 8, 4, 2, 1)
+    for (int s = 0; s < 5; ++s) {              // s = 0..4  (ofs = 1,2,4,8,16)
+        const int ofs = 1 << s;
 
-        // Perform the butterfly exchange for all 32 elements in the register file
+        uint32_t U[32];
         #pragma unroll
-        for (int idx = 0; idx < 32; ++idx) {
-            // Get the value from the partner lane. This is a symmetric exchange.
-            // Note: The original kernel's use of A[idx ^ ofs] was incorrect.
-            const uint32_t partner_val = __shfl_xor_sync(mask, A[idx], ofs, 32);
+        for (int i = 0; i < 32; ++i) U[i] = A[i];
 
-            // The condition for swapping bits 's' of the row and column index.
-            // If the s-th bit of the lane (original column) and the s-th bit
-            // of the index (original row) are different, we take the partner's value.
-            // The original kernel's condition ((lane >> s) & 1) was incomplete,
-            // causing a one-way data transfer instead of a swap.
-            if ((((unsigned)lane >> s) & 1) != ((idx >> s) & 1)) {
-                B[idx] = partner_val;
-            } else {
-                B[idx] = A[idx];
-            }
-        }
-
-        // Ping-pong: update A for the next stage
         #pragma unroll
-        for (int idx = 0; idx < 32; ++idx) {
-            A[idx] = B[idx];
+        for (int i = 0; i < 32; ++i) {
+            // Bring the value from the *partner lane* at the *partner index*.
+            const uint32_t partner = __shfl_xor_sync(mask, U[i ^ ofs], ofs, 32);
+
+            // Decide ownership by the s-th bit of (lane XOR index).
+            // If that bit is 1, this element belongs in the "other half".
+            A[i] = (((lane ^ i) & ofs) ? partner : U[i]);
         }
     }
 }
+
 
 extern "C" __global__ void _et_sample_1b_butterfly(
     const uint32_t* __restrict__ X,        // [bF, M]
