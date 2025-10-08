@@ -63,24 +63,14 @@ __global__ void _et_sample_1b_sm(
     }
 }
 
+
 __device__ __forceinline__ void warp_transpose32(uint32_t A[32], int lane, unsigned mask) {
-    // We’ll ping-pong through a snapshot U each stage to avoid RAW hazards.
     #pragma unroll
     for (int s = 0; s < 5; ++s) {              // s = 0..4  (ofs = 1,2,4,8,16)
         const int ofs = 1 << s;
-
-        uint32_t U[32];
-        #pragma unroll
-        for (int i = 0; i < 32; ++i) U[i] = A[i];
-
-        #pragma unroll
         for (int i = 0; i < 32; ++i) {
-            // Bring the value from the *partner lane* at the *partner index*.
-            const uint32_t partner = __shfl_xor_sync(mask, U[i ^ ofs], ofs, 32);
-
-            // Decide ownership by the s-th bit of (lane XOR index).
-            // If that bit is 1, this element belongs in the "other half".
-            A[i] = (((lane ^ i) & ofs) ? partner : U[i]);
+            const uint32_t partner = __shfl_xor_sync(mask, A[i ^ ofs], ofs, 32);
+            A[i] = (((lane ^ i) & ofs) ? partner : A[i]);
         }
     }
 }
@@ -98,17 +88,17 @@ extern "C" __global__ void _et_sample_1b_butterfly(
     const int lane = threadIdx.x;     // warp lane 0..31
 
     if (f0 >= nfeatsets || blockDim.x != 32 || lane >= 32) return;
+    const unsigned mask = __activemask();               // all lanes participate in shuffles
 
-    // Stage 32 feature-row indices for this feature-set into shared
     __shared__ uint16_t fs[32];
     fs[lane] = Fsch[(size_t)round * (size_t)(32 * nfeatsets) + (size_t)(32 * f0 + lane)];
     __syncwarp();
 
     const size_t rowstride = (size_t)32 * (size_t)M; // XS stride per feature-set
-    const unsigned mask = 0xFFFFFFFFu;               // all lanes participate in shuffles
 
-    // Iterate over 'stride' tiles of width 32 columns each
     for (int i = 0; i < stride; ++i) {
+        const int t = stride * bi + i;
+        if (t >= M) break; 
         const int base = 32 * (stride * bi + i);      // first column in this tile
         if (base >= M) continue;                         // warp-uniform tail guard
         const int  K      = (M - base >= 32) ? 32 : (M - base); // valid cols in tile
