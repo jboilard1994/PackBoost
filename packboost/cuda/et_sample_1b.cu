@@ -15,42 +15,33 @@ __global__ void _et_sample_1b(
 	const int bi = blockIdx.y; // tile group along M
 	const int wi = threadIdx.x; // lane 0..31
 
-	if (f0 >= nfeatsets || blockDim.x != 32) return;
+	if (f0 >= nfeatsets || wi >= 32) return;
 
-	__shared__ uint16_t fs[32];
+	const size_t rowstride = (size_t)32 * (size_t)M;
 
-	fs[wi] = Fsch[size_t(round)*size_t(32*nfeatsets) + size_t(32*f0 + wi)];
-	__syncwarp();
+	const uint32_t fr_lane = (uint32_t)Fsch[
+        (size_t)round * (size_t)(32 * nfeatsets) + (size_t)32 * (size_t)f0 + (size_t)wi
+    ];
 
 	for (int i = 0; i < stride; ++i) {
 		const int base_in = 32*(stride*bi + i); // first word-column in this tile
 		if (base_in >= M) continue;
 		const int i_in = base_in + wi; // this lane's word-column
-		
-		uint32_t row[32];
-		for (int r = 0; r < 32; ++r) {
-			uint32_t v = 0u;
-			const uint32_t fr = uint32_t(fs[r]);
-			if (i_in < M && fr < uint32_t(bF)) {
-				v = X[size_t(fr)*size_t(M) + size_t(i_in)];
-			}
-			row[r] = v;
-		}
 	
 		// We'll emit: XS[f0, 32*(base_in + k) + wi] = A[wi][(k+wi)&31]
 		const unsigned mask = __activemask();
-		const size_t rowstride = size_t(32)*size_t(M);
-
-		const uint32_t base_element = row[wi];
 
 		for (int k = 0; k < 32; ++k) {
-			const int kk = (k + wi) & 31; // rotated column index
-			const size_t i_out = size_t(32)*size_t(base_in + k) + size_t(wi);
-			if (i_out < rowstride) {
-				// pull A[wi][kk] from src lane = kk
-				uint32_t emit = __shfl_sync(mask, base_element, kk);
-				XS[size_t(f0)*rowstride + i_out] = emit;
+			const int base_out = base_in + k;
+			if (base_out >= M) break;
+			const uint32_t rk = __shfl_sync(mask, fr_lane, k);
+			uint32_t v = 0u;
+			if (i_in < M && rk < (uint32_t)bF) {
+				v = X[size_t(rk)*size_t(M) + size_t(i_in)];
 			}
+
+			const size_t i_out = (size_t)32*(size_t)base_out + (size_t)wi;
+			XS[size_t(f0)*rowstride + i_out] = v;
 		}
 	}
 }
