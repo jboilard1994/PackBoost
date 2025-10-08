@@ -98,7 +98,7 @@ extern "C" __global__ void _et_sample_1b_butterfly(
         #pragma unroll
         for (int k = 0; k < 32; ++k) {
             uint32_t v = 0u;
-            if (col_ok && k < K) {
+            if (col_ok) {
                 const uint32_t row_k = (uint32_t)fs[k];
                 if (row_k < (uint32_t)bF) {
                     v = X[(size_t)row_k * (size_t)M + (size_t)col_in];
@@ -108,24 +108,24 @@ extern "C" __global__ void _et_sample_1b_butterfly(
         }
 
         // 2) Transpose 32×32 in registers via butterfly
-        uint32_t U[32];
-        for (int i = 0; i < 32; ++i) U[i] = T[i];
         #pragma unroll
-        for (int s = 0; s < 5; ++s) {
+        for (int s = 0; s < 5; ++s) {              // s = 0..4  (ofs = 1,2,4,8,16)
             const int ofs = 1 << s;
 
+            uint32_t U[32];
             #pragma unroll
-            for (int i = 0; i < K; ++i) {
-                // Present U[i] to the network, fetch partner lane’s U[i]
-                const uint32_t a = U[i];
-                const uint32_t b = __shfl_xor_sync(mask, a, ofs, 32);
+            for (int i = 0; i < 32; ++i) U[i] = T[i];
 
-                // If the i-th index has this bit set, take the partner’s copy
-                // (this routes the value originating from lane==i to index i)
-                if (i & ofs) T[i] = b; else T[i] = a;
+            #pragma unroll
+            for (int i = 0; i < 32; ++i) {
+                // Bring the value from the *partner lane* at the *partner index*.
+                const uint32_t partner = __shfl_xor_sync(mask, U[i ^ ofs], ofs, 32);
+
+                // Decide ownership by the s-th bit of (lane XOR index).
+                // If that bit is 1, this element belongs in the "other half".
+                T[i] = (((lane ^ i) & ofs) ? partner : U[i]);
             }
         }
-
 
         // 3) Coalesced store of K columns (row == lane after transpose)
         const size_t base_out = (size_t)32 * (size_t)base;
