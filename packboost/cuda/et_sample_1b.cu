@@ -63,21 +63,38 @@ __global__ void _et_sample_1b_sm(
     }
 }
 
-__device__ __forceinline__ void warp_transpose32(uint32_t A[32], int lane, unsigned mask){
+__device__ __forceinline__ void warp_transpose32(uint32_t A[32], int lane, unsigned mask) {
+    // A temporary register array for ping-ponging data between stages
     uint32_t B[32];
+
     #pragma unroll
-    for (int s = 0; s < 5; ++s) {
-        const int ofs = 1 << s; // 1,2,4,8,16
+    for (int s = 4; s >= 0; --s) { // Iterate through bit positions 4 down to 0
+        const int ofs = 1 << s;    // Partner lanes differ by ofs (16, 8, 4, 2, 1)
+
+        // Perform the butterfly exchange for all 32 elements in the register file
         #pragma unroll
         for (int idx = 0; idx < 32; ++idx) {
-            // Partner lane contributes its value from partner index (idx^ofs)
-            const uint32_t partner = __shfl_xor_sync(mask, A[idx ^ ofs], ofs, 32);
-            // Swap-on-bit: lanes with s-bit set take partner half; others keep theirs
-            B[idx] = ((lane >> s) & 1) ? partner : A[idx];
+            // Get the value from the partner lane. This is a symmetric exchange.
+            // Note: The original kernel's use of A[idx ^ ofs] was incorrect.
+            const uint32_t partner_val = __shfl_xor_sync(mask, A[idx], ofs, 32);
+
+            // The condition for swapping bits 's' of the row and column index.
+            // If the s-th bit of the lane (original column) and the s-th bit
+            // of the index (original row) are different, we take the partner's value.
+            // The original kernel's condition ((lane >> s) & 1) was incomplete,
+            // causing a one-way data transfer instead of a swap.
+            if ((((unsigned)lane >> s) & 1) != ((idx >> s) & 1)) {
+                B[idx] = partner_val;
+            } else {
+                B[idx] = A[idx];
+            }
         }
-        // Ping-pong
+
+        // Ping-pong: update A for the next stage
         #pragma unroll
-        for (int idx = 0; idx < 32; ++idx) A[idx] = B[idx];
+        for (int idx = 0; idx < 32; ++idx) {
+            A[idx] = B[idx];
+        }
     }
 }
 
