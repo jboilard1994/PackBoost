@@ -42,7 +42,7 @@ __global__ void _et_sample_1b(
 			if (k < K){
 				const uint32_t rk = __shfl_sync(mask, fr_lane, k);
 				if (i_in < M && rk < (uint32_t)bF) {
-					v = X[(size_t)row_k*(size_t)M*(size_t)i_in];
+					v = X[(size_t)rk*(size_t)M*(size_t)i_in];
 				}
 			}
 			T[k] = v;
