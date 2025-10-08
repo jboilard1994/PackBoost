@@ -95,7 +95,7 @@ __global__ void _et_sample_1b_gather(
         // 1) Compute this lane's row value v_row = X[ Fs[f0,lane], base + lane ]
         //    using coalesced loads across r=0..31. Only keep the value when r == lane.
         uint32_t v_row = 0u;
-        #pragma unroll
+        //#pragma unroll
         for (int r = 0; r < 32; ++r) {
             uint32_t v = 0u;
             const uint32_t fr = (uint32_t)fs[r];
@@ -107,14 +107,15 @@ __global__ void _et_sample_1b_gather(
 
         // 2) Emit columns via direct-gather across lanes (one shuffle per output col)
         const size_t base_out = (size_t)32 * (size_t)base_in;
-        #pragma unroll
+        //#pragma unroll
         for (int k = 0; k < 32; ++k) {
             const int col_out = base_in + k;
-            if (col_out >= M) break;
+            //if (col_out >= M) break;
             // Pull my-row value from source lane == k
-            const uint32_t emit = __shfl_sync(mask, v_row, k, 32);
+            const uint32_t emit = __shfl_sync(mask, v_row, k);
             XS[(size_t)f0 * rowstride + (base_out + (size_t)(32 * k + lane))] = emit;
         }
+        __syncthreads();
     }
 
 }
