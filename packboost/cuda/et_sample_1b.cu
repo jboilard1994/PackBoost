@@ -36,7 +36,7 @@ __global__ void _et_sample_1b_sm(
 
     for (int i = 0; i < stride; ++i) {
         const int base = 32 * (stride * bi + i);  // first column in this tile
-        if (base >= M) continue;
+        if (base >= M) break;
         const int col_lane = base + wi;           // column this lane loads each k
 
         // 1) Coalesced loads by row: fill SMEM tile[row_k][lane]
@@ -87,7 +87,7 @@ __global__ void _et_sample_1b_butterfly(
 
     for (int i = 0; i < stride; ++i) {
         const int base = 32 * (stride * bi + i);      
-        if (base >= M) continue;                         
+        if (base >= M) break;                         
         const int  col_in = base + lane;
 
         uint32_t T[32];
