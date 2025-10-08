@@ -3,8 +3,7 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 
-__device__ __forceinline__ uint32_t butterfly_stage_lane(uint32_t v, int idx, int lane, int s){
-	unsigned mask = __activemask();
+__device__ __forceinline__ uint32_t butterfly_stage_lane(uint32_t v, int idx, int lane, int s, unsigned mask){
 	uint32_t other = __shfl_xor_sync(mask, v, 1 << s);
 	return (((lane >> s) ^ (idx >> s)) & 1) ? other : v;
 }
@@ -55,7 +54,7 @@ __global__ void _et_sample_1b(
 			uint32_t U[32];
 			for (int k = 0; k < 32; ++k) U[k] = T[k];
 			for (int k = 0; k < 32; ++k) {
-				T[k] = butterfly_stage_lane(U[k], k, wi, s);
+				T[k] = butterfly_stage_lane(U[k], k, wi, s, mask);
 			}
 		}
 			
