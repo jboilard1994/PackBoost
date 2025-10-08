@@ -48,12 +48,15 @@ __global__ void _et_sample_1b(
 			T[k] = v;
 		}
 
+		/*
+
 		#pragma unroll
 		for (int s = 0; s < 5; ++s) {
 			for (int k = 0; k < 32; ++k) {
 				T[k] = butterfly_stage_lane(T[k], k, wi, s);
 			}
 		}
+			*/
 		#pragma unroll
 		for (int k = 0; k < 32; ++k) {
 			const int col_out = base_in + k;
