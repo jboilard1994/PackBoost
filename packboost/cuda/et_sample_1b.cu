@@ -94,7 +94,7 @@ extern "C" __global__ void _et_sample_1b_butterfly(
         const bool col_ok = (col_in < M);
 
         // 1) Build register tile (column-major per lane), coalesced loads per k
-        uint32_t T[K];
+        uint32_t T[32];
         #pragma unroll
         for (int k = 0; k < K; ++k) {
             uint32_t v = 0u;
@@ -112,7 +112,7 @@ extern "C" __global__ void _et_sample_1b_butterfly(
         for (int s = 0; s < 5; ++s) {              // s = 0..4  (ofs = 1,2,4,8,16)
             const int ofs = 1 << s;
 
-            uint32_t U[K];
+            uint32_t U[32];
             #pragma unroll
             for (int i = 0; i < K; ++i) U[i] = T[i];
 
