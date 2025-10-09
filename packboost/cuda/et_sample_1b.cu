@@ -142,7 +142,7 @@ torch::Tensor et_sample_1b(torch::Tensor X,
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    _et_sample_1b_butterfly<<<grid, block, 0, stream.stream()>>>(
+    _et_sample_1b_sm<<<grid, block, 0, stream.stream()>>>(
         X.data_ptr<uint32_t>(),
         XS.data_ptr<uint32_t>(),
         Fsch.data_ptr<uint16_t>(),
