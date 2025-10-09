@@ -22,7 +22,6 @@ def test_encode_cuts_matches_cpu_reference():
 
     torch.testing.assert_close(result.cpu(), ref)
 
-
 def test_et_sample_1b_matches_cpu_reference():
     pack_cpu = PackBoost(device="cpu")
     pack_gpu = PackBoost(device="cuda")
@@ -42,3 +41,35 @@ def test_et_sample_1b_matches_cpu_reference():
     torch.cuda.synchronize()
 
     torch.testing.assert_close(result.cpu(), ref)
+
+def test_prep_vars_matches_cpu_reference():
+    pack_cpu = PackBoost(device="cpu")
+    pack_gpu = PackBoost(device="cuda")
+
+    torch.manual_seed(0)
+
+    # (K=nfolds, Dm=depth-bits, N=samples)
+    cases = [
+        (1, 3, 1),                         # tiny, single-bitpack sanity
+        (2, 5, 33),                        # N just over a warp
+        (8, 7, 32 * 512 - 1),              # just under a full grid tile
+        (8, 7, 32 * 512),                  # exact full grid tile
+        (8, 7, 32 * 512 + 1),              # just over a full grid tile
+        (16, 10, 100_003),                 # bigger K + near-max Dm
+    ]
+
+    lo, hi = -(1 << 30), (1 << 30) - 1   # Q30-ish range
+
+    for K, Dm, N in cases:
+        L = torch.randint(0, 4, (K, Dm, N), dtype=torch.uint8)
+        Y = torch.randint(lo, hi + 1, (N,), dtype=torch.int32)
+        P = torch.randint(lo, hi + 1, (N,), dtype=torch.int32)
+
+        ref_LE, ref_G = pack_cpu.prep_vars(L, Y, P)
+        out_LE, out_G = pack_gpu.prep_vars(L.cuda(), Y.cuda(), P.cuda())
+        torch.cuda.synchronize()
+
+        assert out_LE.dtype == ref_LE.dtype, f"dtype mismatch: {out_LE.dtype} vs {ref_LE.dtype}"
+        torch.testing.assert_close(out_LE.cpu(), ref_LE, msg=f"LE mismatch K={K} Dm={Dm} N={N}")
+        torch.testing.assert_close(out_G.cpu(),  ref_G,  msg=f"G mismatch  K={K} Dm={Dm} N={N}")
+

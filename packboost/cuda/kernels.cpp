@@ -1,4 +1,6 @@
 #include <torch/extension.h>
+#include <tuple>
+
 
 namespace {
 
@@ -29,6 +31,11 @@ torch::Tensor et_sample_1b(torch::Tensor X,
                            torch::Tensor XS,
                            torch::Tensor Fsch,
                            int round);
+
+std::tuple<torch::Tensor, torch::Tensor>
+prep_vars(torch::Tensor L, 
+            torch::Tensor Y,  
+            torch::Tensor P);
 
 namespace {
 
@@ -82,4 +89,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("XS"),
           pybind11::arg("Fsch"),
           pybind11::arg("round"));
+    
+    m.def("prep_vars", &prep_vars, "L, Y, P -> LE, G");
 }

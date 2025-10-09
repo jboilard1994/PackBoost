@@ -45,4 +45,32 @@ class PackBoost(BaseEstimator, RegressorMixin):
         Fs = Fsch[round].view(nfeatsets, 32).to(dtype=torch.long, device=X.device)
         return X.to(torch.int32)[Fs, :].transpose(1, 2).contiguous().view(nfeatsets, M*32).to(torch.uint32)
 
+    def prep_vars(self, L: torch.Tensor, Y: torch.Tensor, P: torch.Tensor):
+        if L.is_cuda and torch.cuda.is_available():
+            return kernels.prep_vars(L.contiguous(), Y.contiguous(), P.contiguous())
+
+        K, Dm, N = L.shape
+        max_depth = Dm
+
+        if   max_depth > 8:
+            le_dtype = torch.int64
+        elif max_depth > 6:
+            le_dtype = torch.int32
+        else:
+            le_dtype = torch.int16
+
+        device = L.device
+        d = torch.arange(1, max_depth+1, device=device)
+        offsets = (d * (d - 1)) // 2                      # [Dm], int64
+        weights = (torch.ones_like(offsets, dtype=le_dtype) << offsets)  # [Dm] le_dtype
+
+        L_bits = (L & 1).to(le_dtype)
+        LE = (L_bits * weights.view(1, max_depth, 1)).sum(dim=1, dtype=le_dtype)
+
+        g = (Y.to(torch.int32) - P.to(torch.int32)) >> 19
+        G = g.clamp_(-32767, 32767).to(torch.int16)
+
+        return LE.contiguous(), G.contiguous()
+
+
         
