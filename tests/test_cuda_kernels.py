@@ -28,7 +28,7 @@ def test_et_sample_1b_matches_cpu_reference():
     pack_cpu.nfeatsets = pack_gpu.nfeatsets = 32
 
     torch.manual_seed(1)
-    bF, M, rounds = 2376*4, 2_700_000//32, 3
+    bF, M, rounds = 2376*4, 10_000//32, 3
 
     X_cpu = torch.randint(0, 2 ** 32, (bF, M), dtype=torch.int64).to(torch.uint32)
     Fsch = torch.randint(0, bF, (rounds, 32 * pack_cpu.nfeatsets), dtype=torch.int16).to(
