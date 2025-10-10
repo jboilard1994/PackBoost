@@ -132,7 +132,7 @@ template <typename T>
 __global__ void _h0_sm_butterfly(
     const int16_t* __restrict__ G,   // [N]
     const T*       __restrict__ LE,  // [nfolds, N], UNSIGNED in template
-    long long*     __restrict__ H0,  // [nfolds, 2^D, 2] int64
+    int64_t*     __restrict__ H0,  // [nfolds, 2^D, 2] int64
     const int N,
     const int nfolds,
     const int max_depth,
