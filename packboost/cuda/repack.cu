@@ -89,13 +89,12 @@ __global__ void repack_trees_for_features_kernel(
 
 
 void repack_trees_for_features_cuda(
-    const Tensor& FST,     // uint8  [nsets, nfeatsets, max_depth]
-    const Tensor& LE,      // u16/u32/u64 [nfolds, N]
-    Tensor& LF,            // u16/u32/u64 [nfeatsets, N] (output, in-place fill)
+    const torch::Tensor& FST,     // uint8  [nsets, nfeatsets, max_depth]
+    const torch::Tensor& LE,      // u16/u32/u64 [nfolds, N]
+    torch::Tensor& LF,            // u16/u32/u64 [nfeatsets, N] (output, in-place fill)
     int64_t tree_set,      // which set (round)
 ) {
     
-    at::cuda::CUDAGuard device_guard(FST.device());
 
     const int nsets      = static_cast<int>(FST.size(0));
     const int nfeatsets  = static_cast<int>(FST.size(1));
@@ -136,7 +135,7 @@ void repack_trees_for_features_cuda(
         case at::kInt: // NOTE: if you use signed int32, change your tensor to kUInt32
         case at::kLong: // signed long not supported for bit packing here
             break;
-        case at::kUInt: { // uint32
+        case torch::kUInt32: { // uint32
 #if !defined(AT_CUDA_ENABLED)
             TORCH_CHECK(false, "kUInt requires CUDA build with uint32 support");
 #endif
