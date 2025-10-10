@@ -267,7 +267,7 @@ torch::Tensor h0_sm_butterfly(
     static constexpr int lanes   = 32;
     int SM = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
 
-    int target_blocks_per_SM = 256;
+    int target_blocks_per_SM = 32;
     int min_total_blocks = SM * target_blocks_per_SM;
     int strides = (min_total_blocks + nfolds - 1) / nfolds;
     static constexpr int min_workload_per_thread = 128;
