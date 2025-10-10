@@ -48,8 +48,8 @@ __global__ void _h0_sm(
 
     const int used_nodes = (1<<max_depth) -1;
     for (int k = 0; k < used_nodes; ++k) {
-        atomicAdd(H0 + (size_t)tree_set*(used_nodes+1)*2 + (size_t)k*2 + 0, (unsigned long long)(long long)SH(k, 0, wi));
-        atomicAdd(H0 + (size_t)tree_set*(used_nodes+1)*2 + (size_t)k*2 + 1, (unsigned long long)(long long)SH(k, 1, wi));
+        atomicAdd((unsigned long long)(H0 + (size_t)tree_set*(used_nodes+1)*2 + (size_t)k*2 + 0), (unsigned long long)(long long)SH(k, 0, wi));
+        atomicAdd((unsigned long long)(H0 + (size_t)tree_set*(used_nodes+1)*2 + (size_t)k*2 + 1), (unsigned long long)(long long)SH(k, 1, wi));
     }
 
 }
@@ -91,7 +91,7 @@ torch::Tensor h0_sm(
 
     // Dispatch by LE dtype (unsigned first, then signed-as-unsigned)
     const auto dt = LE.scalar_type();
-    if (dt == at::kUInt16) {
+    if (dt == torch::kUInt16) {
         cudaFuncSetAttribute(_h0_sm<uint16_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
         _h0_sm<uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
             G.data_ptr<int16_t>(),
@@ -99,7 +99,7 @@ torch::Tensor h0_sm(
             H0.data_ptr<int64_t>(),
             N, nfolds, max_depth, stride
         );
-    } else if (dt == at::kUInt32) {
+    } else if (dt == torch::kUInt32) {
         cudaFuncSetAttribute(_h0_sm<uint32_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
         _h0_sm<uint32_t><<<grid, block, smem_bytes, stream.stream()>>>(
             G.data_ptr<int16_t>(),
@@ -107,35 +107,11 @@ torch::Tensor h0_sm(
             H0.data_ptr<int64_t>(),
             N, nfolds, max_depth, stride
         );
-    } else if (dt == at::kUInt64) {
+    } else if (dt == torch::kUInt64) {
         cudaFuncSetAttribute(_h0_sm<uint64_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
         _h0_sm<uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
             G.data_ptr<int16_t>(),
             LE.data_ptr<uint64_t>(),
-            H0.data_ptr<int64_t>(),
-            N, nfolds, max_depth, stride
-        );
-    } else if (dt == at::kInt16) {
-        cudaFuncSetAttribute(_h0_sm<uint16_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
-        _h0_sm<uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
-            G.data_ptr<int16_t>(),
-            reinterpret_cast<const uint16_t*>(LE.data_ptr<int16_t>()),
-            H0.data_ptr<int64_t>(),
-            N, nfolds, max_depth, stride
-        );
-    } else if (dt == at::kInt32) {
-        cudaFuncSetAttribute(_h0_sm<uint32_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
-        _h0_sm<uint32_t><<<grid, block, smem_bytes, stream.stream()>>>(
-            G.data_ptr<int16_t>(),
-            reinterpret_cast<const uint32_t*>(LE.data_ptr<int32_t>()),
-            H0.data_ptr<int64_t>(),
-            N, nfolds, max_depth, stride
-        );
-    } else if (dt == at::kInt64) {
-        cudaFuncSetAttribute(_h0_sm<uint64_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
-        _h0_sm<uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
-            G.data_ptr<int16_t>(),
-            reinterpret_cast<const uint64_t*>(LE.data_ptr<int64_t>()),
             H0.data_ptr<int64_t>(),
             N, nfolds, max_depth, stride
         );
