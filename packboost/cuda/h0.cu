@@ -128,6 +128,18 @@ __device__ __forceinline__ int SH_idx(int node, int ch, int lane) {
     return (node * 2 + ch) * 32 + lane;
 }
 
+static __device__ __forceinline__ uint64_t pack_sc(int sum32, int cnt32) {
+    return ( (uint64_t)(uint32_t)cnt32 << 32 ) | (uint64_t)(uint32_t)sum32;
+}
+
+static __device__ __forceinline__ uint64_t add_pack(uint64_t a, uint64_t b) {
+    int sa = (int)(uint32_t)a;           // low 32 = sum
+    int ca = (int)(uint32_t)(a >> 32);   // high 32 = count
+    int sb = (int)(uint32_t)b;
+    int cb = (int)(uint32_t)(b >> 32);
+    return pack_sc(sa + sb, ca + cb);
+}
+
 template <typename T>
 __global__ void _h0_sm_butterfly(
     const int16_t* __restrict__ G,   // [N]
@@ -182,21 +194,6 @@ __global__ void _h0_sm_butterfly(
     // --- butterfly transpose + reduce-scatter over lanes (32×32 tiles) ---
     const unsigned mask = __ballot_sync(__activemask(), true);
     long long* base = reinterpret_cast<long long*>(H0) + ((long long)tree_set * nodes * 2);
-
-
-
-    auto pack_sc = [] __device__ (int s, int c) -> uint64_t {
-        return ( (uint64_t)(uint32_t)c << 32 ) | (uint32_t)s;
-    };
-    auto unpack_add = [] __device__ (uint64_t a, uint64_t b) -> uint64_t {
-        int sa = (int)(uint32_t)(a & 0xFFFFFFFFu);
-        int ca = (int)(uint32_t)(a >> 32);
-        int sb = (int)(uint32_t)(b & 0xFFFFFFFFu);
-        int cb = (int)(uint32_t)(b >> 32);
-        int s = sa + sb;
-        int c = ca + cb;
-        return ( (uint64_t)(uint32_t)c << 32 ) | (uint32_t)s;
-    };
 
     for (int k0 = 0; k0 < used_nodes; k0 += 32) {
         // Load this lane's column (32 rows in tile) for BOTH channels
