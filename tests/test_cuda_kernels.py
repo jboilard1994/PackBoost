@@ -109,7 +109,7 @@ def test_h0_matches_cpu_reference():
         else:
             LE_unsigned = ref_LE.to(torch.uint64)
 
-        for use_unsigned in (False, True):
+        for use_unsigned in (True):
             LE_host = LE_unsigned if use_unsigned else ref_LE
             G_host  = ref_G
 

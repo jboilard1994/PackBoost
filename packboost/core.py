@@ -54,10 +54,13 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
         if   max_depth > 8:
             le_dtype = torch.int64
+            dtype = torch.uint64
         elif max_depth > 6:
             le_dtype = torch.int32
+            dtype = torch.uint32
         else:
             le_dtype = torch.int16
+            dtype = torch.uint16
 
         device = L.device
         d = torch.arange(1, max_depth+1, device=device)
@@ -70,7 +73,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         g = (Y.to(torch.int32) - P.to(torch.int32)) >> 19
         G = g.clamp_(-32767, 32767).to(torch.int16)
 
-        return LE.contiguous(), G.contiguous()
+        return LE.contiguous().to(dtype=dtype), G.contiguous()
 
 
     def h0(self, G: torch.Tensor, LE: torch.Tensor, max_depth: int) -> torch.Tensor:
