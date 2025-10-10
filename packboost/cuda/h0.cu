@@ -189,10 +189,10 @@ __global__ void _h0_sm_butterfly(
         #pragma unroll
         for (int ch = 0; ch < 2; ++ch) {
             // Load this lane's column for the 32-row tile
-            int T[32];
+            int A[32];
             for (int i = 0; i < 32; ++i) {
                 const int node = k0 + i;
-                T[i] = (node < used_nodes) ? s_hist[SH_idx(node, ch, lane)] : 0;
+                A[i] = (node < used_nodes) ? s_hist[SH_idx(node, ch, lane)] : 0;
             }
 
             // Butterfly transpose (EXACT core you validated: U[i ^ ofs], gate on ((lane ^ i) & ofs))
@@ -203,7 +203,7 @@ __global__ void _h0_sm_butterfly(
                 for (int i = 0; i < 32; ++i) Ubuf[i] = T[i];
                 for (int i = 0; i < 32; ++i) {
                     const int partner = __shfl_xor_sync(mask, Ubuf[i ^ ofs], ofs, 32);
-                    T[i] = (((lane ^ i) & ofs) ? partner : Ubuf[i]);
+                    A[i] = (((lane ^ i) & ofs) ? partner : Ubuf[i]);
                 }
             }
 
