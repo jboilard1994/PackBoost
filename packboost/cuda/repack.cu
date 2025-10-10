@@ -136,9 +136,6 @@ void repack_trees_for_features_cuda(
         case at::kLong: // signed long not supported for bit packing here
             break;
         case torch::kUInt32: { // uint32
-#if !defined(AT_CUDA_ENABLED)
-            TORCH_CHECK(false, "kUInt requires CUDA build with uint32 support");
-#endif
             size_t trees_bytes = static_cast<size_t>(nfolds) * 32 * sizeof(uint32_t);
             size_t smem = fst_bytes + trees_bytes;
             repack_trees_for_features_kernel<uint32_t>
@@ -152,7 +149,7 @@ void repack_trees_for_features_cuda(
                 );
             break;
         }
-        case at::kUInt64: { // uint64
+        case torch::kUInt64: { // uint64
             size_t trees_bytes = static_cast<size_t>(nfolds) * 32 * sizeof(uint64_t);
             size_t smem = fst_bytes + trees_bytes;
             repack_trees_for_features_kernel<uint64_t>
