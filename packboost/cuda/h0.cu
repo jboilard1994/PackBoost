@@ -178,7 +178,6 @@ __global__ void _h0_sm_butterfly(
         U lk = static_cast<U>(LE[(size_t)tree_set * N + jj]);
         const int g = (int)G[jj];
 
-        #pragma unroll
         for (int d = 0; d < 32; ++d) {
             if (d >= max_depth) break;
             const int to = (1 << d) - 1;
