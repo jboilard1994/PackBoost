@@ -141,6 +141,7 @@ static __device__ __forceinline__ uint64_t add_pack(uint64_t a, uint64_t b) {
 }
 
 template <typename T>
+__launch_bounds__(32,2)
 __global__ void _h0_sm_butterfly(
     const int16_t* __restrict__ G,   // [N]
     const T*       __restrict__ LE,  // [nfolds, N], UNSIGNED in template
