@@ -53,7 +53,7 @@ void repack_trees_for_features_cuda(
     const torch::Tensor& FST,     // uint8  [nsets, nfeatsets, max_depth]
     const torch::Tensor& LE,      // u16/u32/u64 [nfolds, N]
     torch::Tensor& LF,            // u16/u32/u64 [nfeatsets, N] (output, in-place fill)
-    int64_t tree_set,      // which set (round)
+    int64_t tree_set      // which set (round)
 );
 
 namespace {
