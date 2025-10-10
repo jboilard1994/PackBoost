@@ -180,7 +180,7 @@ __global__ void _h0_sm_butterfly(
 
     // --- butterfly transpose + reduce-scatter over lanes (32×32 tiles) ---
     const unsigned mask = __ballot_sync(__activemask(), true);
-    long long* base = H0 + ((long long)tree_set * nodes * 2);
+    long long* base = reinterpret_cast<long long*>(H0) + ((long long)tree_set * nodes * 2);
 
     for (int k0 = 0; k0 < used_nodes; k0 += 32) {
         const int node_out = k0 + lane;  // row this lane will own after transpose
