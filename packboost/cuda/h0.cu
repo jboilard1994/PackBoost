@@ -199,7 +199,6 @@ __global__ void _h0_sm_butterfly(
         uint64_t P[32];
         // base index for (node=k0, ch=0) at this lane
         int idx = (k0 * 2 + 0) * 32 + lane;
-        #pragma unroll
         for (int i = 0; i < 32; ++i, idx += 64) {   // +64 == 2 * 32 (advance one node)
             const int node = k0 + i;
             int s = 0, c = 0;
@@ -215,7 +214,6 @@ __global__ void _h0_sm_butterfly(
         #pragma unroll
         for (int s = 0; s < 5; ++s) {
             const int ofs = 1 << s;
-            #pragma unroll
             for (int i = 0; i < 32; ++i) {
                 const uint64_t partner = __shfl_xor_sync(mask, P[i], ofs, 32);
                 P[i] = add_pack(P[i], partner);
