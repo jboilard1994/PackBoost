@@ -169,7 +169,7 @@ __global__ void _h0_sm_butterfly(
     __syncwarp();
 
     // --- accumulate lane-private columns in shared ---
-    
+    // possible bottle-neck
     using U = typename std::make_unsigned<T>::type;
     for (int j = 0; j < stride_per_warp; ++j) {
         const int jj = 32 * (stride_per_warp * bi + j) + lane;
