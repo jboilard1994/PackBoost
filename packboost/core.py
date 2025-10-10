@@ -80,7 +80,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         nfolds, N = LE.shape
         nodes = 1 << max_depth
         if (G.is_cuda or LE.is_cuda) and torch.cuda.is_available():
-            return kernels.h0_sm_butterfly(G.contiguous(), LE.contiguous(), int(max_depth))
+            return kernels.h0_sm(G.contiguous(), LE.contiguous(), int(max_depth))
 
         # --- CPU vectorized fallback ---
         H0 = torch.zeros((nfolds, nodes, 2), dtype=torch.int64, device=LE.device)
