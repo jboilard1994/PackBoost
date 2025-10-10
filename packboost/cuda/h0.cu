@@ -218,7 +218,7 @@ __global__ void _h0_sm_butterfly(
             const int ofs = 1 << s;
             #pragma unroll
             for (int i = 0; i < 32; ++i) {
-                const uint64_t partner = __shfl_xor_sync(warp_mask, P[i], ofs, 32);
+                const uint64_t partner = __shfl_xor_sync(mask, P[i], ofs, 32);
                 P[i] = add_pack(P[i], partner);
             }
         }
