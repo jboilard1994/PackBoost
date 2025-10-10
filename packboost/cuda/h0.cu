@@ -241,43 +241,6 @@ __global__ void _h0_sm_butterfly(
         }
     }
 
-    /*
-    for (int k0 = 0; k0 < used_nodes; k0 += 32) {
-
-        
-        #pragma unroll
-        for (int ch = 0; ch < 2; ++ch) {
-            // Each lane loads its column (32 rows in this tile) into registers
-            int A[32];
-            // Precompute shared index stride: node_stride = 2 * 32 (2 channels × 32 lanes)
-            int idx = (k0 * 2 + ch) * 32 + lane;
-            for (int i = 0; i < 32; ++i, idx += 64) {  // +64 == 2*32
-                const int node = k0 + i;
-                A[i] = (node < used_nodes) ? s_hist[idx] : 0;
-            }
-    
-            // Butterfly SUM across lanes for each i (no transpose needed)
-            #pragma unroll
-            for (int s = 0; s < 5; ++s) {
-                const int ofs = 1 << s;
-                for (int i = 0; i < 32; ++i) {
-                    A[i] += __shfl_xor_sync(mask, A[i], ofs, 32);
-                }
-            }
-    
-            // Scatter: lane ℓ writes node_out = k0 + ℓ
-            const int node_out = k0 + lane;
-            if (node_out < used_nodes) {
-                const long long acc = (long long)A[lane];
-                if (acc) {
-                    auto* p = reinterpret_cast<unsigned long long*>(base + node_out * 2 + ch);
-                    atomicAdd(p, (unsigned long long)acc);
-                }
-            }
-        }
-    }
-        */
-
 }
 
 
@@ -302,7 +265,12 @@ torch::Tensor h0_sm_butterfly(
 
     // Murky tiling
     static constexpr int lanes   = 32;
-    static constexpr int strides = 512;
+    int SM = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    int target_blocks_per_SM = 2;
+    int min_blocks = SM * target_blocks_per_SM;
+    int strides = std::max(32, (min_blocks + nfolds - 1) / nfolds); // grid.y
+    strides = std::min(strides, 512); // upper cap like Murky
+
     const dim3 block(lanes, 1, 1);
     const dim3 grid (nfolds, strides, 1);
     int stride = (N + lanes * strides - 1) / (lanes * strides);
