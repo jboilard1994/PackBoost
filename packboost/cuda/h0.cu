@@ -195,6 +195,7 @@ __global__ void _h0_sm_butterfly(
             }
 
             // Butterfly transpose (EXACT core you validated: U[i ^ ofs], gate on ((lane ^ i) & ofs))
+            /*
             #pragma unroll
             for (int s = 0; s < 5; ++s) {
                 const int ofs = 1 << s;
@@ -203,6 +204,21 @@ __global__ void _h0_sm_butterfly(
                 for (int i = 0; i < 32; ++i) {
                     const int partner = __shfl_xor_sync(mask, Ubuf[i ^ ofs], ofs, 32);
                     A[i] = (((lane ^ i) & ofs) ? partner : Ubuf[i]);
+                }
+            }
+            */
+
+            #pragma unroll
+            for (int s = 0; s < 5; ++s) {
+                const int ofs = 1 << s;
+                for (int i = 0; i < 32; ++i) {
+                    // Exchange data with the partner lane
+                    int partner_val = __shfl_xor_sync(mask, A[i ^ ofs], ofs, 32);
+                    
+                    // The gate condition determines if this thread should use the partner's value
+                    if (((lane ^ i) & ofs) != 0) {
+                        A[i] = partner_val;
+                    }
                 }
             }
 
