@@ -218,8 +218,8 @@ __global__ void _h0_sm_butterfly(
             const int ofs = 1 << s;
             #pragma unroll
             for (int i = 0; i < 32; ++i) {
-                const uint64_t partner = __shfl_xor_sync(mask, P[i], ofs, 32);
-                P[i] = unpack_add(P[i], partner);
+                const uint64_t partner = __shfl_xor_sync(warp_mask, P[i], ofs, 32);
+                P[i] = add_pack(P[i], partner);
             }
         }
 
@@ -227,7 +227,7 @@ __global__ void _h0_sm_butterfly(
         const int node_out = k0 + lane;
         if (node_out < used_nodes) {
             const uint64_t pack = P[lane];
-            const long long sum_ll = (long long)(int)(uint32_t)(pack & 0xFFFFFFFFu);
+            const long long sum_ll = (long long)(int)(uint32_t)pack;
             const long long cnt_ll = (long long)(int)(uint32_t)(pack >> 32);
 
             if (sum_ll) {
