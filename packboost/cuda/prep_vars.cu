@@ -74,9 +74,9 @@ prep_vars(torch::Tensor L,  // [K, Dm, N], uint8
   
     // Pick output dtype for LE from max_depth (store as signed types; bit pattern preserved)
     c10::ScalarType le_dtype;
-    if      (max_depth > 8) le_dtype = torch::kInt64; // stores packed 64-bit
-    else if (max_depth > 6) le_dtype = torch::kInt32; // stores packed 32-bit
-    else                    le_dtype = torch::kInt16; // stores packed 16-bit
+    if      (max_depth > 8) le_dtype = torch::kUInt64; // stores packed 64-bit
+    else if (max_depth > 6) le_dtype = torch::kUInt32; // stores packed 32-bit
+    else                    le_dtype = torch::kUInt16; // stores packed 16-bit
   
     auto opts_base = L.options().device(L.device()).memory_format(c10::MemoryFormat::Contiguous);
     auto LE = torch::empty({K, N64}, opts_base.dtype(le_dtype));
@@ -93,13 +93,13 @@ prep_vars(torch::Tensor L,  // [K, Dm, N], uint8
   
     if (max_depth > 8) {
       // LE dtype is kInt64 in Tensor; reinterpret as uint64_t* for kernel
-      auto* LEp = reinterpret_cast<uint64_t*>(LE.data_ptr<int64_t>());
+      auto* LEp = reinterpret_cast<uint64_t*>(LE.data_ptr<uint64_t>());
       _prep_vars<uint64_t><<<grid, block, 0, stream.stream()>>>(Lp, LEp, Yp, Pp, Gp, nfolds, max_depth, N, stride);
     } else if (max_depth > 6) {
-      auto* LEp = reinterpret_cast<uint32_t*>(LE.data_ptr<int32_t>());
+      auto* LEp = reinterpret_cast<uint32_t*>(LE.data_ptr<uint32_t>());
       _prep_vars<uint32_t><<<grid, block, 0, stream.stream()>>>(Lp, LEp, Yp, Pp, Gp, nfolds, max_depth, N, stride);
     } else {
-      auto* LEp = reinterpret_cast<uint16_t*>(LE.data_ptr<int16_t>());
+      auto* LEp = reinterpret_cast<uint16_t*>(LE.data_ptr<uint16_t>());
       _prep_vars<uint16_t><<<grid, block, 0, stream.stream()>>>(Lp, LEp, Yp, Pp, Gp, nfolds, max_depth, N, stride);
     }
   
