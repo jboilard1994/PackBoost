@@ -43,6 +43,12 @@ torch::Tensor h0_sm(
     int max_depth
 );
 
+torch::Tensor h0_sm_butterfly(
+    torch::Tensor G,        // [N], int16, CUDA
+    torch::Tensor LE,       // [nfolds, N], (u)int16/32/64, CUDA
+    int max_depth
+);
+
 namespace {
 
 torch::Tensor encode_cuts_binding(torch::Tensor X) {
@@ -98,5 +104,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     
     m.def("prep_vars", &prep_vars, "L, Y, P -> LE, G");
     m.def("h0_sm", &h0_sm, "H0 (featureless, unweighted) Murky-parity launcher");
+    m.def("h0_sm_butterfly", &h0_sm_butterfly, "H0 butterfly reduce-scatter launcher");
 
 }
