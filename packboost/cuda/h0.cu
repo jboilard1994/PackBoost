@@ -48,8 +48,8 @@ __global__ void _h0_sm(
 
     const int used_nodes = (1<<max_depth) -1;
     for (int k = 0; k < used_nodes; ++k) {
-        atomicAdd((unsigned long long int)&(H0 + (size_t)tree_set*(used_nodes+1)*2 + (size_t)k*2 + 0), (unsigned long long)(long long)SH(k, 0, wi));
-        atomicAdd((unsigned long long int)&(H0 + (size_t)tree_set*(used_nodes+1)*2 + (size_t)k*2 + 1), (unsigned long long)(long long)SH(k, 1, wi));
+        atomicAdd((unsigned long long int)(H0 + (size_t)tree_set*(used_nodes+1)*2 + (size_t)k*2 + 0), (long long)SH(k, 0, wi));
+        atomicAdd((unsigned long long int)(H0 + (size_t)tree_set*(used_nodes+1)*2 + (size_t)k*2 + 1), (long long)SH(k, 1, wi));
     }
 
 }
