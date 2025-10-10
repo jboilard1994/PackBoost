@@ -276,8 +276,6 @@ torch::Tensor h0_sm_butterfly(
 
     const dim3 block(lanes, 1, 1);
     const dim3 grid (nfolds, strides, 1);
-    int stride = (N + lanes * strides - 1) / (lanes * strides);
-    if (stride < 1) stride = 1;
 
     const int nodes = 1 << max_depth;
     auto H0 = torch::zeros({nfolds64, (int64_t)nodes, 2},
