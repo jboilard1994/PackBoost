@@ -177,7 +177,6 @@ __global__ void _h0_sm_butterfly(
             s_hist[SH_idx(node, 1, lane)] += 1;   // count
         }
     }
-    __syncthreads();
 
     // --- butterfly transpose + reduce-scatter over lanes (32×32 tiles) ---
     const unsigned mask = __ballot_sync(__activemask(), true);
@@ -200,7 +199,7 @@ __global__ void _h0_sm_butterfly(
             for (int s = 0; s < 5; ++s) {
                 const int ofs = 1 << s;
                 int Ubuf[32];
-                for (int i = 0; i < 32; ++i) Ubuf[i] = T[i];
+                for (int i = 0; i < 32; ++i) Ubuf[i] = A[i];
                 for (int i = 0; i < 32; ++i) {
                     const int partner = __shfl_xor_sync(mask, Ubuf[i ^ ofs], ofs, 32);
                     A[i] = (((lane ^ i) & ofs) ? partner : Ubuf[i]);
@@ -210,7 +209,7 @@ __global__ void _h0_sm_butterfly(
             // Now lane holds the full row (node_out) across the 32 lanes. Reduce locally.
             if (node_out < used_nodes) {
                 long long acc = 0;
-                for (int i = 0; i < 32; ++i) acc += (long long)T[i];
+                for (int i = 0; i < 32; ++i) acc += (long long)A[i];
 
                 // Single 64-bit atomic per node per block per channel
                 auto* p = reinterpret_cast<unsigned long long*>(base + node_out * 2 + ch);
