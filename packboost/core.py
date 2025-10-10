@@ -135,20 +135,20 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
         # Depths d = 1..max_depth-1
         Dm = max_depth - 1
-        if Dm <= 0:
-            # No work; all zeros
-            return torch.zeros((nfeatsets, N), dtype=out_dtype, device=device)
-
         # Indices: which[fs, d1] in [0..nfolds-1], with d1 = d-1
         which_2d = FST[tree_set, :, 1:].to(torch.long)            # [nfeatsets, Dm]
         idx_flat = which_2d.reshape(-1)                           # [nfeatsets*Dm]
+        
+        d64 = torch.arange(1, max_depth, device=device, dtype=torch.int64)  # [Dm]
+        offsets64 = (d64 * (d64 - 1)) // 2                                  # [Dm]
+        # blocks64 = ((1<<d) - 1) << offsets
+        blocks64 = ((torch.ones_like(d64) << d64) - 1) << offsets64          # [Dm]
+        masks = blocks64.to(dtype=out_dtype)                                 # cast down (wraps as needed)
 
+        
         # Gather LE rows in one shot and reshape -> [nfeatsets, Dm, N]
         LE_sel = LE.index_select(0, idx_flat).view(nfeatsets, Dm, N)
 
-        # Build masks for d=1..max_depth-1 (safe via Python ints -> tensor cast)
-        mask_list = [(((1 << d) - 1) << ((d * (d - 1)) // 2)) for d in range(1, max_depth)]
-        masks = torch.tensor(mask_list, dtype=out_dtype, device=device)   # [Dm]
 
         # Apply masks and reduce across depth.
         # Masks touch disjoint bit ranges, so OR == sum of masked parts.
