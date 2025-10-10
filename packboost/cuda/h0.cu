@@ -154,7 +154,7 @@ __global__ void _h0_sm_butterfly(
         s_hist[SH_idx(n, 0, lane)] = 0;
         s_hist[SH_idx(n, 1, lane)] = 0;
     }
-    __syncthreads();
+    __syncwarp();
 
     // --- accumulate lane-private columns in shared ---
     using U = typename std::make_unsigned<T>::type;
