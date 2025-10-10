@@ -37,6 +37,12 @@ prep_vars(torch::Tensor L,
             torch::Tensor Y,  
             torch::Tensor P);
 
+torch::Tensor h0_sm(
+    torch::Tensor G,        // [N],    int16, cuda
+    torch::Tensor LE,       // [nfolds, N], int16/int32/int64 (signed storage)
+    int max_depth
+);
+
 namespace {
 
 torch::Tensor encode_cuts_binding(torch::Tensor X) {
@@ -91,4 +97,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("round"));
     
     m.def("prep_vars", &prep_vars, "L, Y, P -> LE, G");
+    m.def("h0_sm", &h0_sm, "H0 (featureless, unweighted) Murky-parity launcher");
+
 }

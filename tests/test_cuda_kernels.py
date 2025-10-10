@@ -73,3 +73,64 @@ def test_prep_vars_matches_cpu_reference():
         torch.testing.assert_close(out_LE.cpu(), ref_LE, msg=f"LE mismatch K={K} Dm={Dm} N={N}")
         torch.testing.assert_close(out_G.cpu(),  ref_G,  msg=f"G mismatch  K={K} Dm={Dm} N={N}")
 
+
+def test_h0_matches_cpu_reference():
+    pack_cpu = PackBoost(device="cpu")
+    pack_gpu = PackBoost(device="cuda")
+
+    torch.manual_seed(123)
+
+    # (K=nfolds, max_depth, N). Keep max_depth <= 8 (SMEM bound).
+    cases = [
+        (1, 3, 1),                 # tiny sanity
+        (2, 5, 33),                # N just over a warp
+        (8, 7, 32 * 512 + 1),      # just over a full grid tile
+        (4, 8, 100_003),           # D=8 boundary, large N
+    ]
+
+    # Q30-ish range for Y/P, to reuse prep_vars path
+    lo, hi = -(1 << 30), (1 << 30) - 1
+
+    for K, D, N in cases:
+        # Build inputs for prep_vars so LE/G match Murky packing exactly
+        L = torch.randint(0, 4, (K, D, N), dtype=torch.uint8)     # bits per depth
+        Y = torch.randint(lo, hi + 1, (N,), dtype=torch.int32)
+        P = torch.randint(lo, hi + 1, (N,), dtype=torch.int32)
+
+        # CPU prep_vars → reference LE, G (signed storage OK)
+        ref_LE, ref_G = pack_cpu.prep_vars(L, Y, P)
+
+        # Also create an unsigned-storage variant to exercise launcher branches
+        bits = D * (D - 1) // 2
+        if D <= 6:
+            LE_unsigned = ref_LE.to(torch.uint16)
+        elif D <= 8:
+            LE_unsigned = ref_LE.to(torch.uint32)
+        else:
+            LE_unsigned = ref_LE.to(torch.uint64)
+
+        for use_unsigned in (False, True):
+            LE_host = LE_unsigned if use_unsigned else ref_LE
+            G_host  = ref_G
+
+            # CPU reference
+            H0_ref = pack_cpu.h0(G_host, LE_host, D)
+
+            # GPU result
+            H0_out = pack_gpu.h0(G_host.cuda(), LE_host.cuda(), D)
+            torch.cuda.synchronize()
+
+            # Shape check: [K, 2^D, 2]
+            nodes = 1 << D
+            assert H0_out.shape == (K, nodes, 2)
+            assert H0_ref.shape == (K, nodes, 2)
+
+            # Last row (leaf plane) must be zero by construction
+            assert torch.count_nonzero(H0_out[:, nodes - 1, :]).item() == 0
+            assert torch.count_nonzero(H0_ref[:, nodes - 1, :]).item() == 0
+
+            # Exact equality
+            torch.testing.assert_close(H0_out.cpu(), H0_ref, rtol=0, atol=0,
+                                       msg=f"H0 mismatch K={K} D={D} N={N} (unsigned={use_unsigned})")
+
+

@@ -73,4 +73,31 @@ class PackBoost(BaseEstimator, RegressorMixin):
         return LE.contiguous(), G.contiguous()
 
 
-        
+    def h0(self, G: torch.Tensor, LE: torch.Tensor, max_depth: int) -> torch.Tensor:
+        nfolds, N = LE.shape
+        nodes = 1 << max_depth
+        if (G.is_cuda or LE.is_cuda) and torch.cuda.is_available():
+            return kernels.h0_sm(G.contiguous(), LE.contiguous(), int(max_depth))
+
+        # --- CPU vectorized fallback ---
+        H0 = torch.zeros((nfolds, nodes, 2), dtype=torch.int64, device=LE.device)
+        H0_sum = H0[..., 0]  # [nfolds, nodes]
+        H0_cnt = H0[..., 1]  # [nfolds, nodes]
+
+        le64 = LE.to(torch.int64, copy=False).contiguous()   # [nfolds, N]
+        g64  = G.to(torch.int64,  copy=False).contiguous()   # [N]
+        SRC  = g64.unsqueeze(0).expand(nfolds, N).contiguous()
+        ONES = torch.ones_like(SRC, dtype=torch.int64)
+
+        for d in range(max_depth):
+            if d == 0:
+                idx = torch.zeros((nfolds, N), dtype=torch.long, device=LE.device)
+            else:
+                s = (d * (d - 1)) // 2
+                base = (1 << d) - 1
+                mask = (1 << d) - 1
+                idx = (((le64 >> s) & mask) + base).to(torch.long)
+            H0_sum.scatter_add_(1, idx, SRC)
+            H0_cnt.scatter_add_(1, idx, ONES)
+
+        return H0
