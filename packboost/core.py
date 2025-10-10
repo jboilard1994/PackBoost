@@ -104,3 +104,54 @@ class PackBoost(BaseEstimator, RegressorMixin):
             H0_cnt.scatter_add_(1, idx, ONES)
 
         return H0
+
+    def repack(self, 
+            FST: torch.Tensor,     # [nsets, nfeatsets, max_depth], uint8
+            LE:  torch.Tensor,     # [nfolds, N], packed (same dtype used in prep_vars)
+            tree_set: int) -> torch.Tensor:
+        """
+        Returns LF: [nfeatsets, N] with Murky-parity bit packing:
+        LF[fs, j] = OR_{d=1..max_depth-1} ( LE[ FST[tree_set, fs, d], j ] & mask(d) )
+        where mask(d) = ((1<<d)-1) << ((d*(d-1))//2)
+        """
+        # --- Fast path: GPU kernel ---
+        if FST.is_cuda and LE.is_cuda and torch.cuda.is_available():
+            nfeatsets, N = FST.shape[1], LE.shape[1]
+            LF = torch.empty((nfeatsets, N), dtype=LE.dtype, device=LE.device)
+            # Uses your compiled CUDA kernel; expects contiguous inputs.
+            kernels.repack_trees_for_features(
+                FST.contiguous(), LE.contiguous(), LF, int(tree_set)
+            )
+            return LF.contiguous()
+
+        # --- CPU vectorized path ---
+        # Shapes
+        assert FST.dim() == 3, "FST must be [nsets, nfeatsets, max_depth]"
+        assert LE.dim()  == 2, "LE must be [nfolds, N]"
+        nsets, nfeatsets, max_depth = FST.shape
+        nfolds, N = LE.shape
+        device = LE.device
+        out_dtype = LE.dtype  # keep parity with packed dtype used upstream
+
+        # Depths d = 1..max_depth-1
+        Dm = max_depth - 1
+        if Dm <= 0:
+            # No work; all zeros
+            return torch.zeros((nfeatsets, N), dtype=out_dtype, device=device)
+
+        # Indices: which[fs, d1] in [0..nfolds-1], with d1 = d-1
+        which_2d = FST[tree_set, :, 1:].to(torch.long)            # [nfeatsets, Dm]
+        idx_flat = which_2d.reshape(-1)                           # [nfeatsets*Dm]
+
+        # Gather LE rows in one shot and reshape -> [nfeatsets, Dm, N]
+        LE_sel = LE.index_select(0, idx_flat).view(nfeatsets, Dm, N)
+
+        # Build masks for d=1..max_depth-1 (safe via Python ints -> tensor cast)
+        mask_list = [(((1 << d) - 1) << ((d * (d - 1)) // 2)) for d in range(1, max_depth)]
+        masks = torch.tensor(mask_list, dtype=out_dtype, device=device)   # [Dm]
+
+        # Apply masks and reduce across depth.
+        # Masks touch disjoint bit ranges, so OR == sum of masked parts.
+        LF = (LE_sel & masks.view(1, Dm, 1)).sum(dim=1).to(dtype=out_dtype)  # [nfeatsets, N]
+        return LF.contiguous()
+

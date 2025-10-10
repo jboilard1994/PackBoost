@@ -49,6 +49,13 @@ torch::Tensor h0_sm_butterfly(
     int max_depth
 );
 
+void repack_trees_for_features_cuda(
+    const Tensor& FST,     // uint8  [nsets, nfeatsets, max_depth]
+    const Tensor& LE,      // u16/u32/u64 [nfolds, N]
+    Tensor& LF,            // u16/u32/u64 [nfeatsets, N] (output, in-place fill)
+    int64_t tree_set,      // which set (round)
+);
+
 namespace {
 
 torch::Tensor encode_cuts_binding(torch::Tensor X) {
@@ -105,5 +112,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("prep_vars", &prep_vars, "L, Y, P -> LE, G");
     m.def("h0_sm", &h0_sm, "H0 (featureless, unweighted) Murky-parity launcher");
     m.def("h0_sm_butterfly", &h0_sm_butterfly, "H0 butterfly reduce-scatter launcher");
+    m.def("repack_trees_for_features",
+        &repack_trees_for_features_cuda,
+        "Repack trees for features (Murky parity, CUDA)");
 
 }

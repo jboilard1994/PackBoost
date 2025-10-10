@@ -16,6 +16,7 @@ def _load_extension() -> ModuleType:
         str(src_dir / "et_sample_1b.cu"),
         str(src_dir / "prep_vars.cu"),
         str(src_dir / "h0.cu"),
+        str(src_dir / "repack.cu"),
     ]
     return load(
         name="packboost_cuda_kernels",

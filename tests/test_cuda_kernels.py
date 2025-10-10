@@ -134,3 +134,51 @@ def test_h0_matches_cpu_reference():
                                        msg=f"H0 mismatch K={K} D={D} N={N} (unsigned={use_unsigned})")
 
 
+def test_repack_matches_cpu_reference():
+    pack_cpu = PackBoost(device="cpu")
+    pack_gpu = PackBoost(device="cuda")
+
+    torch.manual_seed(7)
+
+    # (K=nfolds, D=max_depth, N=samples, nfeatsets, nsets)
+    cases = [
+        (1, 3, 1,                7,   2),          # tiny, nfeatsets not multiple of 8
+        (2, 5, 33,               17,  3),          # N just over a warp; tail nfeatsets
+        (8, 7, 32 * 512 - 1,     32,  3),          # just under full grid tile
+        (8, 7, 32 * 512 + 5,     63,  4),          # over tile + tail nfeatsets (63)
+        (16, 8, 100_003,         40,  2),          # D=8 boundary; larger K
+    ]
+
+    for K, D, N, nfeatsets, nsets in cases:
+        # Build LE via prep_vars to ensure Murky-identical bit packing
+        L = torch.randint(0, 4, (K, D - 1, N), dtype=torch.uint8)
+        Y = torch.zeros(N, dtype=torch.int32)
+        P = torch.zeros(N, dtype=torch.int32)
+        LE, _ = pack_cpu.prep_vars(L, Y, P)  # dtype auto: u16/u32/u64 based on D
+
+        # Build FST: [nsets, nfeatsets, D], each depth is a shuffled tiling of [0..K-1]
+        base = torch.arange(K, dtype=torch.uint8)
+        rep = (nfeatsets + K - 1) // K
+        row = base.repeat(rep)[:nfeatsets]
+        FST = torch.empty((nsets, nfeatsets, D), dtype=torch.uint8)
+        for s in range(nsets):
+            for d in range(D):
+                perm = torch.randperm(nfeatsets)
+                FST[s, :, d] = row[perm]
+
+        tree_set = (3 * K + 5) % nsets  # deterministic, within range
+
+        # CPU reference
+        LF_ref = pack_cpu.repack(FST, LE, tree_set)
+
+        # GPU output
+        LF_out = pack_gpu.repack(FST.cuda(), LE.cuda(), tree_set)
+        torch.cuda.synchronize()
+
+        # Checks
+        assert LF_out.dtype == LF_ref.dtype, f"dtype mismatch: {LF_out.dtype} vs {LF_ref.dtype}"
+        assert LF_out.shape == LF_ref.shape == (nfeatsets, N)
+        torch.testing.assert_close(
+            LF_out.cpu(), LF_ref, rtol=0, atol=0,
+            msg=f"LF mismatch K={K} D={D} N={N} nfeatsets={nfeatsets} nsets={nsets}"
+        )
