@@ -183,6 +183,42 @@ __global__ void _h0_sm_butterfly(
     long long* base = reinterpret_cast<long long*>(H0) + ((long long)tree_set * nodes * 2);
 
     for (int k0 = 0; k0 < used_nodes; k0 += 32) {
+        #pragma unroll
+        for (int ch = 0; ch < 2; ++ch) {
+            // Each lane loads its column (32 rows in this tile) into registers
+            int A[32];
+            // Precompute shared index stride: node_stride = 2 * 32 (2 channels × 32 lanes)
+            int idx = (k0 * 2 + ch) * 32 + lane;
+            #pragma unroll
+            for (int i = 0; i < 32; ++i, idx += 64) {  // +64 == 2*32
+                const int node = k0 + i;
+                A[i] = (node < used_nodes) ? s_hist[idx] : 0;
+            }
+    
+            // Butterfly SUM across lanes for each i (no transpose needed)
+            #pragma unroll
+            for (int s = 0; s < 5; ++s) {
+                const int ofs = 1 << s;
+                #pragma unroll
+                for (int i = 0; i < 32; ++i) {
+                    A[i] += __shfl_xor_sync(mask, A[i], ofs, 32);
+                }
+            }
+    
+            // Scatter: lane ℓ writes node_out = k0 + ℓ
+            const int node_out = k0 + lane;
+            if (node_out < used_nodes) {
+                const long long acc = (long long)A[lane];
+                if (acc) {
+                    auto* p = reinterpret_cast<unsigned long long*>(base + node_out * 2 + ch);
+                    atomicAdd(p, (unsigned long long)acc);
+                }
+            }
+        }
+    }
+
+    /*
+    for (int k0 = 0; k0 < used_nodes; k0 += 32) {
         const int node_out = k0 + lane;  // row this lane will own after transpose
 
         #pragma unroll
@@ -195,7 +231,7 @@ __global__ void _h0_sm_butterfly(
             }
 
             // Butterfly transpose (EXACT core you validated: U[i ^ ofs], gate on ((lane ^ i) & ofs))
-            /*
+            
             #pragma unroll
             for (int s = 0; s < 5; ++s) {
                 const int ofs = 1 << s;
@@ -206,21 +242,7 @@ __global__ void _h0_sm_butterfly(
                     A[i] = (((lane ^ i) & ofs) ? partner : Ubuf[i]);
                 }
             }
-            */
-
-            #pragma unroll
-            for (int s = 0; s < 5; ++s) {
-                const int ofs = 1 << s;
-                for (int i = 0; i < 32; ++i) {
-                    // Exchange data with the partner lane
-                    int partner_val = __shfl_xor_sync(mask, A[i ^ ofs], ofs, 32);
-                    
-                    // The gate condition determines if this thread should use the partner's value
-                    if (((lane ^ i) & ofs) != 0) {
-                        A[i] = partner_val;
-                    }
-                }
-            }
+            
 
             // Now lane holds the full row (node_out) across the 32 lanes. Reduce locally.
             if (node_out < used_nodes) {
@@ -233,6 +255,7 @@ __global__ void _h0_sm_butterfly(
             }
         }
     }
+        */
 }
 
 
