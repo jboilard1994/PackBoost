@@ -141,7 +141,6 @@ static __device__ __forceinline__ uint64_t add_pack(uint64_t a, uint64_t b) {
 }
 
 template <typename T>
-__launch_bounds__(32,2)
 __global__ void _h0_sm_butterfly(
     const int16_t* __restrict__ G,   // [N]
     const T*       __restrict__ LE,  // [nfolds, N], UNSIGNED in template
@@ -266,11 +265,14 @@ torch::Tensor h0_sm_butterfly(
 
     // Murky tiling
     static constexpr int lanes   = 32;
-    int SM = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-    int target_blocks_per_SM = 2;
-    int min_blocks = SM * target_blocks_per_SM;
-    int strides = std::max(32, (min_blocks + nfolds - 1) / nfolds); // grid.y
-    strides = std::min(strides, 512); // upper cap like Murky
+    int target_stride_per_warp = 256;
+
+    int64_t total_warp_iterations = (N64 + lanes - 1) / lanes;
+    int strides = (total_warp_iterations + target_stride_per_warp - 1) / target_stride_per_warp;
+    strides = std::min(strides, 512);
+    if (strides == 0) strides = 1;
+    int stride = (N + (lanes * strides) - 1) / (lanes * strides);
+    if (stride < 1) stride = 1;
 
     const dim3 block(lanes, 1, 1);
     const dim3 grid (nfolds, strides, 1);
