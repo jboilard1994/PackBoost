@@ -344,7 +344,6 @@ __global__ void _h_partials(
         const uint32_t lf_hi_lane = (uint32_t)(lf_lane >> 32);
 
         // 32 columns in this tile
-        #pragma unroll
         for (int k = 0; k < 32; ++k) {
             const int jj_k = base + k;
             const unsigned mask_k = __ballot_sync(full, jj_k < N);
@@ -361,7 +360,6 @@ __global__ void _h_partials(
             if (!v) continue;
 
             // dynamic depths: node = ((1<<d)-1) + (lk & ((1<<d)-1)); lk >>= d
-            #pragma unroll 1
             for (int d = 0; d < D; ++d) {
                 const unsigned to = (d==0) ? 0u : ((1u<<d) - 1u);
                 const unsigned tk = (d==0) ? 0u : (unsigned)(lk & to);
