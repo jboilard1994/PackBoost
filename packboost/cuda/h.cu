@@ -89,6 +89,7 @@ __global__ void _h_sm(
         else                valid_mask = 0u;
         xfd_local &= valid_mask;
 
+        #pragma unroll 32
         for (int k = 0; k < 32; ++k) {
         // consume one bit per iter (per-lane)
         const int v = static_cast<int>(xfd_local & 1u);
