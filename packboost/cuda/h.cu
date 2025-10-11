@@ -316,7 +316,7 @@ __global__ void _h_sm_hierarchical(
     const uint32_t* __restrict__ XS,
     const int32_t* __restrict__ Y,
     const LF_T* __restrict__ LF,
-    long long* __restrict__ H,
+    int64_t* __restrict__ H,
     int nfeatsets,
     int cols_32M,
     int N,
