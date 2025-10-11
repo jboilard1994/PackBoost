@@ -13,7 +13,7 @@
 static inline __device__ long long* Hptr(long long* H, int nodes,
                                          int feat, int node, int chan, int lane) {
   size_t idx = (((static_cast<size_t>(feat) * nodes + node) * 2 + chan) * 32u + lane);
-  return H + idx;
+  return (unsigned long long int)(H + idx);
 }
 
 // ---------------- Kernel (templated on LF dtype) ----------------
