@@ -142,8 +142,8 @@ __global__ void _h_sm(
       const int base = ((node - 7) * 2) * 32 + lane;
       const int64_t fsum = static_cast<int64_t>(shmem[base + 0]);
       const int64_t csum = static_cast<int64_t>(shmem[base + 32]);
-      atomicAdd(Hptr(H, nodes_total, feat_set, node, 0, lane), (uint64_t)fsum);
-      atomicAdd(Hptr(H, nodes_total, feat_set, node, 1, lane), (uint64_t)csum);
+      atomicAdd(Hptr(H, nodes_total, feat_set, node, 0, lane), (unsigned long long int)fsum);
+      atomicAdd(Hptr(H, nodes_total, feat_set, node, 1, lane), (unsigned long long int)csum);
     }
   }
 }
