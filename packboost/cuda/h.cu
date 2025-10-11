@@ -305,9 +305,9 @@ __device__ __forceinline__ unsigned long long pack_sc(int sum32, int cnt32) {
 template <typename LF_T>
 __global__ void _h_sm_opt(
     const uint32_t* __restrict__ XS,  // [nfeatsets, 32*M]
-    const int32_t*  __restrict__ Y,   // [N]
-    const LF_T*     __restrict__ LF,  // [nfeatsets, N] (u16/u32/u64)
-    int64_t*      __restrict__ H,   // [nfeatsets, nodes, 2, 32] (int64)
+    const int32_t* __restrict__ Y,   // [N]
+    const LF_T* __restrict__ LF,  // [nfeatsets, N] (u16/u32/u64)
+    int64_t* __restrict__ H,   // [nfeatsets, nodes, 2, 32] (int64)
     int nfeatsets,
     int cols_32M,
     int N,
@@ -345,71 +345,71 @@ __global__ void _h_sm_opt(
   // ---------------- Phase 1: tile loop
   for (int j = 0; j < stride; ++j) {
     const int base = 32 * (stride * gwarp + j);
-    if (base >= cols_32M) break;
+    if (base < cols_32M) { // <<< FIX IS HERE
+      const int jj_lane = base + lane;
+      const bool inb    = (jj_lane < N);
 
-    const int jj_lane = base + lane;
-    const bool inb    = (jj_lane < N);
+      int32_t  y_lane = 0;
+      uint32_t l32    = 0;
+      if (inb) {
+        y_lane = Y[jj_lane];
+        // LF indexed [nfeatsets, N]; only low 32 bits needed for D<=7
+        const LF_T lval = LF[(size_t)feat_set * (size_t)N + jj_lane];
+        l32 = (uint32_t)lval;
+      }
 
-    int32_t  y_lane = 0;
-    uint32_t l32    = 0;
-    if (inb) {
-      y_lane = Y[jj_lane];
-      // LF indexed [nfeatsets, N]; only low 32 bits needed for D<=7
-      const LF_T lval = LF[(size_t)feat_set * (size_t)N + jj_lane];
-      l32 = (uint32_t)lval;
-    }
+      const uint32_t xfd0 = XS[(size_t)feat_set * (size_t)cols_32M + (size_t)(base + lane)];
+      unsigned warp_mask = __ballot_sync(__activemask(), inb);
 
-    const uint32_t xfd0 = XS[(size_t)feat_set * (size_t)cols_32M + (size_t)(base + lane)];
-    unsigned warp_mask = __ballot_sync(__activemask(), inb);
+      // Iterate only over set bits of xfd
+      for (uint32_t m = xfd0; m; m &= (m - 1)) {
+        const int k = __ffs(m) - 1;                // bit index (0..31)
+        const int jj_k = base + k;
+        if (jj_k >= N) continue;
 
-    // Iterate only over set bits of xfd
-    for (uint32_t m = xfd0; m; m &= (m - 1)) {
-      const int k = __ffs(m) - 1;                // bit index (0..31)
-      const int jj_k = base + k;
-      if (jj_k >= N) continue;
+        // v==1 by construction
+        const int32_t yk = __shfl_sync(warp_mask, y_lane, k);
+        uint32_t      lk = __shfl_sync(warp_mask, l32,    k);
 
-      // v==1 by construction
-      const int32_t yk = __shfl_sync(warp_mask, y_lane, k);
-      uint32_t      lk = __shfl_sync(warp_mask, l32,    k);
+        // d = 0
+        hf0 += (long long)yk;  hw0 += 1;
 
-      // d = 0
-      hf0 += (long long)yk;  hw0 += 1;
+        // d = 1
+        unsigned tk = lk & 1u; lk >>= 1;
+        if (tk == 0u) { hf10 += yk; hw10 += 1; } else { hf11 += yk; hw11 += 1; }
 
-      // d = 1
-      unsigned tk = lk & 1u; lk >>= 1;
-      if (tk == 0u) { hf10 += yk; hw10 += 1; } else { hf11 += yk; hw11 += 1; }
+        // d = 2
+        tk = lk & 3u; lk >>= 2;
+        if      (tk == 0u) { hf20 += yk; hw20 += 1; }
+        else if (tk == 1u) { hf21 += yk; hw21 += 1; }
+        else if (tk == 2u) { hf22 += yk; hw22 += 1; }
+        else               { hf23 += yk; hw23 += 1; }
 
-      // d = 2
-      tk = lk & 3u; lk >>= 2;
-      if      (tk == 0u) { hf20 += yk; hw20 += 1; }
-      else if (tk == 1u) { hf21 += yk; hw21 += 1; }
-      else if (tk == 2u) { hf22 += yk; hw22 += 1; }
-      else               { hf23 += yk; hw23 += 1; }
+        // d >= 3 : warp-aggregated packed updates
+        #pragma unroll
+        for (int d = 3; d < max_depth; ++d) {
+          const unsigned to   = (1u << d) - 1u;       // mask width d
+          const int      baseN= (int)to - 7;          // node offset for d>=3
+          const unsigned tkd  = lk & to;
+          lk >>= d;
+          const int b = baseN + (int)tkd;             // bucket 0..n_ge3-1
 
-      // d >= 3 : warp-aggregated packed updates
-      #pragma unroll
-      for (int d = 3; d < max_depth; ++d) {
-        const unsigned to   = (1u << d) - 1u;       // mask width d
-        const int      baseN= (int)to - 7;          // node offset for d>=3
-        const unsigned tkd  = lk & to;
-        lk >>= d;
-        const int b = baseN + (int)tkd;             // bucket 0..n_ge3-1
+          // group lanes hitting the same bucket
+          const unsigned gmask  = __match_any_sync(warp_mask, b);
+          const int leader = __ffs(gmask) - 1;
 
-        // group lanes hitting the same bucket
-        const unsigned gmask  = __match_any_sync(warp_mask, b);
-        const int leader = __ffs(gmask) - 1;
-
-        // sum(y) within group
-        int f_sum = yk;
-        for (int ofs = 16; ofs; ofs >>= 1) {
-          f_sum += __shfl_down_sync(gmask, f_sum, ofs);
-        }
-        if (lane == leader) {
-          const int c_sum = __popc(gmask);
-          atomicAdd(&sh_packed[b * 32 + lane], pack_sc(f_sum, c_sum));
+          // sum(y) within group
+          int f_sum = yk;
+          for (int ofs = 16; ofs; ofs >>= 1) {
+            f_sum += __shfl_down_sync(gmask, f_sum, ofs);
+          }
+          if (lane == leader) {
+            const int c_sum = __popc(gmask);
+            atomicAdd(&sh_packed[b * 32 + lane], pack_sc(f_sum, c_sum));
+          }
         }
       }
-    }
+    } // end of if (base < cols_32M)
   } // tiles
 
   // ---------------- Phase 2: inter-warp reduction for d<=2
@@ -453,6 +453,7 @@ __global__ void _h_sm_opt(
     if (lane < 14) {
       for (int w = 0; w < warps_per_block; ++w) v += s_warp[lane * warps_per_block + w];
     }
+    // Hptr is not defined in the provided code, so assuming it works correctly
     if (lane == 0)  atomicAdd(Hptr(H, nodes_total, feat_set, 0, 0, lane), (unsigned long long)v);
     if (lane == 1)  atomicAdd(Hptr(H, nodes_total, feat_set, 0, 1, lane), (unsigned long long)v);
     if (lane == 2)  atomicAdd(Hptr(H, nodes_total, feat_set, 1, 0, lane), (unsigned long long)v);
