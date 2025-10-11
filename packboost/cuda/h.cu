@@ -434,20 +434,20 @@ __global__ void _h_sm_hierarchical(
     }
     
     // Final write-out. Each lane writes one value.
-    if (lane == 0)  atomicAdd(Hptr(H, nodes_total, feat_set, 0, 0, threadIdx.x), (unsigned long long)final_val);
-    if (lane == 1)  atomicAdd(Hptr(H, nodes_total, feat_set, 0, 1, threadIdx.x), (unsigned long long)final_val);
-    if (lane == 2)  atomicAdd(Hptr(H, nodes_total, feat_set, 1, 0, threadIdx.x), (unsigned long long)final_val);
-    if (lane == 3)  atomicAdd(Hptr(H, nodes_total, feat_set, 1, 1, threadIdx.x), (unsigned long long)final_val);
-    if (lane == 4)  atomicAdd(Hptr(H, nodes_total, feat_set, 2, 0, threadIdx.x), (unsigned long long)final_val);
-    if (lane == 5)  atomicAdd(Hptr(H, nodes_total, feat_set, 2, 1, threadIdx.x), (unsigned long long)final_val);
-    if (lane == 6)  atomicAdd(Hptr(H, nodes_total, feat_set, 3, 0, threadIdx.x), (unsigned long long)final_val);
-    if (lane == 7)  atomicAdd(Hptr(H, nodes_total, feat_set, 3, 1, threadIdx.x), (unsigned long long)final_val);
-    if (lane == 8)  atomicAdd(Hptr(H, nodes_total, feat_set, 4, 0, threadIdx.x), (unsigned long long)final_val);
-    if (lane == 9)  atomicAdd(Hptr(H, nodes_total, feat_set, 4, 1, threadIdx.x), (unsigned long long)final_val);
-    if (lane == 10) atomicAdd(Hptr(H, nodes_total, feat_set, 5, 0, threadIdx.x), (unsigned long long)final_val);
-    if (lane == 11) atomicAdd(Hptr(H, nodes_total, feat_set, 5, 1, threadIdx.x), (unsigned long long)final_val);
-    if (lane == 12) atomicAdd(Hptr(H, nodes_total, feat_set, 6, 0, threadIdx.x), (unsigned long long)final_val);
-    if (lane == 13) atomicAdd(Hptr(H, nodes_total, feat_set, 6, 1, threadIdx.x), (unsigned long long)final_val);
+    if (lane == 0)  atomicAdd(Hptr(H, nodes_total, feat_set, 0, 0, threadIdx.x), (unsigned long long int)final_val);
+    if (lane == 1)  atomicAdd(Hptr(H, nodes_total, feat_set, 0, 1, threadIdx.x), (unsigned long long int)final_val);
+    if (lane == 2)  atomicAdd(Hptr(H, nodes_total, feat_set, 1, 0, threadIdx.x), (unsigned long long int)final_val);
+    if (lane == 3)  atomicAdd(Hptr(H, nodes_total, feat_set, 1, 1, threadIdx.x), (unsigned long long int)final_val);
+    if (lane == 4)  atomicAdd(Hptr(H, nodes_total, feat_set, 2, 0, threadIdx.x), (unsigned long long int)final_val);
+    if (lane == 5)  atomicAdd(Hptr(H, nodes_total, feat_set, 2, 1, threadIdx.x), (unsigned long long int)final_val);
+    if (lane == 6)  atomicAdd(Hptr(H, nodes_total, feat_set, 3, 0, threadIdx.x), (unsigned long long int)final_val);
+    if (lane == 7)  atomicAdd(Hptr(H, nodes_total, feat_set, 3, 1, threadIdx.x), (unsigned long long int)final_val);
+    if (lane == 8)  atomicAdd(Hptr(H, nodes_total, feat_set, 4, 0, threadIdx.x), (unsigned long long int)final_val);
+    if (lane == 9)  atomicAdd(Hptr(H, nodes_total, feat_set, 4, 1, threadIdx.x), (unsigned long long int)final_val);
+    if (lane == 10) atomicAdd(Hptr(H, nodes_total, feat_set, 5, 0, threadIdx.x), (unsigned long long int)final_val);
+    if (lane == 11) atomicAdd(Hptr(H, nodes_total, feat_set, 5, 1, threadIdx.x), (unsigned long long int)final_val);
+    if (lane == 12) atomicAdd(Hptr(H, nodes_total, feat_set, 6, 0, threadIdx.x), (unsigned long long int)final_val);
+    if (lane == 13) atomicAdd(Hptr(H, nodes_total, feat_set, 6, 1, threadIdx.x), (unsigned long long int)final_val);
   }
 
   // --- Phase 3: Optimized Drain for Depths >= 3 ---
@@ -514,17 +514,17 @@ torch::Tensor h_sm_hierarchical(
   if (lf_dt == torch::kUInt16) {
     cudaFuncSetAttribute(_h_sm_hierarchical<uint16_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     _h_sm_hierarchical<uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
-      XS_ptr, Y.data_ptr<int32_t>(), LF.data_ptr<uint16_t>(), H.data_ptr<long long>(),
+      XS_ptr, Y.data_ptr<int32_t>(), LF.data_ptr<uint16_t>(), H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth, warps_per_block, stride, nodes_tot);
   } else if (lf_dt == torch::kUInt32) {
     cudaFuncSetAttribute(_h_sm_hierarchical<uint32_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     _h_sm_hierarchical<uint32_t><<<grid, block, smem_bytes, stream.stream()>>>(
-      XS_ptr, Y.data_ptr<int32_t>(), LF.data_ptr<uint32_t>(), H.data_ptr<long long>(),
+      XS_ptr, Y.data_ptr<int32_t>(), LF.data_ptr<uint32_t>(), H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth, warps_per_block, stride, nodes_tot);
   } else if (lf_dt == torch::kUInt64) {
     cudaFuncSetAttribute(_h_sm_hierarchical<uint64_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     _h_sm_hierarchical<uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
-      XS_ptr, Y.data_ptr<int32_t>(), static_cast<uint64_t*>(LF.data_ptr()), H.data_ptr<long long>(),
+      XS_ptr, Y.data_ptr<int32_t>(), static_cast<uint64_t*>(LF.data_ptr()), H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth, warps_per_block, stride, nodes_tot);
   } else {
     TORCH_CHECK(false, "Unsupported LF dtype: ", lf_dt);
