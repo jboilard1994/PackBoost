@@ -387,14 +387,7 @@ torch::Tensor h_sm_sw(
     torch::Tensor LF,   // [F, N], (u)int16/32/64
     int max_depth
 ){
-    TORCH_CHECK(XS.is_cuda() && Y.is_cuda() && LF.is_cuda(), "XS, Y, LF must be CUDA.");
-    TORCH_CHECK(XS.dim()==2 && Y.dim()==1 && LF.dim()==2, "XS[F,32*M], Y[N], LF[F,N].");
-    TORCH_CHECK((XS.scalar_type()==c10::ScalarType::UInt || XS.scalar_type()==c10::ScalarType::Int),
-                "XS must be uint32/int32.");
-    TORCH_CHECK(Y.scalar_type()==c10::ScalarType::Int, "Y must be int32.");
-    TORCH_CHECK(max_depth>=1 && max_depth<=9, "Supports 1..9.");
-    TORCH_CHECK(XS.size(1) % 32 == 0, "XS.shape[1] must be divisible by 32.");
-
+    
     const int64_t F64 = XS.size(0);
     const int64_t C64 = XS.size(1);     // 32*M
     const int64_t N64 = Y.size(0);
@@ -436,19 +429,19 @@ torch::Tensor h_sm_sw(
     const uint32_t* XS_u32 = reinterpret_cast<const uint32_t*>(XS.data_ptr());
     const auto dt = LF.scalar_type();
 
-    if (dt == c10::ScalarType::UInt16) {
+    if (dt == torch::kUInt16) {
         cudaFuncSetAttribute(_h_sm_sw<uint16_t>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
         _h_sm_sw<uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
             XS_u32, Y.data_ptr<int32_t>(), LF.data_ptr<uint16_t>(),
             H.data_ptr<int64_t>(), F, cols_32M, N, D, stride_per_block, nodes_tot);
-    } else if (dt == c10::ScalarType::UInt32) {
+    } else if (dt == torch::kUInt32) {
         cudaFuncSetAttribute(_h_sm_sw<uint32_t>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
         _h_sm_sw<uint32_t><<<grid, block, smem_bytes, stream.stream()>>>(
             XS_u32, Y.data_ptr<int32_t>(), LF.data_ptr<uint32_t>(),
             H.data_ptr<int64_t>(), F, cols_32M, N, D, stride_per_block, nodes_tot);
-    } else if (dt == c10::ScalarType::UInt64) {
+    } else if (dt == torch::kUInt64) {
         cudaFuncSetAttribute(_h_sm_sw<uint64_t>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
         _h_sm_sw<uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
