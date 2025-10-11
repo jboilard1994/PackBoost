@@ -300,7 +300,7 @@ __global__ void _h_partials(
     const int bidx  = blockIdx.y;       // 0..B-1 (this block's partial slot)
     if (feat >= F || bidx >= B) return;
 
-    const int lane  = threadIdx.x & (32-1);
+    const int lane  = threadIdx.x & 31;
     const int wid   = threadIdx.x >> 5;               // 0..warps_per_block-1
     const int gwarp = warps_per_block * bidx + wid;   // global warp ordinal along samples
 
@@ -308,14 +308,16 @@ __global__ void _h_partials(
     extern __shared__ int s_hist[];                   // [nodes_tot, 2, 32] int32
     const size_t hist_ints = (size_t)nodes_tot * 2 * 32;
 
-    // helpers
+    // helper
     auto HIST = [&](int node, int ch, int l)->int& {
-        return s_hist[( (size_t)node * 2 + ch ) * 32 + l];
+        return s_hist[((size_t)node * 2 + ch) * 32 + l];
     };
 
     // zero cooperatively
     for (size_t i = threadIdx.x; i < hist_ints; i += blockDim.x) s_hist[i] = 0;
     __syncthreads();
+
+    const unsigned full = __activemask();
 
     // iterate tiles owned by this warp
     for (int j = 0; j < stride_per_warp; ++j) {
@@ -337,25 +339,29 @@ __global__ void _h_partials(
                 (typename std::make_unsigned<LF_T>::type)
                 (LF[(size_t)feat * N + jj_lane]));
         }
+        // split 64b into two 32b pieces for shuffles
+        const uint32_t lf_lo_lane = (uint32_t)(lf_lane & 0xFFFFFFFFull);
+        const uint32_t lf_hi_lane = (uint32_t)(lf_lane >> 32);
 
-        const unsigned full = __activemask();
-
+        // 32 columns in this tile
+        #pragma unroll
         for (int k = 0; k < 32; ++k) {
             const int jj_k = base + k;
             const unsigned mask_k = __ballot_sync(full, jj_k < N);
-            if (!mask_k) break;
+            if (!mask_k) break;  // all lanes agree there is no more work in this tile
 
-            // always broadcast with the same mask
-            const int  yk = __shfl_sync(mask_k, y_lane,  k);
-            uint64_t   lk = (uint64_t)__shfl_sync(mask_k, l_lo, k)
-                        | ((uint64_t)__shfl_sync(mask_k, l_hi, k) << 32);
+            // always broadcast with the same mask_k
+            const int  yk  = __shfl_sync(mask_k, y_lane,     k, 32);
+            const uint32_t loK = __shfl_sync(mask_k, lf_lo_lane, k, 32);
+            const uint32_t hiK = __shfl_sync(mask_k, lf_hi_lane, k, 32);
+            unsigned long long lk = (unsigned long long)loK | ((unsigned long long)hiK << 32);
 
             // lane’s bit for this column
-            const int v = (xbits >> k) & 1u;
+            const int v = (int)((xbits >> k) & 1u);
             if (!v) continue;
 
-
             // dynamic depths: node = ((1<<d)-1) + (lk & ((1<<d)-1)); lk >>= d
+            #pragma unroll 1
             for (int d = 0; d < D; ++d) {
                 const unsigned to = (d==0) ? 0u : ((1u<<d) - 1u);
                 const unsigned tk = (d==0) ? 0u : (unsigned)(lk & to);
@@ -377,13 +383,14 @@ __global__ void _h_partials(
     int64_t* base_ptr = SCR + ((size_t)feat * nodes_tot) * (2*32*B);
 
     for (int node = wid; node < nodes_tot; node += warps_per_block) {
-        const size_t base_off = (size_t)node * nodes_stride + lane * lane_stride + bidx;
+        const size_t base_off = (size_t)node * nodes_stride + (size_t)lane * lane_stride + bidx;
         const int fs = HIST(node, 0, lane);
         const int cs = HIST(node, 1, lane);
         base_ptr[base_off + 0*ch_stride] = (long long)fs;
         base_ptr[base_off + 1*ch_stride] = (long long)cs;
     }
 }
+
 
 // ------------------------ Kernel B: reduce partials to final H ------------------------
 __global__ void _h_reduce(
