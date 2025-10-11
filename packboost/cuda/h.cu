@@ -663,9 +663,6 @@ __global__ void _h_multiwarp_fast(
   }
 }
 
-
-static inline int ceil_div_int(int a, int b){ return (a + b - 1) / b; }
-
 // Heuristic + perf caps: prefer W<=5 at D=7, W<=4 at D=8, W<=3 at D=9
 static inline int perf_cap_warps(int max_depth){
   if (max_depth <= 7) return 5;
