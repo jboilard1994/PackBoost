@@ -444,7 +444,7 @@ torch::Tensor h_two_pass(
         "D=8 fits on 64KB, D=9 needs ~128KB (A100-class).");
 
     // Choose warps_per_block and B (blocks_per_feat) to keep GPU busy
-    int warps_per_block = std::min(16, prop->maxThreadsPerBlock / WARP);
+    int warps_per_block = std::min(16, prop->maxThreadsPerBlock / 32);
     if (warps_per_block < 1) warps_per_block = 1;
 
     int SM = prop->multiProcessorCount;
@@ -454,7 +454,7 @@ torch::Tensor h_two_pass(
     if (B < 16) B = 16; // ensure enough partials
 
     // per-warp tiles along samples
-    int stride_per_warp = (N + (WARP * B * warps_per_block) - 1) / (WARP * B * warps_per_block);
+    int stride_per_warp = (N + (32 * B * warps_per_block) - 1) / (32 * B * warps_per_block);
     if (stride_per_warp < 1) stride_per_warp = 1;
 
     // Allocate scratch: [F, nodes_tot, 2, 32, B] int64
@@ -466,7 +466,7 @@ torch::Tensor h_two_pass(
                           LF.options().dtype(torch::kLong).memory_format(c10::MemoryFormat::Contiguous));
 
     const dim3 gridA(F, B, 1);
-    const dim3 blockA(warps_per_block * WARP, 1, 1);
+    const dim3 blockA(warps_per_block * 32, 1, 1);
     const size_t smemA = hist_bytes;
 
     const dim3 gridB(F, (unsigned)nodes_tot, 2);
