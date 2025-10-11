@@ -10,7 +10,7 @@
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
 // H layout helper: [nfeatsets, nodes, 2, 32]
-static inline __device__ long long* Hptr(long long* H, int nodes,
+static inline __device__ unsigned long long int* Hptr(long long* H, int nodes,
                                          int feat, int node, int chan, int lane) {
   size_t idx = (((static_cast<size_t>(feat) * nodes + node) * 2 + chan) * 32u + lane);
   return (unsigned long long int)(H + idx);
