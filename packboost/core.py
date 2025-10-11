@@ -176,7 +176,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         # --- GPU fast path ---
         if (XS.is_cuda or Y.is_cuda or LF.is_cuda) and torch.cuda.is_available():
             # Expect your compiled extension to expose kernels.h_sm
-            return kernels.h_multiwarp_generic(XS.contiguous(), Y.to(torch.int32).contiguous(), LF.contiguous(), int(max_depth))
+            return kernels.h_two_pass(XS.contiguous(), Y.to(torch.int32).contiguous(), LF.contiguous(), int(max_depth))
 
         # --- CPU vectorized fallback ---
         dev = XS.device
