@@ -62,7 +62,11 @@ torch::Tensor h_sm(
     torch::Tensor LF,
     int max_depth);
 
-
+torch::Tensor h_multiwarp_fast(
+    torch::Tensor XS,  // [nfeatsets, 32*M] (uint32/int32)
+    torch::Tensor Y,   // [N] (int32)
+    torch::Tensor LF,  // [nfeatsets, N] (uint16/32/64) — use uint64 for D=9
+    int max_depth);
 
 namespace {
 
@@ -125,5 +129,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Repack trees for features (Murky parity, CUDA)");
 
     m.def("h_sm", &h_sm, "PackBoost H (unweighted histogram, Murky parity; returns H)");
+
+    m.def("h_multiwarp_fast", &h_multiwarp_fast, "PackBoost H (unweighted histogram, Murky parity; returns H)");
+
 
 }
