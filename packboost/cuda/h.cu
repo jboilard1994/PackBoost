@@ -288,20 +288,17 @@ torch::Tensor h_sm(
 
 // ---------------- Warp reduce helpers
 __device__ __forceinline__ long long warp_reduce_sum_ll(long long v, unsigned mask = FULL_MASK) {
-#if __CUDA_ARCH__ >= 800
-    return __reduce_add_sync(mask, v);
-#else
-    for (int ofs = WARP_SIZE >> 1; ofs; ofs >>= 1) v += __shfl_down_sync(mask, v, ofs);
+    #pragma unroll
+    for (int ofs = WARP_SIZE >> 1; ofs; ofs >>= 1)
+        v += __shfl_down_sync(mask, v, ofs);   // works for 64-bit on recent toolchains
     return v;
-#endif
 }
+
 __device__ __forceinline__ int warp_reduce_sum_int(int v, unsigned mask = FULL_MASK) {
-#if __CUDA_ARCH__ >= 800
-    return __reduce_add_sync(mask, v);
-#else
-    for (int ofs = WARP_SIZE >> 1; ofs; ofs >>= 1) v += __shfl_down_sync(mask, v, ofs);
+    #pragma unroll
+    for (int ofs = WARP_SIZE >> 1; ofs; ofs >>= 1)
+        v += __shfl_down_sync(mask, v, ofs);
     return v;
-#endif
 }
 
 // ---------------- Kernel
