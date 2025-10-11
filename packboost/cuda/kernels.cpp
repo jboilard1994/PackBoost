@@ -56,6 +56,12 @@ void repack_trees_for_features_cuda(
     int64_t tree_set      // which set (round)
 );
 
+torch::Tensor h_sm(
+    torch::Tensor XS,
+    torch::Tensor Y,
+    torch::Tensor LF,
+    int max_depth)
+
 namespace {
 
 torch::Tensor encode_cuts_binding(torch::Tensor X) {
