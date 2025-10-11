@@ -25,12 +25,12 @@ static __device__ __forceinline__ unsigned long long add_pack(unsigned long long
 // ---------------- Kernel (templated on LF dtype) ----------------
 template <typename LF_T>
 __global__ void _h_sm(
-    const uint32_t* __restrict__ XS, // [nfeatsets, 32*M]
-    const int32_t* __restrict__ Y, // [N]
+    const uint32_t* __restrict__ XS, // [nfeatsets, N]
+    const int16_t* __restrict__ Y, // [N]
     const LF_T* __restrict__ LF, // [nfeatsets, N] (u16/u32/u64)
     int64_t* __restrict__ H, // [nfeatsets, nodes, 2, 32] (int64)
     int nfeatsets,
-    int cols_32M, // XS.shape[1] == 32*M
+    int cols_32M, // XS.shape[1] == N
     int N, // Y.shape[0]
     int max_depth,
     int warps_per_block,
@@ -199,8 +199,8 @@ static inline void infer_grid_stride(
   stride_out = stride;
 }
 // API: returns H tensor; creates it inside like your h0_sm
-// XS: [nfeatsets, 32*M] (torch.uint32)
-// Y : [N] (torch.int32)
+// XS: [nfeatsets, N] (torch.uint32)
+// Y : [N] (torch.int16)
 // LF: [nfeatsets, N] (torch.uint16/32/64)
 // max_depth: <= 7 (this SMEM variant)
 torch::Tensor h_sm(
@@ -235,9 +235,9 @@ torch::Tensor h_sm(
               "Required dynamic shared memory (", smem_bytes,
               ") exceeds device limit (", smem_cap, ")");
   auto stream = at::cuda::getCurrentCUDAStream();
-  // Dtypes: XS must be (u)int32; Y must be int32; LF in {uint16,uint32,uint64}
-  TORCH_CHECK(Y.scalar_type() == torch::kInt32,
-              "Y must be int32 (got ", Y.scalar_type(), ")");
+  // Dtypes: XS must be (u)int32; Y must be int16; LF in {uint16,uint32,uint64}
+  TORCH_CHECK(Y.scalar_type() == torch::kInt16,
+              "Y must be int16 (got ", Y.scalar_type(), ")");
   // We accept XS either as uint32 or int32 (bit-identical)
   TORCH_CHECK(
     XS.scalar_type() == torch::kUInt32 || XS.scalar_type() == torch::kInt32,
@@ -252,7 +252,7 @@ torch::Tensor h_sm(
                          static_cast<int>(smem_bytes));
       _h_sm<uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
       XS_ptr,
-      Y.data_ptr<int32_t>(),
+      Y.data_ptr<int16_t>(),
       LF.data_ptr<uint16_t>(),
       H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth,
@@ -264,7 +264,7 @@ torch::Tensor h_sm(
                          static_cast<int>(smem_bytes));
     _h_sm<uint32_t><<<grid, block, smem_bytes, stream.stream()>>>(
       XS_ptr,
-      Y.data_ptr<int32_t>(),
+      Y.data_ptr<int16_t>(),
       LF.data_ptr<uint32_t>(),
       H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth,
@@ -276,7 +276,7 @@ torch::Tensor h_sm(
                          static_cast<int>(smem_bytes));
     _h_sm<uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
       XS_ptr,
-      Y.data_ptr<int32_t>(),
+      Y.data_ptr<int16_t>(),
       static_cast<uint64_t*>(LF.data_ptr()),
       H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth,
