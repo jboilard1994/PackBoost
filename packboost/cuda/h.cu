@@ -120,22 +120,22 @@ __global__ void _h_sm(
   }
 
   // Write back depths 0..2 (per lane)
-  atomicAdd(Hptr(H, nodes_total, feat_set, 0, 0, lane), hf0);
-  atomicAdd(Hptr(H, nodes_total, feat_set, 0, 1, lane), hw0);
+  atomicAdd(Hptr(H, nodes_total, feat_set, 0, 0, lane), (unsigned long long int)hf0);
+  atomicAdd(Hptr(H, nodes_total, feat_set, 0, 1, lane), (unsigned long long int)hw0);
 
-  atomicAdd(Hptr(H, nodes_total, feat_set, 1, 0, lane), hf10);
-  atomicAdd(Hptr(H, nodes_total, feat_set, 2, 0, lane), hf11);
-  atomicAdd(Hptr(H, nodes_total, feat_set, 1, 1, lane), hw10);
-  atomicAdd(Hptr(H, nodes_total, feat_set, 2, 1, lane), hw11);
+  atomicAdd(Hptr(H, nodes_total, feat_set, 1, 0, lane), (unsigned long long int)hf10);
+  atomicAdd(Hptr(H, nodes_total, feat_set, 2, 0, lane), (unsigned long long int)hf11);
+  atomicAdd(Hptr(H, nodes_total, feat_set, 1, 1, lane), (unsigned long long int)hw10);
+  atomicAdd(Hptr(H, nodes_total, feat_set, 2, 1, lane), (unsigned long long int)hw11);
 
-  atomicAdd(Hptr(H, nodes_total, feat_set, 3, 0, lane), hf20);
-  atomicAdd(Hptr(H, nodes_total, feat_set, 4, 0, lane), hf21);
-  atomicAdd(Hptr(H, nodes_total, feat_set, 5, 0, lane), hf22);
-  atomicAdd(Hptr(H, nodes_total, feat_set, 6, 0, lane), hf23);
-  atomicAdd(Hptr(H, nodes_total, feat_set, 3, 1, lane), hw20);
-  atomicAdd(Hptr(H, nodes_total, feat_set, 4, 1, lane), hw21);
-  atomicAdd(Hptr(H, nodes_total, feat_set, 5, 1, lane), hw22);
-  atomicAdd(Hptr(H, nodes_total, feat_set, 6, 1, lane), hw23);
+  atomicAdd(Hptr(H, nodes_total, feat_set, 3, 0, lane), (unsigned long long int)hf20);
+  atomicAdd(Hptr(H, nodes_total, feat_set, 4, 0, lane), (unsigned long long int)hf21);
+  atomicAdd(Hptr(H, nodes_total, feat_set, 5, 0, lane), (unsigned long long int)hf22);
+  atomicAdd(Hptr(H, nodes_total, feat_set, 6, 0, lane), (unsigned long long int)hf23);
+  atomicAdd(Hptr(H, nodes_total, feat_set, 3, 1, lane), (unsigned long long int)hw20);
+  atomicAdd(Hptr(H, nodes_total, feat_set, 4, 1, lane), (unsigned long long int)hw21);
+  atomicAdd(Hptr(H, nodes_total, feat_set, 5, 1, lane), (unsigned long long int)hw22);
+  atomicAdd(Hptr(H, nodes_total, feat_set, 6, 1, lane), (unsigned long long int)hw23);
 
   __syncthreads();
 
@@ -147,8 +147,8 @@ __global__ void _h_sm(
       const int base = ((node - 7) * 2) * 32 + lane;
       const long long fsum = static_cast<long long>(shmem[base + 0]);
       const long long csum = static_cast<long long>(shmem[base + 32]);
-      atomicAdd(Hptr(H, nodes_total, feat_set, node, 0, lane), fsum);
-      atomicAdd(Hptr(H, nodes_total, feat_set, node, 1, lane), csum);
+      atomicAdd(Hptr(H, nodes_total, feat_set, node, 0, lane), (unsigned long long int)fsum);
+      atomicAdd(Hptr(H, nodes_total, feat_set, node, 1, lane), (unsigned long long int)csum);
     }
   }
 }
