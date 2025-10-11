@@ -60,7 +60,7 @@ torch::Tensor h_sm(
     torch::Tensor XS,
     torch::Tensor Y,
     torch::Tensor LF,
-    int max_depth)
+    int max_depth);
 
 namespace {
 
