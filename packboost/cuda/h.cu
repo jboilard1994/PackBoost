@@ -55,8 +55,10 @@ __global__ void _h_sm(
         reinterpret_cast<unsigned long long*>(shmem + n_ge3 * 2 * 32);
 
     // zero the high plane with all threads in the block
-  for (int idx = threadIdx.x; idx < n_ge3 * 2 * 32; idx += blockDim.x)
-        sh_high[idx] = 0;
+  for (int idx = threadIdx.x; idx < n_ge3 * 2 * 32; idx += blockDim.x) {
+      sh_high[idx] = 0;
+  }
+
   __syncthreads();
 
   const unsigned mask = __ballot_sync(__activemask(), true);
@@ -80,7 +82,7 @@ __global__ void _h_sm(
                       + static_cast<size_t>(base + lane)];
       for (int k = 0; k < 32; ++k) {
         const int jj_k = base + k;
-        if (xfd == 0u) break;
+        //if (xfd == 0u) break;
         if (jj_k < N) {
           const int v = static_cast<int>(xfd & 1u);
           xfd >>= 1;
