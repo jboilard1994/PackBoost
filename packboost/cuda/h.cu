@@ -51,16 +51,15 @@ __global__ void _h_sm(
   if (n_ge3 < 1) n_ge3 = 1;
   extern __shared__ int shmem[];
   int* sh_high = shmem;
-  unsigned long long* sh_low =
-        reinterpret_cast<unsigned long long*>(shmem + n_ge3 * 2 * 32);
-
-    // zero the high plane with all threads in the block
-  for (int idx = threadIdx.x; idx < n_ge3 * 2 * 32; idx += blockDim.x) {
-      sh_high[idx] = 0;
+  unsigned long long* sh_low = (unsigned long long*)(shmem + n_ge3 * 2 * 32);
+  // Zero this lane’s column for both channels in high
+  
+  #pragma unroll
+  for (int i = 0; i < n_ge3; ++i) {
+    sh_high[(i * 2 + 0) * 32 + lane] = 0; // sum(y)
+    sh_high[(i * 2 + 1) * 32 + lane] = 0; // count
   }
-
   __syncthreads();
-
   const unsigned mask = __ballot_sync(__activemask(), true);
   // Each warp processes 'stride' tiles of 32 columns
   for (int j = 0; j < stride; ++j) {
@@ -82,7 +81,7 @@ __global__ void _h_sm(
                       + static_cast<size_t>(base + lane)];
       for (int k = 0; k < 32; ++k) {
         const int jj_k = base + k;
-        //if (xfd == 0u) break;
+        if (xfd == 0u) break;
         if (jj_k < N) {
           const int v = static_cast<int>(xfd & 1u);
           xfd >>= 1;
