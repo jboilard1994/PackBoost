@@ -345,11 +345,15 @@ __global__ void _h_partials(
             const unsigned mask_k = __ballot_sync(full, jj_k < N);
             if (!mask_k) break;
 
-            // bit gate
-            if (((xbits >> k) & 1u) == 0u) continue;
+            // always broadcast with the same mask
+            const int  yk = __shfl_sync(mask_k, y_lane,  k);
+            uint64_t   lk = (uint64_t)__shfl_sync(mask_k, l_lo, k)
+                        | ((uint64_t)__shfl_sync(mask_k, l_hi, k) << 32);
 
-            const int  yk = __shfl_sync(mask_k, y_lane,  k, 32);
-            unsigned long long lk = __shfl_sync(mask_k, lf_lane, k, 32);
+            // lane’s bit for this column
+            const int v = (xbits >> k) & 1u;
+            if (!v) continue;
+
 
             // dynamic depths: node = ((1<<d)-1) + (lk & ((1<<d)-1)); lk >>= d
             for (int d = 0; d < D; ++d) {
