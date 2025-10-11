@@ -281,3 +281,273 @@ torch::Tensor h_sm(
 
   return H;
 }
+
+#define WARP_SIZE 32
+#define FULL_MASK 0xFFFFFFFFu
+
+// ---------------- Warp reduce helpers (no lambdas)
+__device__ __forceinline__ long long warp_reduce_sum_ll(long long v, unsigned mask = FULL_MASK) {
+  for (int ofs = WARP_SIZE >> 1; ofs; ofs >>= 1) v += __shfl_down_sync(mask, v, ofs);
+  return v;
+}
+__device__ __forceinline__ int warp_reduce_sum_int(int v, unsigned mask = FULL_MASK) {
+  for (int ofs = WARP_SIZE >> 1; ofs; ofs >>= 1) v += __shfl_down_sync(mask, v, ofs);
+  return v;
+}
+
+// pack (sum,count) -> 64-bit (low32=sum (signed), high32=count (unsigned))
+__device__ __forceinline__ unsigned long long pack_sc(int sum32, int cnt32) {
+  return ( (unsigned long long)(unsigned int)cnt32 << 32 ) |
+           (unsigned long long)(unsigned int)sum32;
+}
+
+// ---------------- Kernel (templated on LF dtype)
+template <typename LF_T>
+__global__ void _h_sm_opt(
+    const uint32_t* __restrict__ XS,  // [nfeatsets, 32*M]
+    const int32_t*  __restrict__ Y,   // [N]
+    const LF_T*     __restrict__ LF,  // [nfeatsets, N] (u16/u32/u64)
+    int64_t*      __restrict__ H,   // [nfeatsets, nodes, 2, 32] (int64)
+    int nfeatsets,
+    int cols_32M,
+    int N,
+    int max_depth,
+    int warps_per_block,
+    int stride,
+    int nodes_total)
+{
+  const int feat_set   = blockIdx.x;
+  const int block_warp = threadIdx.x >> 5;    // 0..warps_per_block-1
+  const int lane       = threadIdx.x & 31;    // 0..31
+  const int gwarp      = warps_per_block * blockIdx.y + block_warp;
+
+  // ---------------- Shared memory aliasing
+  const int n_ge3 = max(1, (1 << max_depth) - 8);              // nodes 7..(nodes_total-1)
+  extern __shared__ unsigned char smem_raw[];
+  // Packed d>=3 histogram: [n_ge3, 32] of uint64_t (low32=sum, high32=count)
+  unsigned long long* sh_packed = reinterpret_cast<unsigned long long*>(smem_raw);
+  const size_t packed_elems = static_cast<size_t>(n_ge3) * 32u;
+  // Inter-warp reduce buffer for 14 values (d<=2): [14 * warps_per_block] int64
+  long long* s_warp = reinterpret_cast<long long*>(sh_packed + packed_elems);
+
+  // Zero this lane’s column in packed plane
+  for (int i = 0; i < n_ge3; ++i) {
+    sh_packed[i * 32 + lane] = 0ull;
+  }
+  __syncthreads();
+
+  // ---------------- Per-thread accumulators (d<=2)
+  long long hf0=0,  hw0=0;
+  long long hf10=0, hf11=0, hw10=0, hw11=0;
+  long long hf20=0, hf21=0, hf22=0, hf23=0;
+  long long hw20=0, hw21=0, hw22=0, hw23=0;
+
+  // ---------------- Phase 1: tile loop
+  for (int j = 0; j < stride; ++j) {
+    const int base = 32 * (stride * gwarp + j);
+    if (base >= cols_32M) break;
+
+    const int jj_lane = base + lane;
+    const bool inb    = (jj_lane < N);
+
+    int32_t  y_lane = 0;
+    uint32_t l32    = 0;
+    if (inb) {
+      y_lane = Y[jj_lane];
+      // LF indexed [nfeatsets, N]; only low 32 bits needed for D<=7
+      const LF_T lval = LF[(size_t)feat_set * (size_t)N + jj_lane];
+      l32 = (uint32_t)lval;
+    }
+
+    const uint32_t xfd0 = XS[(size_t)feat_set * (size_t)cols_32M + (size_t)(base + lane)];
+    unsigned warp_mask = __ballot_sync(__activemask(), inb);
+
+    // Iterate only over set bits of xfd
+    for (uint32_t m = xfd0; m; m &= (m - 1)) {
+      const int k = __ffs(m) - 1;                // bit index (0..31)
+      const int jj_k = base + k;
+      if (jj_k >= N) continue;
+
+      // v==1 by construction
+      const int32_t yk = __shfl_sync(warp_mask, y_lane, k);
+      uint32_t      lk = __shfl_sync(warp_mask, l32,    k);
+
+      // d = 0
+      hf0 += (long long)yk;  hw0 += 1;
+
+      // d = 1
+      unsigned tk = lk & 1u; lk >>= 1;
+      if (tk == 0u) { hf10 += yk; hw10 += 1; } else { hf11 += yk; hw11 += 1; }
+
+      // d = 2
+      tk = lk & 3u; lk >>= 2;
+      if      (tk == 0u) { hf20 += yk; hw20 += 1; }
+      else if (tk == 1u) { hf21 += yk; hw21 += 1; }
+      else if (tk == 2u) { hf22 += yk; hw22 += 1; }
+      else               { hf23 += yk; hw23 += 1; }
+
+      // d >= 3 : warp-aggregated packed updates
+      #pragma unroll
+      for (int d = 3; d < max_depth; ++d) {
+        const unsigned to   = (1u << d) - 1u;       // mask width d
+        const int      baseN= (int)to - 7;          // node offset for d>=3
+        const unsigned tkd  = lk & to;
+        lk >>= d;
+        const int b = baseN + (int)tkd;             // bucket 0..n_ge3-1
+
+        // group lanes hitting the same bucket
+        const unsigned gmask  = __match_any_sync(warp_mask, b);
+        const int leader = __ffs(gmask) - 1;
+
+        // sum(y) within group
+        int f_sum = yk;
+        for (int ofs = 16; ofs; ofs >>= 1) {
+          f_sum += __shfl_down_sync(gmask, f_sum, ofs);
+        }
+        if (lane == leader) {
+          const int c_sum = __popc(gmask);
+          atomicAdd(&sh_packed[b * 32 + lane], pack_sc(f_sum, c_sum));
+        }
+      }
+    }
+  } // tiles
+
+  // ---------------- Phase 2: inter-warp reduction for d<=2
+  const long long hf0_r  = warp_reduce_sum_ll(hf0);
+  const long long hw0_r  = warp_reduce_sum_ll(hw0);
+  const long long hf10_r = warp_reduce_sum_ll(hf10);
+  const long long hw10_r = warp_reduce_sum_ll(hw10);
+  const long long hf11_r = warp_reduce_sum_ll(hf11);
+  const long long hw11_r = warp_reduce_sum_ll(hw11);
+  const long long hf20_r = warp_reduce_sum_ll(hf20);
+  const long long hw20_r = warp_reduce_sum_ll(hw20);
+  const long long hf21_r = warp_reduce_sum_ll(hf21);
+  const long long hw21_r = warp_reduce_sum_ll(hw21);
+  const long long hf22_r = warp_reduce_sum_ll(hf22);
+  const long long hw22_r = warp_reduce_sum_ll(hw22);
+  const long long hf23_r = warp_reduce_sum_ll(hf23);
+  const long long hw23_r = warp_reduce_sum_ll(hw23);
+
+  if (lane == 0) {
+    // s_warp is [14, warps_per_block] row-major
+    s_warp[0  * warps_per_block + block_warp] = hf0_r;
+    s_warp[1  * warps_per_block + block_warp] = hw0_r;
+    s_warp[2  * warps_per_block + block_warp] = hf10_r;
+    s_warp[3  * warps_per_block + block_warp] = hw10_r;
+    s_warp[4  * warps_per_block + block_warp] = hf11_r;
+    s_warp[5  * warps_per_block + block_warp] = hw11_r;
+    s_warp[6  * warps_per_block + block_warp] = hf20_r;
+    s_warp[7  * warps_per_block + block_warp] = hw20_r;
+    s_warp[8  * warps_per_block + block_warp] = hf21_r;
+    s_warp[9  * warps_per_block + block_warp] = hw21_r;
+    s_warp[10 * warps_per_block + block_warp] = hf22_r;
+    s_warp[11 * warps_per_block + block_warp] = hw22_r;
+    s_warp[12 * warps_per_block + block_warp] = hf23_r;
+    s_warp[13 * warps_per_block + block_warp] = hw23_r;
+  }
+  __syncthreads();
+
+  // one warp writes 14 values (one atomic each)
+  if (block_warp == 0) {
+    long long v = 0;
+    if (lane < 14) {
+      for (int w = 0; w < warps_per_block; ++w) v += s_warp[lane * warps_per_block + w];
+    }
+    if (lane == 0)  atomicAdd(Hptr(H, nodes_total, feat_set, 0, 0, lane), (unsigned long long)v);
+    if (lane == 1)  atomicAdd(Hptr(H, nodes_total, feat_set, 0, 1, lane), (unsigned long long)v);
+    if (lane == 2)  atomicAdd(Hptr(H, nodes_total, feat_set, 1, 0, lane), (unsigned long long)v);
+    if (lane == 3)  atomicAdd(Hptr(H, nodes_total, feat_set, 1, 1, lane), (unsigned long long)v);
+    if (lane == 4)  atomicAdd(Hptr(H, nodes_total, feat_set, 2, 0, lane), (unsigned long long)v);
+    if (lane == 5)  atomicAdd(Hptr(H, nodes_total, feat_set, 2, 1, lane), (unsigned long long)v);
+    if (lane == 6)  atomicAdd(Hptr(H, nodes_total, feat_set, 3, 0, lane), (unsigned long long)v);
+    if (lane == 7)  atomicAdd(Hptr(H, nodes_total, feat_set, 3, 1, lane), (unsigned long long)v);
+    if (lane == 8)  atomicAdd(Hptr(H, nodes_total, feat_set, 4, 0, lane), (unsigned long long)v);
+    if (lane == 9)  atomicAdd(Hptr(H, nodes_total, feat_set, 4, 1, lane), (unsigned long long)v);
+    if (lane == 10) atomicAdd(Hptr(H, nodes_total, feat_set, 5, 0, lane), (unsigned long long)v);
+    if (lane == 11) atomicAdd(Hptr(H, nodes_total, feat_set, 5, 1, lane), (unsigned long long)v);
+    if (lane == 12) atomicAdd(Hptr(H, nodes_total, feat_set, 6, 0, lane), (unsigned long long)v);
+    if (lane == 13) atomicAdd(Hptr(H, nodes_total, feat_set, 6, 1, lane), (unsigned long long)v);
+  }
+
+  __syncthreads(); // fence before reading sh_packed
+
+  // ---------------- Phase 3: drain d>=3
+  const int rows_per_warp = (n_ge3 + warps_per_block - 1) / warps_per_block;
+  for (int r = 0; r < rows_per_warp; ++r) {
+    const int node = 7 + rows_per_warp * block_warp + r;
+    if (node >= nodes_total) break;
+
+    const unsigned long long pc = sh_packed[(node - 7) * 32 + lane];
+    const int fsum = (int)(pc & 0xFFFFFFFFu);
+    const int csum = (int)(pc >> 32);
+
+    if (fsum) atomicAdd(Hptr(H, nodes_total, feat_set, node, 0, lane), (unsigned long long)(long long)fsum);
+    if (csum) atomicAdd(Hptr(H, nodes_total, feat_set, node, 1, lane), (unsigned long long)(long long)csum);
+  }
+}
+
+// ---------------- Launcher (returns H)
+torch::Tensor h_sm_optimized(
+    torch::Tensor XS,  // uint32 [nfeatsets, 32*M]
+    torch::Tensor Y,   // int32  [N]
+    torch::Tensor LF,  // uint{16,32,64} [nfeatsets, N]
+    int max_depth)
+{
+  TORCH_CHECK(XS.is_cuda() && Y.is_cuda() && LF.is_cuda(), "All inputs must be CUDA tensors.");
+  TORCH_CHECK(Y.scalar_type() == torch::kInt32, "Y must be int32.");
+  TORCH_CHECK(XS.scalar_type() == torch::kUInt32 || XS.scalar_type() == torch::kInt32, "XS must be uint32/int32.");
+
+  const int nfeatsets = (int)XS.size(0);
+  const int cols_32M  = (int)XS.size(1);
+  const int N         = (int)Y.size(0);
+  const int nodes_tot = (1 << max_depth) - 1;
+
+  auto H = torch::zeros({nfeatsets, nodes_tot, 2, 32},
+                        XS.options().dtype(torch::kLong).memory_format(c10::MemoryFormat::Contiguous));
+
+  const int warps_per_block = infer_hist_warps_per_block(max_depth);
+  int blocks_per_feat = 0, stride = 0;
+  infer_grid_stride(nfeatsets, cols_32M, warps_per_block, blocks_per_feat, stride);
+
+  dim3 grid(nfeatsets, blocks_per_feat, 1);
+  dim3 block(warps_per_block * WARP_SIZE, 1, 1);
+
+  // dynamic shared memory: packed d>=3 + inter-warp buffer (14 values)
+  const int n_ge3 = std::max(1, (1 << max_depth) - 8);
+  const size_t smem_hist_bytes   = (size_t)n_ge3 * 32 * sizeof(unsigned long long); // packed
+  const size_t smem_reduce_bytes = 14ull * (size_t)warps_per_block * sizeof(long long);
+  const size_t smem_bytes        = smem_hist_bytes + smem_reduce_bytes;
+
+  auto* prop = at::cuda::getCurrentDeviceProperties();
+  const size_t smem_cap = prop->sharedMemPerBlockOptin ? (size_t)prop->sharedMemPerBlockOptin
+                                                       : (size_t)prop->sharedMemPerBlock;
+  TORCH_CHECK(smem_bytes <= smem_cap,
+              "Dynamic shared memory (", smem_bytes, " B) exceeds device limit (", smem_cap, " B).");
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const uint32_t* XS_ptr = reinterpret_cast<const uint32_t*>(XS.data_ptr());
+  long long*      H_ptr  = H.data_ptr<int64_t>();
+
+  const auto lf_dt = LF.scalar_type();
+  if (lf_dt == torch::kUInt16) {
+    cudaFuncSetAttribute(_h_sm_opt<uint16_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
+    _h_sm_opt<uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
+      XS_ptr, Y.data_ptr<int32_t>(), LF.data_ptr<uint16_t>(), H_ptr,
+      nfeatsets, cols_32M, N, max_depth, warps_per_block, stride, nodes_tot);
+  } else if (lf_dt == torch::kUInt32) {
+    cudaFuncSetAttribute(_h_sm_opt<uint32_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
+    _h_sm_opt<uint32_t><<<grid, block, smem_bytes, stream.stream()>>>(
+      XS_ptr, Y.data_ptr<int32_t>(), LF.data_ptr<uint32_t>(), H_ptr,
+      nfeatsets, cols_32M, N, max_depth, warps_per_block, stride, nodes_tot);
+  } else if (lf_dt == torch::kUInt64) {
+    cudaFuncSetAttribute(_h_sm_opt<uint64_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
+    _h_sm_opt<uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
+      XS_ptr, Y.data_ptr<int32_t>(), LF.data_ptr<uint64_t>(), H_ptr,
+      nfeatsets, cols_32M, N, max_depth, warps_per_block, stride, nodes_tot);
+  } else {
+    TORCH_CHECK(false, "LF must be uint16/uint32/uint64 (got ", lf_dt, ")");
+  }
+
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return H;
+}
