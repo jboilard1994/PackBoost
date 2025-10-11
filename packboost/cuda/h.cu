@@ -281,11 +281,10 @@ torch::Tensor h_sm(
 
   return H;
 }
-
+// --- helpers ---
 #define WARP_SIZE 32
 #define FULL_MASK 0xFFFFFFFFu
 
-// ---------------- Warp reduce helpers (no lambdas)
 __device__ __forceinline__ long long warp_reduce_sum_ll(long long v, unsigned mask = FULL_MASK) {
   for (int ofs = WARP_SIZE >> 1; ofs; ofs >>= 1) v += __shfl_down_sync(mask, v, ofs);
   return v;
@@ -295,124 +294,131 @@ __device__ __forceinline__ int warp_reduce_sum_int(int v, unsigned mask = FULL_M
   return v;
 }
 
-// pack (sum,count) -> 64-bit (low32=sum (signed), high32=count (unsigned))
+// pack (sum,count) into 64b: low32 = sum (signed), high32 = count (unsigned)
 __device__ __forceinline__ unsigned long long pack_sc(int sum32, int cnt32) {
   return ( (unsigned long long)(unsigned int)cnt32 << 32 ) |
            (unsigned long long)(unsigned int)sum32;
 }
 
-// ---------------- Kernel (templated on LF dtype)
+// --- kernel (unchanged signature; only inner logic changed to be convergent) ---
 template <typename LF_T>
-__global__ void _h_sm_opt(
-    const uint32_t* __restrict__ XS,  // [nfeatsets, 32*M]
-    const int32_t* __restrict__ Y,   // [N]
-    const LF_T* __restrict__ LF,  // [nfeatsets, N] (u16/u32/u64)
-    int64_t* __restrict__ H,   // [nfeatsets, nodes, 2, 32] (int64)
-    int nfeatsets,
-    int cols_32M,
-    int N,
-    int max_depth,
-    int warps_per_block,
-    int stride,
-    int nodes_total)
+__global__ void _h_sm_opt_safe(
+    const uint32_t* __restrict__ XS,
+    const int32_t*  __restrict__ Y,
+    const LF_T*     __restrict__ LF,
+    int64_t*        __restrict__ H,
+    int nfeatsets, int cols_32M, int N, int max_depth,
+    int warps_per_block, int stride, int nodes_total)
 {
   const int feat_set   = blockIdx.x;
-  const int block_warp = threadIdx.x >> 5;    // 0..warps_per_block-1
-  const int lane       = threadIdx.x & 31;    // 0..31
-  const int gwarp      = warps_per_block * blockIdx.y + block_warp;
+  const int warp_id    = threadIdx.x >> 5;
+  const int lane       = threadIdx.x & 31;
+  const int gwarp      = warps_per_block * blockIdx.y + warp_id;
 
-  // ---------------- Shared memory aliasing
-  const int n_ge3 = max(1, (1 << max_depth) - 8);              // nodes 7..(nodes_total-1)
+  const int n_ge3 = max(1, (1 << max_depth) - 8);
+
   extern __shared__ unsigned char smem_raw[];
-  // Packed d>=3 histogram: [n_ge3, 32] of uint64_t (low32=sum, high32=count)
+  // [n_ge3, 32] packed (sum,count)
   unsigned long long* sh_packed = reinterpret_cast<unsigned long long*>(smem_raw);
-  const size_t packed_elems = static_cast<size_t>(n_ge3) * 32u;
-  // Inter-warp reduce buffer for 14 values (d<=2): [14 * warps_per_block] int64
+  const size_t packed_elems = (size_t)n_ge3 * 32u;
+  // [14, warps_per_block] inter-warp
   long long* s_warp = reinterpret_cast<long long*>(sh_packed + packed_elems);
 
-  // Zero this lane’s column in packed plane
-  for (int i = 0; i < n_ge3; ++i) {
-    sh_packed[i * 32 + lane] = 0ull;
-  }
+  // zero this lane's column
+  for (int i = 0; i < n_ge3; ++i) sh_packed[i*32 + lane] = 0ull;
   __syncthreads();
 
-  // ---------------- Per-thread accumulators (d<=2)
+  // d<=2 accumulators
   long long hf0=0,  hw0=0;
   long long hf10=0, hf11=0, hw10=0, hw11=0;
   long long hf20=0, hf21=0, hf22=0, hf23=0;
   long long hw20=0, hw21=0, hw22=0, hw23=0;
 
-  // ---------------- Phase 1: tile loop
+  // tiles
   for (int j = 0; j < stride; ++j) {
     const int base = 32 * (stride * gwarp + j);
-    if (base < cols_32M) { // <<< FIX IS HERE
-      const int jj_lane = base + lane;
-      const bool inb    = (jj_lane < N);
+    if (base >= cols_32M) break;
 
-      int32_t  y_lane = 0;
-      uint32_t l32    = 0;
-      if (inb) {
-        y_lane = Y[jj_lane];
-        // LF indexed [nfeatsets, N]; only low 32 bits needed for D<=7
-        const LF_T lval = LF[(size_t)feat_set * (size_t)N + jj_lane];
-        l32 = (uint32_t)lval;
+    const int jj_lane = base + lane;
+    const bool inb    = (jj_lane < N);
+
+    int32_t  y_lane = 0;
+    uint32_t l32    = 0;
+    if (inb) {
+      y_lane = Y[jj_lane];
+      l32 = (uint32_t)LF[(size_t)feat_set * (size_t)N + jj_lane]; // D<=7 ⇒ 32b ok
+    }
+
+    const uint32_t xfd = XS[(size_t)feat_set * (size_t)cols_32M + (size_t)(base + lane)];
+    const unsigned warp_mask = __ballot_sync(FULL_MASK, inb);
+
+    // LOCK-STEP k-loop (avoid divergent shuffles)
+    #pragma unroll
+    for (int k = 0; k < 32; ++k) {
+      const int jj_k = base + k;
+      if (jj_k >= N) break;                 // same across lanes; safe
+
+      // get y, lk from lane k (k is converged)
+      const int32_t yk = __shfl_sync(warp_mask, y_lane, k);
+      uint32_t      lk = __shfl_sync(warp_mask, l32,    k);
+
+      // this lane's bit for row k
+      const int v = (int)((xfd >> k) & 1u);
+
+      // d0..d2 (cheap)
+      if (v) {
+        hf0 += (long long)yk;  hw0 += 1;
+        unsigned tk = lk & 1u; lk >>= 1;
+        if (tk==0u) { hf10 += yk; hw10 += 1; } else { hf11 += yk; hw11 += 1; }
+        tk = lk & 3u; lk >>= 2;
+        if      (tk==0u){ hf20 += yk; hw20 += 1; }
+        else if (tk==1u){ hf21 += yk; hw21 += 1; }
+        else if (tk==2u){ hf22 += yk; hw22 += 1; }
+        else            { hf23 += yk; hw23 += 1; }
+      } else {
+        // still need to advance lk for d>=3 computations below if we use them,
+        // but since we group only v==1 lanes, we can skip entirely.
       }
 
-      const uint32_t xfd0 = XS[(size_t)feat_set * (size_t)cols_32M + (size_t)(base + lane)];
-      unsigned warp_mask = __ballot_sync(__activemask(), inb);
+      // d>=3 (warp-aggregated, only lanes with v==1 participate)
+      const unsigned vm = __ballot_sync(warp_mask, v != 0);  // SAME across lanes
+      if (vm == 0u) continue;
 
-      // Iterate only over set bits of xfd
-      for (uint32_t m = xfd0; m; m &= (m - 1)) {
-        const int k = __ffs(m) - 1;                // bit index (0..31)
-        const int jj_k = base + k;
-        if (jj_k >= N) continue;
+      #pragma unroll
+      for (int d = 3; d < max_depth; ++d) {
+        const unsigned to   = (1u << d) - 1u;
+        const int      baseN= (int)to - 7;
 
-        // v==1 by construction
-        const int32_t yk = __shfl_sync(warp_mask, y_lane, k);
-        uint32_t      lk = __shfl_sync(warp_mask, l32,    k);
+        // Recompute lk stream for this lane when v==1:
+        uint32_t lk_d = __shfl_sync(warp_mask, l32, k);  // safe: converged k
+        // peel d=1,2 already consumed above:
+        lk_d >>= 3; // consumed 1 + 2 bits
+        // now advance to depth d
+        // accumulate total bits up to (d-1): 1 + 2 + ... + (d-1) = d*(d-1)/2
+        // but we already shifted 3; shift the remaining:
+        const int rem = (d*(d-1))/2 - 3;
+        if (rem > 0) lk_d >>= rem;
 
-        // d = 0
-        hf0 += (long long)yk;  hw0 += 1;
+        const unsigned tkd = lk_d & to;
+        const int b = baseN + (int)tkd;
 
-        // d = 1
-        unsigned tk = lk & 1u; lk >>= 1;
-        if (tk == 0u) { hf10 += yk; hw10 += 1; } else { hf11 += yk; hw11 += 1; }
+        const unsigned gmask = __match_any_sync(vm, b);       // mask is vm (participants)
+        const int leader = __ffs(gmask) - 1;
 
-        // d = 2
-        tk = lk & 3u; lk >>= 2;
-        if      (tk == 0u) { hf20 += yk; hw20 += 1; }
-        else if (tk == 1u) { hf21 += yk; hw21 += 1; }
-        else if (tk == 2u) { hf22 += yk; hw22 += 1; }
-        else               { hf23 += yk; hw23 += 1; }
-
-        // d >= 3 : warp-aggregated packed updates
-        #pragma unroll
-        for (int d = 3; d < max_depth; ++d) {
-          const unsigned to   = (1u << d) - 1u;       // mask width d
-          const int      baseN= (int)to - 7;          // node offset for d>=3
-          const unsigned tkd  = lk & to;
-          lk >>= d;
-          const int b = baseN + (int)tkd;             // bucket 0..n_ge3-1
-
-          // group lanes hitting the same bucket
-          const unsigned gmask  = __match_any_sync(warp_mask, b);
-          const int leader = __ffs(gmask) - 1;
-
-          // sum(y) within group
-          int f_sum = yk;
-          for (int ofs = 16; ofs; ofs >>= 1) {
-            f_sum += __shfl_down_sync(gmask, f_sum, ofs);
-          }
-          if (lane == leader) {
-            const int c_sum = __popc(gmask);
-            atomicAdd(&sh_packed[b * 32 + lane], pack_sc(f_sum, c_sum));
-          }
+        // sum(y) in group (participants only)
+        int f_sum = yk;
+        for (int ofs = 16; ofs; ofs >>= 1) {
+          f_sum += __shfl_down_sync(gmask, f_sum, ofs);
+        }
+        if (lane == leader) {
+          const int c_sum = __popc(gmask);
+          atomicAdd(&sh_packed[b * 32 + lane], pack_sc(f_sum, c_sum));
         }
       }
-    } // end of if (base < cols_32M)
+    } // k
   } // tiles
 
-  // ---------------- Phase 2: inter-warp reduction for d<=2
+  // inter-warp reduce for d<=2
   const long long hf0_r  = warp_reduce_sum_ll(hf0);
   const long long hw0_r  = warp_reduce_sum_ll(hw0);
   const long long hf10_r = warp_reduce_sum_ll(hf10);
@@ -429,31 +435,28 @@ __global__ void _h_sm_opt(
   const long long hw23_r = warp_reduce_sum_ll(hw23);
 
   if (lane == 0) {
-    // s_warp is [14, warps_per_block] row-major
-    s_warp[0  * warps_per_block + block_warp] = hf0_r;
-    s_warp[1  * warps_per_block + block_warp] = hw0_r;
-    s_warp[2  * warps_per_block + block_warp] = hf10_r;
-    s_warp[3  * warps_per_block + block_warp] = hw10_r;
-    s_warp[4  * warps_per_block + block_warp] = hf11_r;
-    s_warp[5  * warps_per_block + block_warp] = hw11_r;
-    s_warp[6  * warps_per_block + block_warp] = hf20_r;
-    s_warp[7  * warps_per_block + block_warp] = hw20_r;
-    s_warp[8  * warps_per_block + block_warp] = hf21_r;
-    s_warp[9  * warps_per_block + block_warp] = hw21_r;
-    s_warp[10 * warps_per_block + block_warp] = hf22_r;
-    s_warp[11 * warps_per_block + block_warp] = hw22_r;
-    s_warp[12 * warps_per_block + block_warp] = hf23_r;
-    s_warp[13 * warps_per_block + block_warp] = hw23_r;
+    s_warp[0  * warps_per_block + warp_id] = hf0_r;
+    s_warp[1  * warps_per_block + warp_id] = hw0_r;
+    s_warp[2  * warps_per_block + warp_id] = hf10_r;
+    s_warp[3  * warps_per_block + warp_id] = hw10_r;
+    s_warp[4  * warps_per_block + warp_id] = hf11_r;
+    s_warp[5  * warps_per_block + warp_id] = hw11_r;
+    s_warp[6  * warps_per_block + warp_id] = hf20_r;
+    s_warp[7  * warps_per_block + warp_id] = hw20_r;
+    s_warp[8  * warps_per_block + warp_id] = hf21_r;
+    s_warp[9  * warps_per_block + warp_id] = hw21_r;
+    s_warp[10 * warps_per_block + warp_id] = hf22_r;
+    s_warp[11 * warps_per_block + warp_id] = hw22_r;
+    s_warp[12 * warps_per_block + warp_id] = hf23_r;
+    s_warp[13 * warps_per_block + warp_id] = hw23_r;
   }
   __syncthreads();
 
-  // one warp writes 14 values (one atomic each)
-  if (block_warp == 0) {
+  if (warp_id == 0) {
     long long v = 0;
     if (lane < 14) {
       for (int w = 0; w < warps_per_block; ++w) v += s_warp[lane * warps_per_block + w];
     }
-    // Hptr is not defined in the provided code, so assuming it works correctly
     if (lane == 0)  atomicAdd(Hptr(H, nodes_total, feat_set, 0, 0, lane), (unsigned long long)v);
     if (lane == 1)  atomicAdd(Hptr(H, nodes_total, feat_set, 0, 1, lane), (unsigned long long)v);
     if (lane == 2)  atomicAdd(Hptr(H, nodes_total, feat_set, 1, 0, lane), (unsigned long long)v);
@@ -472,10 +475,10 @@ __global__ void _h_sm_opt(
 
   __syncthreads(); // fence before reading sh_packed
 
-  // ---------------- Phase 3: drain d>=3
+  // drain d>=3
   const int rows_per_warp = (n_ge3 + warps_per_block - 1) / warps_per_block;
   for (int r = 0; r < rows_per_warp; ++r) {
-    const int node = 7 + rows_per_warp * block_warp + r;
+    const int node = 7 + rows_per_warp * warp_id + r;
     if (node >= nodes_total) break;
 
     const unsigned long long pc = sh_packed[(node - 7) * 32 + lane];
@@ -486,6 +489,7 @@ __global__ void _h_sm_opt(
     if (csum) atomicAdd(Hptr(H, nodes_total, feat_set, node, 1, lane), (unsigned long long)(long long)csum);
   }
 }
+
 
 // ---------------- Launcher (returns H)
 torch::Tensor h_sm_optimized(
