@@ -79,7 +79,7 @@ __global__ void _h_sm(
                       + static_cast<size_t>(base + lane)];
 
       const bool inb = (jj_lane < N);
-      const unsigned warp_mask = __ballot_sync(__activemask(), inb);
+      const unsigned warp_mask = __ballot_sync(0xFFFFFFFFu, inb);
 
       for (int k = 0; k < 32; ++k) {
         const int jj_k = base + k;
@@ -92,31 +92,31 @@ __global__ void _h_sm(
           const int32_t yk = __shfl_sync(warp_mask, y_lane, k);
           uint32_t lk = __shfl_sync(warp_mask, l32, k);
           // d = 0
-          if (v) {
-            hf0 += (long long)yk;  hw0 += 1;
-        
-            unsigned tk = lk & 1u; lk >>= 1;
-            if (tk==0u) { hf10 += yk; hw10 += 1; } else { hf11 += yk; hw11 += 1; }
-        
-            tk = lk & 3u; lk >>= 2;
-            if      (tk==0u) { hf20 += yk; hw20 += 1; }
-            else if (tk==1u) { hf21 += yk; hw21 += 1; }
-            else if (tk==2u) { hf22 += yk; hw22 += 1; }
-            else             { hf23 += yk; hw23 += 1; }
-        
-            // d >= 3 (only when this lane contributes)
-            #pragma unroll
-            for (int d = 3; d < max_depth; ++d) {
-              const unsigned to  = (1u << d) - 1u;
-              const unsigned tkd = lk & to;
-              lk >>= d;
-              const int idx = (int)(to + tkd) - 7;
-              atomicAdd(&sh_high[(idx * 2 + 0) * 32 + lane], yk);
-              atomicAdd(&sh_high[(idx * 2 + 1) * 32 + lane], 1);
-            }
+          hf0 += static_cast<int64_t>(v) * static_cast<int64_t>(yk);
+          hw0 += v;
+          // d = 1
+          unsigned tk = lk & 1u;
+          if (tk == 0u) { hf10 += v * (int64_t)yk; hw10 += v; }
+          else { hf11 += v * (int64_t)yk; hw11 += v; }
+          lk >>= 1;
+          // d = 2
+          tk = lk & 3u;
+          if (tk == 0u) { hf20 += v * (int64_t)yk; hw20 += v; }
+          else if (tk == 1u) { hf21 += v * (int64_t)yk; hw21 += v; }
+          else if (tk == 2u) { hf22 += v * (int64_t)yk; hw22 += v; }
+          else { hf23 += v * (int64_t)yk; hw23 += v; }
+          lk >>= 2;
+          // d >= 3
+          for (int d = 3; d < max_depth; ++d) {
+            const unsigned to = (1u << d) - 1u;
+            const unsigned tkd = lk & to;
+            lk >>= d;
+            const int idx = static_cast<int>(to + tkd) - 7; // shift after first 7 nodes
+            atomicAdd(&sh_high[(idx * 2 + 0) * 32 + lane], v * yk);
+            atomicAdd(&sh_high[(idx * 2 + 1) * 32 + lane], v);
           }
         }
-    }
+      }
     }
   }
   // Write low-depth registers to shared (packed, per warp, per node, per lane)
