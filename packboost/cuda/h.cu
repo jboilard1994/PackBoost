@@ -57,7 +57,6 @@ __global__ void _h_sm(
     sh_high[(i * 2 + 0) * 32 + lane] = 0; // sum(y)
     sh_high[(i * 2 + 1) * 32 + lane] = 0; // count
   }
-  __syncthreads();
   const unsigned mask = __ballot_sync(__activemask(), true);
   // Each warp processes 'stride' tiles of 32 columns
   for (int j = 0; j < stride; ++j) {
@@ -78,19 +77,13 @@ __global__ void _h_sm(
       uint32_t xfd = XS[static_cast<size_t>(feat_set) * static_cast<size_t>(cols_32M)
                       + static_cast<size_t>(base + lane)];
 
-      const bool inb = (jj_lane < N);
-      const unsigned warp_mask = __ballot_sync(0xFFFFFFFFu, inb);
-
       for (int k = 0; k < 32; ++k) {
         const int jj_k = base + k;
         if (jj_k < N) {
           const int v = static_cast<int>(xfd & 1u);
-          const unsigned vm = __ballot_sync(warp_mask, v != 0);
           xfd >>= 1;
-          if (((warp_mask >> k) & 1u) == 0) continue;
-          if (vm == 0u) continue;
-          const int32_t yk = __shfl_sync(warp_mask, y_lane, k);
-          uint32_t lk = __shfl_sync(warp_mask, l32, k);
+          const int32_t yk = __shfl_sync(mask, y_lane, k);
+          uint32_t lk = __shfl_sync(mask, l32, k);
           // d = 0
           hf0 += static_cast<int64_t>(v) * static_cast<int64_t>(yk);
           hw0 += v;
@@ -140,7 +133,6 @@ __global__ void _h_sm(
   for (int tmp = warps_per_block; tmp > 1; tmp >>= 1) ++log_wpb;
   // Butterfly reduction for low depths
   for (int s = 0; s < log_wpb; ++s) {
-    __syncthreads();
     const int ofs = 1 << s;
     if ((block_warp & ofs) == 0 && (block_warp + ofs) < warps_per_block) {
       for (int ndi = 0; ndi < low_nodes; ++ndi) {
@@ -151,7 +143,6 @@ __global__ void _h_sm(
     }
   }
   // Write reduced low-depth values to global (from warp 0 only, unpacked)
-  __syncthreads();
   if (block_warp == 0) {
     const int low_node_map[7] = {0, 1, 2, 3, 4, 5, 6};
     for (int ndi = 0; ndi < low_nodes; ++ndi) {
