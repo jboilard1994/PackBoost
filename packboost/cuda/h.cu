@@ -526,7 +526,7 @@ torch::Tensor h_sm_optimized(
 
   auto stream = at::cuda::getCurrentCUDAStream();
   const uint32_t* XS_ptr = reinterpret_cast<const uint32_t*>(XS.data_ptr());
-  long long*      H_ptr  = H.data_ptr<int64_t>();
+  int64_t*      H_ptr  = H.data_ptr<int64_t>();
 
   const auto lf_dt = LF.scalar_type();
   if (lf_dt == torch::kUInt16) {
