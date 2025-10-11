@@ -51,7 +51,7 @@ __global__ void _h_sm(
   if (n_ge3 < 1) n_ge3 = 1;
   extern __shared__ int shmem[];
   int* sh_high = shmem;
-] unsigned long long* sh_low =
+  unsigned long long* sh_low =
         reinterpret_cast<unsigned long long*>(shmem + n_ge3 * 2 * 32);
 
     // zero the high plane with all threads in the block
