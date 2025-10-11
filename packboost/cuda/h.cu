@@ -46,15 +46,16 @@ __global__ void _h_sm(
   int64_t hf10=0, hf11=0, hw10=0, hw11=0;
   int64_t hf20=0, hf21=0, hf22=0, hf23=0;
   int64_t hw20=0, hw21=0, hw22=0, hw23=0;
-  // Shared histogram for depths >=3 : shape [(2^D - 8), 2, 32] int64
+  // Shared histogram for depths >=3 : shape [(2^D - 8), 2, 32] int32
   int n_ge3 = (1 << max_depth) - 8;
   if (n_ge3 < 1) n_ge3 = 1;
-  extern __shared__ int64_t shmem[];
-  int64_t* sh_high = shmem;
-  unsigned long long* sh_low = (unsigned long long*)(sh_high + n_ge3 * 2 * 32);
-  // Zero high shared memory in parallel
-  for (int i = threadIdx.x; i < n_ge3 * 2 * 32; i += blockDim.x) {
-    sh_high[i] = 0;
+  extern __shared__ int shmem[];
+  int* sh_high = shmem;
+  unsigned long long* sh_low = (unsigned long long*)(shmem + n_ge3 * 2 * 32);
+  // Zero this lane’s column for both channels in high
+  for (int i = 0; i < n_ge3; ++i) {
+    sh_high[(i * 2 + 0) * 32 + lane] = 0; // sum(y)
+    sh_high[(i * 2 + 1) * 32 + lane] = 0; // count
   }
   __syncthreads();
   const unsigned mask = __ballot_sync(__activemask(), true);
@@ -64,7 +65,7 @@ __global__ void _h_sm(
     if (base < cols_32M) {
       // Load lane’s locals
       const int jj_lane = base + lane;
-      int16_t y_lane = 0;
+      int32_t y_lane = 0;
       uint32_t l32 = 0;
       if (jj_lane < N) {
         y_lane = Y[jj_lane];
@@ -76,38 +77,36 @@ __global__ void _h_sm(
       // XS row value for this lane (bits consumed across k)
       uint32_t xfd = XS[static_cast<size_t>(feat_set) * static_cast<size_t>(cols_32M)
                       + static_cast<size_t>(base + lane)];
-      #pragma unroll
       for (int k = 0; k < 32; ++k) {
         const int jj_k = base + k;
         if (jj_k < N) {
           const int v = static_cast<int>(xfd & 1u);
           xfd >>= 1;
-          const int32_t yk = __shfl_sync(mask, static_cast<int32_t>(y_lane), k);
+          const int32_t yk = __shfl_sync(mask, y_lane, k);
           uint32_t lk = __shfl_sync(mask, l32, k);
           // d = 0
           hf0 += static_cast<int64_t>(v) * static_cast<int64_t>(yk);
           hw0 += v;
           // d = 1
           unsigned tk = lk & 1u;
-          if (tk == 0u) { hf10 += v * static_cast<int64_t>(yk); hw10 += v; }
-          else { hf11 += v * static_cast<int64_t>(yk); hw11 += v; }
+          if (tk == 0u) { hf10 += v * (int64_t)yk; hw10 += v; }
+          else { hf11 += v * (int64_t)yk; hw11 += v; }
           lk >>= 1;
           // d = 2
           tk = lk & 3u;
-          if (tk == 0u) { hf20 += v * static_cast<int64_t>(yk); hw20 += v; }
-          else if (tk == 1u) { hf21 += v * static_cast<int64_t>(yk); hw21 += v; }
-          else if (tk == 2u) { hf22 += v * static_cast<int64_t>(yk); hw22 += v; }
-          else { hf23 += v * static_cast<int64_t>(yk); hw23 += v; }
+          if (tk == 0u) { hf20 += v * (int64_t)yk; hw20 += v; }
+          else if (tk == 1u) { hf21 += v * (int64_t)yk; hw21 += v; }
+          else if (tk == 2u) { hf22 += v * (int64_t)yk; hw22 += v; }
+          else { hf23 += v * (int64_t)yk; hw23 += v; }
           lk >>= 2;
           // d >= 3
-          #pragma unroll
           for (int d = 3; d < max_depth; ++d) {
             const unsigned to = (1u << d) - 1u;
             const unsigned tkd = lk & to;
             lk >>= d;
             const int idx = static_cast<int>(to + tkd) - 7; // shift after first 7 nodes
-            atomicAdd(&sh_high[(idx * 2 + 0) * 32 + lane], v * static_cast<int64_t>(yk));
-            atomicAdd(&sh_high[(idx * 2 + 1) * 32 + lane], static_cast<int64_t>(v));
+            atomicAdd(&sh_high[(idx * 2 + 0) * 32 + lane], v * yk);
+            atomicAdd(&sh_high[(idx * 2 + 1) * 32 + lane], v);
           }
         }
       }
@@ -164,10 +163,10 @@ __global__ void _h_sm(
     const int node = 7 + rows_per_warp * block_warp + k;
     if (node < nodes_total) {
       const int base = ((node - 7) * 2) * 32 + lane;
-      const int64_t fsum = sh_high[base + 0];
-      const int64_t csum = sh_high[base + 32];
-      atomicAdd(Hptr(H, nodes_total, feat_set, node, 0, lane), static_cast<unsigned long long>(fsum));
-      atomicAdd(Hptr(H, nodes_total, feat_set, node, 1, lane), static_cast<unsigned long long>(csum));
+      const int64_t fsum = static_cast<int64_t>(sh_high[base + 0]);
+      const int64_t csum = static_cast<int64_t>(sh_high[base + 32]);
+      atomicAdd(Hptr(H, nodes_total, feat_set, node, 0, lane), (unsigned long long int)fsum);
+      atomicAdd(Hptr(H, nodes_total, feat_set, node, 1, lane), (unsigned long long int)csum);
     }
   }
 }
@@ -223,9 +222,9 @@ torch::Tensor h_sm(
   infer_grid_stride(nfeatsets, cols_32M, warps_per_block, blocks_per_feat, stride);
   dim3 grid(nfeatsets, blocks_per_feat, 1);
   dim3 block(warps_per_block * 32, 1, 1);
-  // Dynamic shared memory for high depths: (2^D - 8, 2, 32) int64
+  // Dynamic shared memory for high depths: (2^D - 8, 2, 32) ints
   int n_ge3 = std::max((1 << max_depth) - 8, 1);
-  size_t smem_high = static_cast<size_t>(n_ge3) * 2 * 32 * sizeof(int64_t);
+  size_t smem_high = static_cast<size_t>(n_ge3) * 2 * 32 * sizeof(int);
   // Additional for low depths: (warps_per_block, 7, 32) unsigned long long (packed)
   size_t smem_low = static_cast<size_t>(warps_per_block) * 7 * 32 * sizeof(unsigned long long);
   size_t smem_bytes = smem_high + smem_low;
