@@ -69,7 +69,7 @@ __global__ void _h_sm(
       const int jj_lane = base + lane;
       int32_t y_lane = 0;
       uint32_t l32 = 0;
-      if (jj_lane < N) {
+      if (jj_lane < N  && xfd != 0u) {
         y_lane = Y[jj_lane];
         // LF indexed [nfeatsets, N]
         LF_T lval = LF[static_cast<size_t>(feat_set) * static_cast<size_t>(N) + jj_lane];
