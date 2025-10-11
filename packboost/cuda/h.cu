@@ -283,6 +283,14 @@ torch::Tensor h_sm(
 }
 
 
+#define WARP 32
+
+// shared layout: [nodes, 2, 32] packed: ((node*2 + ch)*32 + lane)
+static __device__ __forceinline__ int SH_idx(int node, int ch, int lane) {
+    return (node * 2 + ch) * 32 + lane;
+}
+
+
 template <typename T>
 __global__ void _h_sm_sw(
     const uint32_t* __restrict__ XS,   // [F, 32*M]
