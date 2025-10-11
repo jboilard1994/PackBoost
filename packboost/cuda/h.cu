@@ -283,45 +283,41 @@ torch::Tensor h_sm(
 }
 
 
-// ------------------------ Kernel A: build per-block partials ------------------------
-// Shared histogram covers ALL nodes: [nodes_tot, 2, 32] int32
-// Then each block writes its partial to: Scratch[F, nodes_tot, 2, 32, B] int64
-template <typename LF_T>
-__global__ void _h_partials(
+template <typename T>
+__global__ void _h_sm_sw(
     const uint32_t* __restrict__ XS,   // [F, 32*M]
     const int32_t*  __restrict__ Y,    // [N]
-    const LF_T*     __restrict__ LF,   // [F, N] (u16/u32/u64)
-    int64_t*        __restrict__ SCR,  // [F, nodes_tot, 2, 32, B] int64
-    int F, int cols_32M, int N, int D,
-    int warps_per_block, int stride_per_warp,
-    int nodes_tot, int B                 // blocks_per_feat (last scratch dim)
+    const T*        __restrict__ LF,   // [F, N], UNSIGNED in template
+    int64_t*        __restrict__ H,    // [F, nodes_tot, 2, 32] int64
+    const int F,
+    const int cols_32M,
+    const int N,
+    const int max_depth,
+    const int stride_per_block,
+    const int nodes_tot
 ){
-    const int feat  = blockIdx.x;       // 0..F-1
-    const int bidx  = blockIdx.y;       // 0..B-1 (this block's partial slot)
-    if (feat >= F || bidx >= B) return;
+    const int feat = blockIdx.x;
+    const int bi   = blockIdx.y;              // sample-tile id
+    const int lane = threadIdx.x;             // 0..31
 
-    const int lane  = threadIdx.x & 31;
-    const int wid   = threadIdx.x >> 5;               // 0..warps_per_block-1
-    const int gwarp = warps_per_block * bidx + wid;   // global warp ordinal along samples
+    if (feat >= F || blockDim.x != WARP || lane >= WARP) return;
 
-    // ----- shared histogram -----
-    extern __shared__ int s_hist[];                   // [nodes_tot, 2, 32] int32
-    const size_t hist_ints = (size_t)nodes_tot * 2 * 32;
+    extern __shared__ int s_hist[];           // [nodes_tot, 2, 32] int32
 
-    // helper
-    auto HIST = [&](int node, int ch, int l)->int& {
-        return s_hist[((size_t)node * 2 + ch) * 32 + l];
-    };
-
-    // zero cooperatively
-    for (size_t i = threadIdx.x; i < hist_ints; i += blockDim.x) s_hist[i] = 0;
-    __syncthreads();
+    // --- zero shared histogram (32 threads) ---
+    const size_t hist_ints = static_cast<size_t>(nodes_tot) * 2 * 32;
+    for (size_t i = lane; i < hist_ints; i += 32) s_hist[i] = 0;
+    __syncwarp();
 
     const unsigned full = __activemask();
+    using U = typename std::make_unsigned<T>::type;
 
-    // iterate tiles owned by this warp
-    for (int j = 0; j < stride_per_warp; ++j) {
-        const int base = 32 * (gwarp * stride_per_warp + j);
+    // --- accumulate lane-private columns into shared ---
+    // each block processes 'stride_per_block' tiles of 32 samples
+    const int base0 = 32 * (bi * stride_per_block);
+    #pragma unroll 1
+    for (int j = 0; j < stride_per_block; ++j) {
+        const int base = base0 + 32 * j;
         if (base >= cols_32M) break;
 
         // lane-local loads
@@ -332,178 +328,136 @@ __global__ void _h_partials(
 
         const int jj_lane = base + lane;
         int32_t y_lane = 0;
-        unsigned long long lf_lane = 0ULL; // 64b to support D up to 9
+        unsigned long long lf_lane = 0ULL; // up to 64 bits for D<=9
         if (jj_lane < N) {
             y_lane  = Y[jj_lane];
-            lf_lane = (unsigned long long)(
-                (typename std::make_unsigned<LF_T>::type)
-                (LF[(size_t)feat * N + jj_lane]));
+            lf_lane = (unsigned long long)( (U)LF[(size_t)feat * N + jj_lane] );
         }
-        // split 64b into two 32b pieces for shuffles
         const uint32_t lf_lo_lane = (uint32_t)(lf_lane & 0xFFFFFFFFull);
         const uint32_t lf_hi_lane = (uint32_t)(lf_lane >> 32);
 
-        // 32 columns in this tile
+        // iterate 32 columns in this tile
+        #pragma unroll
         for (int k = 0; k < 32; ++k) {
             const int jj_k = base + k;
             const unsigned mask_k = __ballot_sync(full, jj_k < N);
-            if (!mask_k) break;  // all lanes agree there is no more work in this tile
+            if (!mask_k) break;  // all lanes agree: no more valid samples here
 
-            // always broadcast with the same mask_k
-            const int  yk  = __shfl_sync(mask_k, y_lane,     k, 32);
+            // broadcast Y and LF from lane k (everyone must call shuffles)
+            const int  yk  = __shfl_sync(mask_k, y_lane,      k, 32);
             const uint32_t loK = __shfl_sync(mask_k, lf_lo_lane, k, 32);
             const uint32_t hiK = __shfl_sync(mask_k, lf_hi_lane, k, 32);
             unsigned long long lk = (unsigned long long)loK | ((unsigned long long)hiK << 32);
 
-            // lane’s bit for this column
+            // this lane's feature bit for sample (base+k)
             const int v = (int)((xbits >> k) & 1u);
             if (!v) continue;
 
-            // dynamic depths: node = ((1<<d)-1) + (lk & ((1<<d)-1)); lk >>= d
-            for (int d = 0; d < D; ++d) {
+            // depth walk: node = ((1<<d)-1) + (lk & ((1<<d)-1)); lk >>= d
+            #pragma unroll 1
+            for (int d = 0; d < max_depth; ++d) {
                 const unsigned to = (d==0) ? 0u : ((1u<<d) - 1u);
                 const unsigned tk = (d==0) ? 0u : (unsigned)(lk & to);
                 if (d > 0) lk >>= d;
-                const int node = (int)(to + tk);     // 0..nodes_tot-1
-                atomicAdd(&HIST(node, 0, lane), yk);
-                atomicAdd(&HIST(node, 1, lane), 1);
+                const int node = (int)(to + tk);   // 0..nodes_tot-1
+                s_hist[SH_idx(node, 0, lane)] += yk;   // sum(G)
+                s_hist[SH_idx(node, 1, lane)] += 1;    // count
             }
         }
     }
-    __syncthreads();
+    __syncwarp();
 
-    // drain shared histogram to this block's scratch slice (no atomics)
-    // layout: SCR[feat, node, ch, lane, bidx]
-    const size_t nodes_stride = (size_t)2 * 32 * B;
-    const size_t ch_stride    = (size_t)32 * B;
-    const size_t lane_stride  = (size_t)B;
+    // --- drain shared -> global (preserve lanes) ---
+    // do it in 32-node tiles so each lane handles its own node index
+    for (int k0 = 0; k0 < nodes_tot; k0 += 32) {
+        const int node = k0 + lane;
+        if (node >= nodes_tot) break;
 
-    int64_t* base_ptr = SCR + ((size_t)feat * nodes_tot) * (2*32*B);
-
-    for (int node = wid; node < nodes_tot; node += warps_per_block) {
-        const size_t base_off = (size_t)node * nodes_stride + (size_t)lane * lane_stride + bidx;
-        const int fs = HIST(node, 0, lane);
-        const int cs = HIST(node, 1, lane);
-        base_ptr[base_off + 0*ch_stride] = (long long)fs;
-        base_ptr[base_off + 1*ch_stride] = (long long)cs;
+        const int fs = s_hist[SH_idx(node, 0, lane)];
+        const int cs = s_hist[SH_idx(node, 1, lane)];
+        if (fs) atomicAdd(Hptr(H, nodes_tot, feat, node, 0, lane), (unsigned long long)(long long)fs);
+        if (cs) atomicAdd(Hptr(H, nodes_tot, feat, node, 1, lane), (unsigned long long)(long long)cs);
     }
 }
 
-
-// ------------------------ Kernel B: reduce partials to final H ------------------------
-__global__ void _h_reduce(
-    const int64_t* __restrict__ SCR,   // [F, nodes_tot, 2, 32, B]
-    int64_t*       __restrict__ H,     // [F, nodes_tot, 2, 32]
-    int F, int nodes_tot, int B
-){
-    const int feat = blockIdx.x;
-    const int node = blockIdx.y;
-    const int ch   = blockIdx.z;       // 0 or 1
-    const int lane = threadIdx.x;      // 0..31
-    if (feat >= F || node >= nodes_tot || ch >= 2 || lane >= 32) return;
-
-    const size_t nodes_stride = (size_t)2 * 32 * B;
-    const size_t ch_stride    = (size_t)32 * B;
-    const size_t lane_stride  = (size_t)B;
-
-    const int64_t* base_ptr = SCR + ((size_t)feat * nodes_tot + node) * (2*32*B);
-    int64_t acc = 0;
-    for (int b = 0; b < B; ++b) {
-        acc += base_ptr[ (size_t)ch * ch_stride + (size_t)lane * lane_stride + b ];
-    }
-
-    // H[feat, node, ch, lane] = acc
-    H[ (((size_t)feat * nodes_tot + node) * 2 + ch) * 32 + lane ] = acc;
-}
-
-// ---------------------------------- Launcher ----------------------------------
-torch::Tensor h_two_pass(
+// ------------------------------ Launcher ------------------------------
+torch::Tensor h_sm_sw(
     torch::Tensor XS,   // [F, 32*M], (u)int32
     torch::Tensor Y,    // [N], int32
     torch::Tensor LF,   // [F, N], (u)int16/32/64
-    int max_depth       // supports 1..9 (SMEM bound)
+    int max_depth
 ){
-    
-    const int64_t F64    = XS.size(0);
-    const int64_t cols64 = XS.size(1);
-    const int64_t N64    = Y.size(0);
-    
+    TORCH_CHECK(XS.is_cuda() && Y.is_cuda() && LF.is_cuda(), "XS, Y, LF must be CUDA.");
+    TORCH_CHECK(XS.dim()==2 && Y.dim()==1 && LF.dim()==2, "XS[F,32*M], Y[N], LF[F,N].");
+    TORCH_CHECK((XS.scalar_type()==c10::ScalarType::UInt || XS.scalar_type()==c10::ScalarType::Int),
+                "XS must be uint32/int32.");
+    TORCH_CHECK(Y.scalar_type()==c10::ScalarType::Int, "Y must be int32.");
+    TORCH_CHECK(max_depth>=1 && max_depth<=9, "Supports 1..9.");
+    TORCH_CHECK(XS.size(1) % 32 == 0, "XS.shape[1] must be divisible by 32.");
+
+    const int64_t F64 = XS.size(0);
+    const int64_t C64 = XS.size(1);     // 32*M
+    const int64_t N64 = Y.size(0);
+    TORCH_CHECK(F64<=INT_MAX && C64<=INT_MAX && N64<=INT_MAX, "shape too large");
 
     const int F        = (int)F64;
-    const int cols_32M = (int)cols64;
+    const int cols_32M = (int)C64;
     const int N        = (int)N64;
     const int D        = max_depth;
     const int nodes_tot = (1<<D) - 1;
 
+    // grid tiling: one warp per block, many blocks along samples
     auto* prop = at::cuda::getCurrentDeviceProperties();
-    size_t smem_cap = prop->sharedMemPerBlockOptin ? (size_t)prop->sharedMemPerBlockOptin
-                                                   : (size_t)prop->sharedMemPerBlock;
-
-    // SMEM for full-node histogram (int32): nodes_tot * 2 * 32 * 4
-    const size_t hist_bytes = (size_t)nodes_tot * 2 * 32 * sizeof(int);
-    TORCH_CHECK(hist_bytes <= smem_cap,
-        "Kernel A needs ", hist_bytes, "B SMEM; device allows ", smem_cap, "B. "
-        "D=8 fits on 64KB, D=9 needs ~128KB (A100-class).");
-
-    // Choose warps_per_block and B (blocks_per_feat) to keep GPU busy
-    int warps_per_block = std::min(16, prop->maxThreadsPerBlock / 32);
-    if (warps_per_block < 1) warps_per_block = 1;
-
     int SM = prop->multiProcessorCount;
-    int target_blocks_per_SM = 24; // good default for two-pass
+    int target_blocks_per_SM = 64;  // tiny blocks → scale out
     int min_total_blocks = SM * target_blocks_per_SM;
-    int B = (min_total_blocks + F - 1) / F;
-    if (B < 16) B = 16; // ensure enough partials
+    int grid_y = (min_total_blocks + F - 1) / F;
+    if (grid_y < 64) grid_y = 64;
 
-    // per-warp tiles along samples
-    int stride_per_warp = (N + (32 * B * warps_per_block) - 1) / (32 * B * warps_per_block);
-    if (stride_per_warp < 1) stride_per_warp = 1;
+    int stride_per_block = (N + (WARP * grid_y) - 1) / (WARP * grid_y);
+    if (stride_per_block < 1) stride_per_block = 1;
 
-    // Allocate scratch: [F, nodes_tot, 2, 32, B] int64
-    auto SCR = torch::empty({F64, (int64_t)nodes_tot, 2, 32, (int64_t)B},
-                            LF.options().dtype(torch::kLong).memory_format(c10::MemoryFormat::Contiguous));
+    const dim3 block(WARP, 1, 1);
+    const dim3 grid (F, grid_y, 1);
 
-    // Final output: [F, nodes_tot, 2, 32] int64
-    auto H = torch::empty({F64, (int64_t)nodes_tot, 2, 32},
+    // output
+    auto H = torch::zeros({F64, (int64_t)nodes_tot, 2, 32},
                           LF.options().dtype(torch::kLong).memory_format(c10::MemoryFormat::Contiguous));
 
-    const dim3 gridA(F, B, 1);
-    const dim3 blockA(warps_per_block * 32, 1, 1);
-    const size_t smemA = hist_bytes;
-
-    const dim3 gridB(F, (unsigned)nodes_tot, 2);
-    const dim3 blockB(32, 1, 1);
+    // dynamic SMEM for [nodes_tot, 2, 32] int32
+    const size_t smem_bytes = (size_t)nodes_tot * 2 * 32 * sizeof(int);
+    size_t smem_cap = prop->sharedMemPerBlockOptin ? (size_t)prop->sharedMemPerBlockOptin
+                                                   : (size_t)prop->sharedMemPerBlock;
+    TORCH_CHECK(smem_bytes <= smem_cap,
+        "H single-warp butterfly needs ", smem_bytes, "B SMEM; device allows ",
+        smem_cap, "B. (D=9 ~130,816B; requires ~128KB opt-in SMEM e.g. A100)");
 
     auto stream = at::cuda::getCurrentCUDAStream();
     const uint32_t* XS_u32 = reinterpret_cast<const uint32_t*>(XS.data_ptr());
     const auto dt = LF.scalar_type();
 
-    // ---------------- Kernel A launch ----------------
-    if (dt == torch::kUInt16) {
-        cudaFuncSetAttribute(_h_partials<uint16_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smemA);
-        _h_partials<uint16_t><<<gridA, blockA, smemA, stream.stream()>>>(
+    if (dt == c10::ScalarType::UInt16) {
+        cudaFuncSetAttribute(_h_sm_sw<uint16_t>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
+        _h_sm_sw<uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
             XS_u32, Y.data_ptr<int32_t>(), LF.data_ptr<uint16_t>(),
-            SCR.data_ptr<int64_t>(), F, cols_32M, N, D,
-            warps_per_block, stride_per_warp, nodes_tot, B);
-    } else if (dt == torch::kUInt32) {
-        cudaFuncSetAttribute(_h_partials<uint32_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smemA);
-        _h_partials<uint32_t><<<gridA, blockA, smemA, stream.stream()>>>(
+            H.data_ptr<int64_t>(), F, cols_32M, N, D, stride_per_block, nodes_tot);
+    } else if (dt == c10::ScalarType::UInt32) {
+        cudaFuncSetAttribute(_h_sm_sw<uint32_t>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
+        _h_sm_sw<uint32_t><<<grid, block, smem_bytes, stream.stream()>>>(
             XS_u32, Y.data_ptr<int32_t>(), LF.data_ptr<uint32_t>(),
-            SCR.data_ptr<int64_t>(), F, cols_32M, N, D,
-            warps_per_block, stride_per_warp, nodes_tot, B);
-    } else if (dt == torch::kUInt64) {
-        cudaFuncSetAttribute(_h_partials<uint64_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smemA);
-        _h_partials<uint64_t><<<gridA, blockA, smemA, stream.stream()>>>(
+            H.data_ptr<int64_t>(), F, cols_32M, N, D, stride_per_block, nodes_tot);
+    } else if (dt == c10::ScalarType::UInt64) {
+        cudaFuncSetAttribute(_h_sm_sw<uint64_t>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
+        _h_sm_sw<uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
             XS_u32, Y.data_ptr<int32_t>(), LF.data_ptr<uint64_t>(),
-            SCR.data_ptr<int64_t>(), F, cols_32M, N, D,
-            warps_per_block, stride_per_warp, nodes_tot, B);
+            H.data_ptr<int64_t>(), F, cols_32M, N, D, stride_per_block, nodes_tot);
     } else {
-        TORCH_CHECK(false, "LF must be uint16/uint32/uint64.");
+        TORCH_CHECK(false, "LF must be one of: uint16/uint32/uint64.");
     }
 
-    // ---------------- Kernel B launch ----------------
-    _h_reduce<<<gridB, blockB, 0, stream.stream()>>>(
-        SCR.data_ptr<int64_t>(), H.data_ptr<int64_t>(), F, nodes_tot, B);
-
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return H;
 }
