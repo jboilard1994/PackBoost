@@ -62,11 +62,12 @@ torch::Tensor h_sm(
     torch::Tensor LF,
     int max_depth);
 
-torch::Tensor h_multiwarp_generic(
-    torch::Tensor XS,  // [nfeatsets, 32*M] (uint32/int32)
-    torch::Tensor Y,   // [N] (int32)
-    torch::Tensor LF,  // [nfeatsets, N] (uint16/32/64) — use uint64 for D=9
-    int max_depth);
+torch::Tensor h_two_pass(
+        torch::Tensor XS,   // [F, 32*M], (u)int32
+        torch::Tensor Y,    // [N], int32
+        torch::Tensor LF,   // [F, N], (u)int16/32/64
+        int max_depth       // supports 1..9 (SMEM bound)
+    );
 
 namespace {
 
@@ -129,7 +130,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Repack trees for features (Murky parity, CUDA)");
 
     m.def("h_sm", &h_sm, "PackBoost H (unweighted histogram, Murky parity; returns H)");
-    m.def("h_multiwarp_generic", &h_multiwarp_generic, "PackBoost H (unweighted histogram, returns H)");
+    m.def("h_two_pass", &h_two_pass,
+        "PackBoost H two-pass (partials + merge), lane-preserving, D<=9");
 
 
 }
