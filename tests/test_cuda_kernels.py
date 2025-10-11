@@ -182,3 +182,77 @@ def test_repack_matches_cpu_reference():
             LF_out.cpu(), LF_ref, rtol=0, atol=0,
             msg=f"LF mismatch K={K} D={D} N={N} nfeatsets={nfeatsets} nsets={nsets}"
         )
+
+
+def test_h_matches_cpu_reference():
+    pack_cpu = PackBoost(device="cpu")
+    pack_gpu = PackBoost(device="cuda")
+
+    torch.manual_seed(42)
+
+    # (K=nfolds, D=max_depth (<=7), N=samples, nfeatsets)
+    cases = [
+        (1, 3, 1,                 7),    # tiny sanity; tail nfeatsets
+        (2, 5, 33,               17),    # N just over a warp; tail nfeatsets
+        (8, 7, 32 * 512 - 1,     32),    # just under full grid tile
+        (8, 7, 32 * 512 + 5,     63),    # over tile + tail nfeatsets
+        (16, 7, 100_003,         40),    # large N, varied nfeatsets
+    ]
+
+    # Q30-ish range to match prior conventions; we'll use G (from prep_vars) as Y for H.
+    lo, hi = -(1 << 30), (1 << 30) - 1
+
+    for K, D, N, nfeatsets in cases:
+        assert D <= 7, "GPU H shared-mem variant is defined up to D=7"
+
+        # --- Build LE and G via prep_vars so packing matches Murky exactly ---
+        # L shape: [K, D-1, N] (depth bits for d=1..D-1)
+        L_bits = torch.randint(0, 4, (K, max(D - 1, 0), N), dtype=torch.uint8)
+        Y_raw  = torch.randint(lo, hi + 1, (N,), dtype=torch.int32)
+        P_raw  = torch.randint(lo, hi + 1, (N,), dtype=torch.int32)
+
+        LE_ref, G_ref = pack_cpu.prep_vars(L_bits, Y_raw, P_raw)  # LE dtype auto (u16/u32/u64)
+
+        # --- Build LF via repack (Murky FST wiring) ---
+        # FST: [nsets, nfeatsets, D], each depth is a shuffled tiling of [0..K-1]
+        nsets = 3
+        base = torch.arange(K, dtype=torch.uint8)
+        rep  = (nfeatsets + K - 1) // K
+        row  = base.repeat(rep)[:nfeatsets]
+        FST  = torch.empty((nsets, nfeatsets, D), dtype=torch.uint8)
+        for s in range(nsets):
+            for d in range(D):
+                perm = torch.randperm(nfeatsets)
+                FST[s, :, d] = row[perm]
+        tree_set = (3 * K + 5) % nsets
+
+        LF_ref = pack_cpu.repack(FST, LE_ref, tree_set)  # [nfeatsets, N], dtype(u16/u32/u64)
+
+        # --- Make XS with enough columns to cover N samples (N <= 32*M) ---
+        M = (N + 31) // 32
+        XS_cpu = torch.randint(
+            0, 2 ** 32, (nfeatsets, 32 * M), dtype=torch.int64
+        ).to(torch.uint32)
+
+        # --- CPU reference ---
+        Y32_cpu = G_ref.to(torch.int32)                 # H expects int32 Y
+        H_ref   = pack_cpu.H(XS_cpu, Y32_cpu, LF_ref, D)
+
+        # --- GPU output ---
+        XS_gpu  = XS_cpu.cuda()
+        Y32_gpu = Y32_cpu.cuda()
+        LF_gpu  = LF_ref.cuda()
+
+        H_out = pack_gpu.H(XS_gpu, Y32_gpu, LF_gpu, D)
+        torch.cuda.synchronize()
+
+        # --- Checks ---
+        nodes_tot = (1 << D) - 1
+        assert H_out.shape == (nfeatsets, nodes_tot, 2, 32)
+        assert H_ref.shape == (nfeatsets, nodes_tot, 2, 32)
+
+        # Exact equality
+        torch.testing.assert_close(
+            H_out.cpu(), H_ref, rtol=0, atol=0,
+            msg=f"H mismatch K={K} D={D} N={N} nfeatsets={nfeatsets}"
+        )

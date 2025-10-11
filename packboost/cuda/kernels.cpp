@@ -116,4 +116,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &repack_trees_for_features_cuda,
         "Repack trees for features (Murky parity, CUDA)");
 
+    m.def("h_sm", &h_sm, "PackBoost H (unweighted histogram, Murky parity; returns H)");
+
 }

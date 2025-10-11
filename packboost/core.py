@@ -2,7 +2,10 @@ import torch
 import numpy as np
 from sklearn.base import BaseEstimator, RegressorMixin
 from torch import Tensor
+import torch.nn.functional as Fn
+
 from packboost.cuda import kernels
+
 
 class PackBoost(BaseEstimator, RegressorMixin):
     def __init__(self, device='cuda'):
@@ -154,4 +157,106 @@ class PackBoost(BaseEstimator, RegressorMixin):
         # Masks touch disjoint bit ranges, so OR == sum of masked parts.
         LF = (LE_sel & masks.view(1, Dm, 1)).sum(dim=1).to(dtype=out_dtype)  # [nfeatsets, N]
         return LF.contiguous()
+    
 
+    def H(self, XS: torch.Tensor, Y: torch.Tensor, LF: torch.Tensor, max_depth: int) -> torch.Tensor:
+        """
+        XS : [nfeatsets, 32*M] (uint32/int32), packed features
+        Y  : [N]               (int32/int64), target/gradient
+        LF : [nfeatsets, N]    (uint16/uint32/uint64), path codes (Murky parity)
+        max_depth: int (<= 7 for the SMEM variant on GPU)
+        Returns:
+        H: [nfeatsets, (1<<max_depth)-1, 2, 32] int64
+            last dim = lane (0..31); channel 0=sum(y*v), 1=count(v)
+        """
+        nfeatsets, cols_32M = XS.shape
+        N = int(Y.shape[0])
+        nodes_tot = (1 << max_depth) - 1
+
+        # --- GPU fast path ---
+        if (XS.is_cuda or Y.is_cuda or LF.is_cuda) and torch.cuda.is_available():
+            # Expect your compiled extension to expose kernels.h_sm
+            return kernels.h_sm(XS.contiguous(), Y.to(torch.int32).contiguous(), LF.contiguous(), int(max_depth))
+
+        # --- CPU vectorized fallback ---
+        dev = XS.device
+        TORCH_INT64 = torch.int64
+
+        # Validate shapes
+        assert cols_32M % 32 == 0, "XS must have columns divisible by 32"
+        M = cols_32M // 32
+
+        # Prepare output
+        H_sum = torch.zeros((nfeatsets, nodes_tot, 32), dtype=TORCH_INT64, device=dev)
+        H_cnt = torch.zeros_like(H_sum)
+
+        # Casts (no copies if already correct)
+        Y64  = Y.to(TORCH_INT64,  copy=False).contiguous()                     # [N]
+        LF64 = LF.to(TORCH_INT64, copy=False).contiguous()                     # [F, N]
+        XS64 = XS.to(TORCH_INT64, copy=False).contiguous().view(nfeatsets, M, 32)  # [F, M, 32]
+
+        # Build V = bit-unpacked features per lane:
+        # V[f, l, s] = ((XS[f, b, l] >> k) & 1) where s = 32*b + k
+        # Vectorized unpack: [F,M,32(lane),32(k)]
+        bit_ids = torch.arange(32, dtype=TORCH_INT64, device=dev)
+        masks   = (1 << bit_ids)                                              # [32]
+        V_bits  = ((XS64[..., None] & masks) != 0).to(TORCH_INT64)            # [F, M, 32, 32]
+        V       = V_bits.permute(0, 2, 1, 3).reshape(nfeatsets, 32, 32 * M)   # [F, 32, 32*M]
+        if V.size(2) > N:                                                     # trim to N
+            V = V[:, :, :N].contiguous()                                      # [F, 32, N]
+
+        # Common broadcasts
+        Y_b  = Y64.view(1, 1, N)                      # [1,1,N]
+        ones = torch.ones((1, 1, N), dtype=TORCH_INT64, device=dev)
+
+        # -------- depth = 0 (node 0) --------
+        H_sum[:, 0, :] = (V * Y_b).sum(dim=2)         # [F, 32]
+        H_cnt[:, 0, :] = V.sum(dim=2)                 # [F, 32]
+
+        # -------- depth = 1 (nodes 1,2) --------
+        tk1 = (LF64 & 1)                               # [F, N]
+        m0  = (tk1 == 0).to(TORCH_INT64).unsqueeze(1)  # [F,1,N]
+        m1  = 1 - m0                                   # [F,1,N]
+
+        H_sum[:, 1, :] = (V * (Y_b * m0)).sum(dim=2)   # -> node 1
+        H_cnt[:, 1, :] = (V * m0).sum(dim=2)
+        H_sum[:, 2, :] = (V * (Y_b * m1)).sum(dim=2)   # -> node 2
+        H_cnt[:, 2, :] = (V * m1).sum(dim=2)
+
+        # -------- depth = 2 (nodes 3..6) via one-hot --------
+        tk2 = ((LF64 >> 1) & 3).to(torch.long)         # [F, N]
+        oh2 = Fn.one_hot(tk2, num_classes=4).to(TORCH_INT64)  # [F, N, 4]
+        oh2 = oh2.unsqueeze(1)                         # [F,1,N,4]
+        V4  = V.unsqueeze(-1)                          # [F,32,N,1]
+        sum2 = (V4 * (Y_b.unsqueeze(-1) * oh2)).sum(dim=2)   # [F,32,4]
+        cnt2 = (V4 * oh2).sum(dim=2)                   # [F,32,4]
+        H_sum[:, 3:7, :] = sum2.permute(0, 2, 1).contiguous()  # [F,4,32]
+        H_cnt[:, 3:7, :] = cnt2.permute(0, 2, 1).contiguous()
+
+        # -------- depths >= 3 (nodes 7..(2^D-2)) via scatter_add --------
+        if max_depth > 3:
+            F32 = nfeatsets * 32
+            V_flat  = V.view(F32, N)                               # [F*32, N]
+            Y_flat  = Y64.view(1, N).expand(F32, N)               # [F*32, N]
+
+            for d in range(3, max_depth):
+                s     = (d * (d - 1)) // 2
+                base  = (1 << d) - 1
+                maskd = (1 << d) - 1
+
+                idx_fn = (((LF64 >> s) & maskd) + base).to(torch.long).contiguous()  # [F,N]
+                idx_b  = idx_fn.repeat_interleave(32, dim=0)                          # [F*32, N]
+
+                out_sum = torch.zeros((F32, nodes_tot), dtype=TORCH_INT64, device=dev)
+                out_cnt = torch.zeros_like(out_sum)
+
+                out_sum.scatter_add_(1, idx_b, (V_flat * Y_flat))
+                out_cnt.scatter_add_(1, idx_b, V_flat)
+
+                # reshape back to [F, 32, nodes] -> [F, nodes, 32]
+                H_sum[:, :, :] += out_sum.view(nfeatsets, 32, nodes_tot).permute(0, 2, 1)
+                H_cnt[:, :, :] += out_cnt.view(nfeatsets, 32, nodes_tot).permute(0, 2, 1)
+
+        # stack channels: [F, nodes, 2, 32]
+        H = torch.stack([H_sum, H_cnt], dim=2).contiguous()
+        return H
