@@ -17,7 +17,7 @@ __global__ void _h_sm(
     const uint32_t* __restrict__ XS,  // [nfeatsets, 32*M]
     const int32_t*  __restrict__ Y,   // [N]
     const LF_T*     __restrict__ LF,  // [nfeatsets, N] (u16/u32/u64)
-    long long*      __restrict__ H,   // [nfeatsets, nodes, 2, 32] (int64)
+    int64_t*      __restrict__ H,   // [nfeatsets, nodes, 2, 32] (int64)
     int nfeatsets,
     int cols_32M,     // XS.shape[1] == 32*M
     int N,            // Y.shape[0]
@@ -49,7 +49,7 @@ __global__ void _h_sm(
   }
   __syncthreads();
 
-  const unsigned mask = 0xFFFFFFFFu;
+  const unsigned mask = __ballot_sync(__activemask(), true);
 
   // Each warp processes 'stride' tiles of 32 columns
   for (int j = 0; j < stride; ++j) {
@@ -247,7 +247,7 @@ torch::Tensor h_sm(
       XS_ptr,
       Y.data_ptr<int32_t>(),
       LF.data_ptr<uint16_t>(),
-      H.data_ptr<long long>(),
+      H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth,
       warps_per_block, stride, nodes_tot
     );
@@ -259,7 +259,7 @@ torch::Tensor h_sm(
       XS_ptr,
       Y.data_ptr<int32_t>(),
       LF.data_ptr<uint32_t>(),
-      H.data_ptr<long long>(),
+      H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth,
       warps_per_block, stride, nodes_tot
     );
@@ -271,7 +271,7 @@ torch::Tensor h_sm(
       XS_ptr,
       Y.data_ptr<int32_t>(),
       LF.data_ptr<uint64_t>(),
-      H.data_ptr<long long>(),
+      H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth,
       warps_per_block, stride, nodes_tot
     );
