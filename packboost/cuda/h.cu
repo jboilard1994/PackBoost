@@ -302,7 +302,7 @@ __device__ __forceinline__ unsigned long long pack_sc(int sum32, int cnt32) {
 
 // --- kernel (unchanged signature; only inner logic changed to be convergent) ---
 template <typename LF_T>
-__global__ void _h_sm_opt_safe(
+__global__ void _h_sm_opt(
     const uint32_t* __restrict__ XS,
     const int32_t*  __restrict__ Y,
     const LF_T*     __restrict__ LF,
