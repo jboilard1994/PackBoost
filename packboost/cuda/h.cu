@@ -76,17 +76,20 @@ __global__ void _h_sm(
         // Cast to 32-bit for warp shuffle (max_depth<=7 => safe)
         l32 = static_cast<uint32_t>(lval);
       }
-      // XS row value for this lane (bits consumed across k)
-      uint32_t xfd_local = XS[static_cast<size_t>(feat_set) * static_cast<size_t>(cols_32M)
-        + static_cast<size_t>(base + lane)];
 
-        // Uniform “short tile” check (safe for all lanes)
-        const bool full_tile = (base + 31) < N;
+        // Load this lane's 32-bit tile
+        uint32_t xfd_local = XS[static_cast<size_t>(feat_set) * static_cast<size_t>(cols_32M)
+            + static_cast<size_t>(base + lane)];
 
-        #pragma unroll
+        // Mask off bits beyond N for the tail tile (uniform)
+        const int rem = N - base;
+        uint32_t valid_mask;
+        if (rem >= 32)      valid_mask = 0xFFFFFFFFu;
+        else if (rem > 0)   valid_mask = (1u << rem) - 1u;
+        else                valid_mask = 0u;
+        xfd_local &= valid_mask;
+
         for (int k = 0; k < 32; ++k) {
-        if (!full_tile && (base + k) >= N) break;          // uniform early-exit
-
         // consume one bit per iter (per-lane)
         const int v = static_cast<int>(xfd_local & 1u);
         xfd_local >>= 1;
@@ -96,35 +99,33 @@ __global__ void _h_sm(
         uint32_t      lk = __shfl_sync(mask, l32,    k);
 
         // d = 0
-        hf0 += static_cast<int64_t>(v) * static_cast<int64_t>(yk);
+        hf0 += static_cast<int64_t>(v) * (int64_t)yk;
         hw0 += v;
 
         // d = 1
         unsigned tk = lk & 1u; lk >>= 1;
-        if (tk == 0u) { hf10 += static_cast<int64_t>(v) * static_cast<int64_t>(yk); hw10 += v; }
-        else          { hf11 += static_cast<int64_t>(v) * static_cast<int64_t>(yk); hw11 += v; }
+        const int64_t add = static_cast<int64_t>(v) * (int64_t)yk;
+        if (tk == 0u) { hf10 += add; hw10 += v; }
+        else          { hf11 += add; hw11 += v; }
 
         // d = 2
         tk = lk & 3u; lk >>= 2;
-        if      (tk == 0u) { hf20 += static_cast<int64_t>(v) * static_cast<int64_t>(yk); hw20 += v; }
-        else if (tk == 1u) { hf21 += static_cast<int64_t>(v) * static_cast<int64_t>(yk); hw21 += v; }
-        else if (tk == 2u) { hf22 += static_cast<int64_t>(v) * static_cast<int64_t>(yk); hw22 += v; }
-        else               { hf23 += static_cast<int64_t>(v) * static_cast<int64_t>(yk); hw23 += v; }
+        if      (tk == 0u) { hf20 += add; hw20 += v; }
+        else if (tk == 1u) { hf21 += add; hw21 += v; }
+        else if (tk == 2u) { hf22 += add; hw22 += v; }
+        else               { hf23 += add; hw23 += v; }
 
-        // d >= 3  (guard atomics to avoid useless traffic)
+        // d >= 3 (no branch; multiply by v)
+        #pragma unroll
         for (int d = 3; d < max_depth; ++d) {
         const unsigned to  = (1u << d) - 1u;
         const unsigned tkd = lk & to; lk >>= d;
-        const int idx = static_cast<int>(to + tkd) - 7;   // shift after first 7 nodes
-        if (v) {
-        atomicAdd(&sh_high[(idx * 2 + 0) * 32 + lane], yk);
-        atomicAdd(&sh_high[(idx * 2 + 1) * 32 + lane], 1);
+        const int idx = static_cast<int>(to + tkd) - 7;
+        atomicAdd(&sh_high[(idx * 2 + 0) * 32 + lane], v * yk);
+        atomicAdd(&sh_high[(idx * 2 + 1) * 32 + lane], v);
         }
         }
 
-        // uniform break when all lanes have no remaining 1-bits
-        if (__all_sync(mask, xfd_local == 0u)) break;
-        }
 
     }
   }
