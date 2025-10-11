@@ -235,7 +235,7 @@ def test_h_matches_cpu_reference():
         ).to(torch.uint32)
 
         # --- CPU reference ---
-        Y32_cpu = G_ref.to(torch.int32)                 # H expects int32 Y
+        Y32_cpu = G_ref#.to(torch.int32)                 # H expects int32 Y
         H_ref   = pack_cpu.H(XS_cpu, Y32_cpu, LF_ref, D)
 
         # --- GPU output ---
