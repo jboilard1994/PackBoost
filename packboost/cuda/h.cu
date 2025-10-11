@@ -117,6 +117,7 @@ __global__ void _h_sm(
           }
         }
     }
+    }
   }
   // Write low-depth registers to shared (packed, per warp, per node, per lane)
   const int low_nodes = 7;
