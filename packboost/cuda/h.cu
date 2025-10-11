@@ -69,7 +69,7 @@ __global__ void _h_sm(
       const int jj_lane = base + lane;
       int32_t y_lane = 0;
       uint32_t l32 = 0;
-      if (jj_lane < N  && xfd != 0u) {
+      if (jj_lane < N) {
         y_lane = Y[jj_lane];
         // LF indexed [nfeatsets, N]
         LF_T lval = LF[static_cast<size_t>(feat_set) * static_cast<size_t>(N) + jj_lane];
@@ -81,8 +81,7 @@ __global__ void _h_sm(
                       + static_cast<size_t>(base + lane)];
       for (int k = 0; k < 32; ++k) {
         const int jj_k = base + k;
-        if (xfd == 0u) break;
-        if (jj_k < N) {
+        if (jj_k < N && xfd != 0u) {
           const int v = static_cast<int>(xfd & 1u);
           xfd >>= 1;
           const int32_t yk = __shfl_sync(mask, y_lane, k);
