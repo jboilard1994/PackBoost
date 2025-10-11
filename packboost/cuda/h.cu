@@ -57,6 +57,7 @@ __global__ void _h_sm(
     sh_high[(i * 2 + 0) * 32 + lane] = 0; // sum(y)
     sh_high[(i * 2 + 1) * 32 + lane] = 0; // count
   }
+  __syncthreads();
   const unsigned mask = __ballot_sync(__activemask(), true);
   // Each warp processes 'stride' tiles of 32 columns
   for (int j = 0; j < stride; ++j) {
@@ -133,6 +134,7 @@ __global__ void _h_sm(
   for (int tmp = warps_per_block; tmp > 1; tmp >>= 1) ++log_wpb;
   // Butterfly reduction for low depths
   for (int s = 0; s < log_wpb; ++s) {
+    __syncthreads();
     const int ofs = 1 << s;
     if ((block_warp & ofs) == 0 && (block_warp + ofs) < warps_per_block) {
       for (int ndi = 0; ndi < low_nodes; ++ndi) {
@@ -143,6 +145,7 @@ __global__ void _h_sm(
     }
   }
   // Write reduced low-depth values to global (from warp 0 only, unpacked)
+  __syncthreads();
   if (block_warp == 0) {
     const int low_node_map[7] = {0, 1, 2, 3, 4, 5, 6};
     for (int ndi = 0; ndi < low_nodes; ++ndi) {
