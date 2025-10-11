@@ -81,35 +81,51 @@ __global__ void _h_sm(
                       + static_cast<size_t>(base + lane)];
       for (int k = 0; k < 32; ++k) {
         const int jj_k = base + k;
-        if (jj_k < N && xfd != 0u) {
-          const int v = static_cast<int>(xfd & 1u);
-          xfd >>= 1;
-          const int32_t yk = __shfl_sync(mask, y_lane, k);
-          uint32_t lk = __shfl_sync(mask, l32, k);
-          // d = 0
-          hf0 += static_cast<int64_t>(v) * static_cast<int64_t>(yk);
-          hw0 += v;
-          // d = 1
-          unsigned tk = lk & 1u;
-          if (tk == 0u) { hf10 += v * (int64_t)yk; hw10 += v; }
-          else { hf11 += v * (int64_t)yk; hw11 += v; }
-          lk >>= 1;
-          // d = 2
-          tk = lk & 3u;
-          if (tk == 0u) { hf20 += v * (int64_t)yk; hw20 += v; }
-          else if (tk == 1u) { hf21 += v * (int64_t)yk; hw21 += v; }
-          else if (tk == 2u) { hf22 += v * (int64_t)yk; hw22 += v; }
-          else { hf23 += v * (int64_t)yk; hw23 += v; }
-          lk >>= 2;
-          // d >= 3
-          for (int d = 3; d < max_depth; ++d) {
-            const unsigned to = (1u << d) - 1u;
-            const unsigned tkd = lk & to;
-            lk >>= d;
-            const int idx = static_cast<int>(to + tkd) - 7; // shift after first 7 nodes
-            atomicAdd(&sh_high[(idx * 2 + 0) * 32 + lane], v * yk);
-            atomicAdd(&sh_high[(idx * 2 + 1) * 32 + lane], v);
-          }
+        if (jj_k < N) {
+            const unsigned warp_mask = __activemask();
+
+            // If this tile is partial, exit uniformly when we run past N
+            const bool full_tile = (base + 31) < N;
+            
+            uint32_t xfd_local = xfd;  // per-lane
+            for (int k = 0; k < 32; ++k) {
+              if (!full_tile && (base + k) >= N) break;             // uniform break (safe)
+            
+              // Early exit only if *every* lane is done
+              if (__all_sync(warp_mask, xfd_local == 0u)) break;    // uniform break (safe)
+            
+              // per-lane bit & shift (no divergence around shuffles)
+              const int v = (int)(xfd_local & 1u);
+              xfd_local >>= 1;
+            
+              const int32_t yk = __shfl_sync(warp_mask, y_lane, k);
+              uint32_t      lk = __shfl_sync(warp_mask, l32,    k);
+            
+              // …same updates as before, but they’re effectively masked by v
+              // d=0
+              hf0 += (int64_t)v * (int64_t)yk;
+              hw0 += v;
+              // d=1
+              unsigned tk = lk & 1u; lk >>= 1;
+              if (tk == 0u) { hf10 += (int64_t)v * (int64_t)yk; hw10 += v; }
+              else          { hf11 += (int64_t)v * (int64_t)yk; hw11 += v; }
+              // d=2
+              tk = lk & 3u; lk >>= 2;
+              if      (tk == 0u) { hf20 += (int64_t)v * (int64_t)yk; hw20 += v; }
+              else if (tk == 1u) { hf21 += (int64_t)v * (int64_t)yk; hw21 += v; }
+              else if (tk == 2u) { hf22 += (int64_t)v * (int64_t)yk; hw22 += v; }
+              else               { hf23 += (int64_t)v * (int64_t)yk; hw23 += v; }
+            
+              // d >= 3: same logic; keep the work predicated on v (or skip atomics when v==0)
+              for (int d = 3; d < max_depth; ++d) {
+                const unsigned to  = (1u << d) - 1u;
+                const unsigned tkd = lk & to; lk >>= d;
+                const int idx = (int)(to + tkd) - 7;
+                if (v) {  // optional: guard to avoid useless atomics
+                  atomicAdd(&sh_high[(idx * 2 + 0) * 32 + lane], yk);
+                  atomicAdd(&sh_high[(idx * 2 + 1) * 32 + lane], 1);
+                }
+              }
         }
       }
     }
