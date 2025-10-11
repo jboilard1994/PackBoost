@@ -77,58 +77,55 @@ __global__ void _h_sm(
         l32 = static_cast<uint32_t>(lval);
       }
       // XS row value for this lane (bits consumed across k)
-      uint32_t xfd = XS[static_cast<size_t>(feat_set) * static_cast<size_t>(cols_32M)
-                      + static_cast<size_t>(base + lane)];
-      for (int k = 0; k < 32; ++k) {
-        const int jj_k = base + k;
-        if (jj_k < N) {
-          const unsigned warp_mask = __activemask();
+      // Load this lane's 32-bit tile
+        uint32_t xfd_local = XS[static_cast<size_t>(feat_set) * static_cast<size_t>(cols_32M)
+            + static_cast<size_t>(base + lane)];
 
-            // If this tile is partial, exit uniformly when we run past N
-            const bool full_tile = (base + 31) < N;
+        // Uniform “short tile” check (safe for all lanes)
+        const bool full_tile = (base + 31) < N;
 
-            uint32_t xfd_local = xfd;  // per-lane
-            for (int k = 0; k < 32; ++k) {
-            if (!full_tile && (base + k) >= N) break;             // uniform break (safe)
+        for (int k = 0; k < 32; ++k) {
+        if (!full_tile && (base + k) >= N) break;          // uniform early-exit
 
-            // Early exit only if *every* lane is done
-            if (__all_sync(warp_mask, xfd_local == 0u)) break;    // uniform break (safe)
+        // consume one bit per iter (per-lane)
+        const int v = static_cast<int>(xfd_local & 1u);
+        xfd_local >>= 1;
 
-            // per-lane bit & shift (no divergence around shuffles)
-            const int v = (int)(xfd_local & 1u);
-            xfd_local >>= 1;
+        // all lanes participate in the shuffles each iter
+        const int32_t yk = __shfl_sync(mask, y_lane, k);
+        uint32_t      lk = __shfl_sync(mask, l32,    k);
 
-            const int32_t yk = __shfl_sync(warp_mask, y_lane, k);
-            uint32_t      lk = __shfl_sync(warp_mask, l32,    k);
+        // d = 0
+        hf0 += static_cast<int64_t>(v) * static_cast<int64_t>(yk);
+        hw0 += v;
 
-            // …same updates as before, but they’re effectively masked by v
-            // d=0
-            hf0 += (int64_t)v * (int64_t)yk;
-            hw0 += v;
-            // d=1
-            unsigned tk = lk & 1u; lk >>= 1;
-            if (tk == 0u) { hf10 += (int64_t)v * (int64_t)yk; hw10 += v; }
-            else          { hf11 += (int64_t)v * (int64_t)yk; hw11 += v; }
-            // d=2
-            tk = lk & 3u; lk >>= 2;
-            if      (tk == 0u) { hf20 += (int64_t)v * (int64_t)yk; hw20 += v; }
-            else if (tk == 1u) { hf21 += (int64_t)v * (int64_t)yk; hw21 += v; }
-            else if (tk == 2u) { hf22 += (int64_t)v * (int64_t)yk; hw22 += v; }
-            else               { hf23 += (int64_t)v * (int64_t)yk; hw23 += v; }
+        // d = 1
+        unsigned tk = lk & 1u; lk >>= 1;
+        if (tk == 0u) { hf10 += static_cast<int64_t>(v) * static_cast<int64_t>(yk); hw10 += v; }
+        else          { hf11 += static_cast<int64_t>(v) * static_cast<int64_t>(yk); hw11 += v; }
 
-            // d >= 3: same logic; keep the work predicated on v (or skip atomics when v==0)
-            for (int d = 3; d < max_depth; ++d) {
-                const unsigned to  = (1u << d) - 1u;
-                const unsigned tkd = lk & to; lk >>= d;
-                const int idx = (int)(to + tkd) - 7;
-                if (v) {  // optional: guard to avoid useless atomics
-                atomicAdd(&sh_high[(idx * 2 + 0) * 32 + lane], yk);
-                atomicAdd(&sh_high[(idx * 2 + 1) * 32 + lane], 1);
-                }
-            }
+        // d = 2
+        tk = lk & 3u; lk >>= 2;
+        if      (tk == 0u) { hf20 += static_cast<int64_t>(v) * static_cast<int64_t>(yk); hw20 += v; }
+        else if (tk == 1u) { hf21 += static_cast<int64_t>(v) * static_cast<int64_t>(yk); hw21 += v; }
+        else if (tk == 2u) { hf22 += static_cast<int64_t>(v) * static_cast<int64_t>(yk); hw22 += v; }
+        else               { hf23 += static_cast<int64_t>(v) * static_cast<int64_t>(yk); hw23 += v; }
+
+        // d >= 3  (guard atomics to avoid useless traffic)
+        for (int d = 3; d < max_depth; ++d) {
+        const unsigned to  = (1u << d) - 1u;
+        const unsigned tkd = lk & to; lk >>= d;
+        const int idx = static_cast<int>(to + tkd) - 7;   // shift after first 7 nodes
+        if (v) {
+        atomicAdd(&sh_high[(idx * 2 + 0) * 32 + lane], yk);
+        atomicAdd(&sh_high[(idx * 2 + 1) * 32 + lane], 1);
         }
-      }
-    }
+        }
+
+        // uniform break when all lanes have no remaining 1-bits
+        if (__all_sync(mask, xfd_local == 0u)) break;
+        }
+
   }
   // Write low-depth registers to shared (packed, per warp, per node, per lane)
   const int low_nodes = 7;
