@@ -77,13 +77,13 @@ __global__ void _h_sm(
         l32 = static_cast<uint32_t>(lval);
       }
       // XS row value for this lane (bits consumed across k)
-      // Load this lane's 32-bit tile
-        uint32_t xfd_local = XS[static_cast<size_t>(feat_set) * static_cast<size_t>(cols_32M)
-            + static_cast<size_t>(base + lane)];
+      uint32_t xfd_local = XS[static_cast<size_t>(feat_set) * static_cast<size_t>(cols_32M)
+        + static_cast<size_t>(base + lane)];
 
         // Uniform “short tile” check (safe for all lanes)
         const bool full_tile = (base + 31) < N;
 
+        #pragma unroll
         for (int k = 0; k < 32; ++k) {
         if (!full_tile && (base + k) >= N) break;          // uniform early-exit
 
@@ -126,6 +126,7 @@ __global__ void _h_sm(
         if (__all_sync(mask, xfd_local == 0u)) break;
         }
 
+    }
   }
   // Write low-depth registers to shared (packed, per warp, per node, per lane)
   const int low_nodes = 7;
