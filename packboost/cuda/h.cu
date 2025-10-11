@@ -3,11 +3,6 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
-#define WARP_SIZE 32
-#define FULL_MASK 0xFFFFFFFFu
-
-#define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
-#define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
 // H layout helper: [nfeatsets, nodes, 2, 32]
 static inline __device__ unsigned long long int* Hptr(long long* H, int nodes,
@@ -54,11 +49,11 @@ __global__ void _h_sm(
   }
   __syncthreads();
 
-  const unsigned mask = FULL_MASK;
+  const unsigned mask = 0xFFFFFFFFu;
 
   // Each warp processes 'stride' tiles of 32 columns
   for (int j = 0; j < stride; ++j) {
-    const int base = WARP_SIZE * (stride * gwarp + j); // column start
+    const int base = 32 * (stride * gwarp + j); // column start
     if (base < cols_32M) {
       // Load lane’s locals
       const int jj_lane = base + lane;
@@ -78,7 +73,7 @@ __global__ void _h_sm(
                       + static_cast<size_t>(base + lane)];
 
       #pragma unroll
-      for (int k = 0; k < WARP_SIZE; ++k) {
+      for (int k = 0; k < 32; ++k) {
         const int jj_k = base + k;
         if (jj_k < N) {
           const int v = static_cast<int>(xfd & 1u);
@@ -180,7 +175,7 @@ static inline void infer_grid_stride(
   if (blocks_per_feat < 1) blocks_per_feat = 1;
 
   const int total_warps = blocks_per_feat * warps_per_block;
-  int stride = ceil_div_int(cols_32M, total_warps * WARP_SIZE);
+  int stride = ceil_div_int(cols_32M, total_warps * 32);
   if (stride < 1) stride = 1;
 
   blocks_per_feat_out = blocks_per_feat;
@@ -198,15 +193,7 @@ torch::Tensor h_sm(
     torch::Tensor LF,
     int max_depth)
 {
-  // Basic checks
-  CHECK_CUDA(XS); CHECK_CUDA(Y); CHECK_CUDA(LF);
-  CHECK_CONTIGUOUS(XS); CHECK_CONTIGUOUS(Y); CHECK_CONTIGUOUS(LF);
-  TORCH_CHECK(XS.dim()==2 && XS.size(1)%32==0, "XS must be [nfeatsets, 32*M]");
-  TORCH_CHECK(Y.dim()==1, "Y must be [N]");
-  TORCH_CHECK(LF.dim()==2, "LF must be [nfeatsets, N]");
-  TORCH_CHECK(LF.size(0)==XS.size(0) && LF.size(1)==Y.size(0),
-              "LF shape must be [XS.size(0), Y.size(0)]");
-  TORCH_CHECK(max_depth>=1 && max_depth<=7, "max_depth must be in [1,7] for this variant");
+
 
   const int nfeatsets = static_cast<int>(XS.size(0));
   const int cols_32M  = static_cast<int>(XS.size(1));
@@ -223,7 +210,7 @@ torch::Tensor h_sm(
   infer_grid_stride(nfeatsets, cols_32M, warps_per_block, blocks_per_feat, stride);
 
   dim3 grid(nfeatsets, blocks_per_feat, 1);
-  dim3 block(warps_per_block * WARP_SIZE, 1, 1);
+  dim3 block(warps_per_block * 32, 1, 1);
 
   // Dynamic shared memory for (2^D - 8, 2, 32) ints
   const int n_ge3 = std::max((1 << max_depth) - 8, 1);
