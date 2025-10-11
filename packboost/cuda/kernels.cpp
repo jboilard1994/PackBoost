@@ -62,6 +62,12 @@ torch::Tensor h_sm(
     torch::Tensor LF,
     int max_depth);
 
+torch::Tensor h_sm_hierarchical(
+    torch::Tensor XS,
+    torch::Tensor Y,
+    torch::Tensor LF,
+    int max_depth);
+
 namespace {
 
 torch::Tensor encode_cuts_binding(torch::Tensor X) {
@@ -123,5 +129,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Repack trees for features (Murky parity, CUDA)");
 
     m.def("h_sm", &h_sm, "PackBoost H (unweighted histogram, Murky parity; returns H)");
+    m.def("h_sm_hierarchical", &h_sm_hierarchical, "PackBoost H (unweighted histogram, Murky parity; returns H)");
 
 }
