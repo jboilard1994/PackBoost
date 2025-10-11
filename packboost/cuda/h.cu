@@ -13,6 +13,14 @@ __device__ __forceinline__ unsigned long long pack_sc(int sum32, int cnt32) {
     return ( (unsigned long long)(unsigned int)cnt32 << 32 ) |
              (unsigned long long)(unsigned int)sum32;
   }
+// add two packed values
+static __device__ __forceinline__ unsigned long long add_pack(unsigned long long a, unsigned long long b) {
+    int sa = (int)(unsigned int)a;
+    int ca = (int)(unsigned int)(a >> 32);
+    int sb = (int)(unsigned int)b;
+    int cb = (int)(unsigned int)(b >> 32);
+    return pack_sc(sa + sb, ca + cb);
+  }
  
 // ---------------- Kernel (templated on LF dtype) ----------------
 template <typename LF_T>
@@ -42,8 +50,8 @@ __global__ void _h_sm(
   int n_ge3 = (1 << max_depth) - 8;
   if (n_ge3 < 1) n_ge3 = 1;
   extern __shared__ int shmem[];
-  int* sh_high = shmem; // First part for high depths
-  int64_t* sh_low = (int64_t*)(shmem + n_ge3 * 2 * 32); // Second part for low depths
+  int* sh_high = shmem;
+  unsigned long long* sh_low = (unsigned long long*)(shmem + n_ge3 * 2 * 32);
   // Zero this lane’s column for both channels in high
   for (int i = 0; i < n_ge3; ++i) {
     sh_high[(i * 2 + 0) * 32 + lane] = 0; // sum(y)
@@ -104,60 +112,48 @@ __global__ void _h_sm(
       }
     }
   }
-  // Write low-depth registers to shared (per warp, per node, per chan, per lane)
-  __syncthreads(); // Ensure high is done before using sh_low (though separate)
+  // Write low-depth registers to shared (packed, per warp, per node, per lane)
   const int low_nodes = 7;
-  const int sh_low_stride = low_nodes * 2 * 32;
   int nd = 0;
-  sh_low[(block_warp * low_nodes + nd) * 2 * 32 + 0 * 32 + lane] = hf0;
-  sh_low[(block_warp * low_nodes + nd) * 2 * 32 + 1 * 32 + lane] = hw0;
+  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf0), static_cast<int>(hw0));
   nd = 1;
-  sh_low[(block_warp * low_nodes + nd) * 2 * 32 + 0 * 32 + lane] = hf10;
-  sh_low[(block_warp * low_nodes + nd) * 2 * 32 + 1 * 32 + lane] = hw10;
+  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf10), static_cast<int>(hw10));
   nd = 2;
-  sh_low[(block_warp * low_nodes + nd) * 2 * 32 + 0 * 32 + lane] = hf11;
-  sh_low[(block_warp * low_nodes + nd) * 2 * 32 + 1 * 32 + lane] = hw11;
+  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf11), static_cast<int>(hw11));
   nd = 3;
-  sh_low[(block_warp * low_nodes + nd) * 2 * 32 + 0 * 32 + lane] = hf20;
-  sh_low[(block_warp * low_nodes + nd) * 2 * 32 + 1 * 32 + lane] = hw20;
+  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf20), static_cast<int>(hw20));
   nd = 4;
-  sh_low[(block_warp * low_nodes + nd) * 2 * 32 + 0 * 32 + lane] = hf21;
-  sh_low[(block_warp * low_nodes + nd) * 2 * 32 + 1 * 32 + lane] = hw21;
+  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf21), static_cast<int>(hw21));
   nd = 5;
-  sh_low[(block_warp * low_nodes + nd) * 2 * 32 + 0 * 32 + lane] = hf22;
-  sh_low[(block_warp * low_nodes + nd) * 2 * 32 + 1 * 32 + lane] = hw22;
+  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf22), static_cast<int>(hw22));
   nd = 6;
-  sh_low[(block_warp * low_nodes + nd) * 2 * 32 + 0 * 32 + lane] = hf23;
-  sh_low[(block_warp * low_nodes + nd) * 2 * 32 + 1 * 32 + lane] = hw23;
-  // Butterfly reduction for low depths
+  sh_low[(block_warp * low_nodes + nd) * 32 + lane] = pack_sc(static_cast<int>(hf23), static_cast<int>(hw23));
+  // Compute log_wpb (assuming warps_per_block is power of 2)
   int log_wpb = 0;
-  int tmp = warps_per_block;
-  while (tmp > 1) {
-    log_wpb++;
-    tmp >>= 1;
-  }
+  for (int tmp = warps_per_block; tmp > 1; tmp >>= 1) ++log_wpb;
+  // Butterfly reduction for low depths
   for (int s = 0; s < log_wpb; ++s) {
     __syncthreads();
-    int ofs = 1 << s;
-    if ((block_warp & ofs) == 0) {
+    const int ofs = 1 << s;
+    if ((block_warp & ofs) == 0 && (block_warp + ofs) < warps_per_block) {
       for (int ndi = 0; ndi < low_nodes; ++ndi) {
-        for (int ch = 0; ch < 2; ++ch) {
-          int idx = (block_warp * low_nodes + ndi) * 2 * 32 + ch * 32 + lane;
-          int idx_p = ((block_warp + ofs) * low_nodes + ndi) * 2 * 32 + ch * 32 + lane;
-          sh_low[idx] += sh_low[idx_p];
-        }
+        const int idx = (block_warp * low_nodes + ndi) * 32 + lane;
+        const int idx_p = ((block_warp + ofs) * low_nodes + ndi) * 32 + lane;
+        sh_low[idx] = add_pack(sh_low[idx], sh_low[idx_p]);
       }
     }
   }
-  // Write reduced low-depth values to global (from warp 0 only)
+  // Write reduced low-depth values to global (from warp 0 only, unpacked)
   __syncthreads();
   if (block_warp == 0) {
     const int low_node_map[7] = {0, 1, 2, 3, 4, 5, 6};
     for (int ndi = 0; ndi < low_nodes; ++ndi) {
-      for (int ch = 0; ch < 2; ++ch) {
-        int idx = (0 * low_nodes + ndi) * 2 * 32 + ch * 32 + lane;
-        atomicAdd(Hptr(H, nodes_total, feat_set, low_node_map[ndi], ch, lane), (unsigned long long int)sh_low[idx]);
-      }
+      const unsigned long long pack = sh_low[(0 * low_nodes + ndi) * 32 + lane];
+      const int64_t fsum = static_cast<int64_t>(static_cast<int32_t>(static_cast<uint32_t>(pack)));
+      const int64_t csum = static_cast<int64_t>(static_cast<uint32_t>(pack >> 32));
+      const int node = low_node_map[ndi];
+      atomicAdd(Hptr(H, nodes_total, feat_set, node, 0, lane), static_cast<unsigned long long>(fsum));
+      atomicAdd(Hptr(H, nodes_total, feat_set, node, 1, lane), static_cast<unsigned long long>(csum));
     }
   }
   __syncthreads();
@@ -229,8 +225,8 @@ torch::Tensor h_sm(
   // Dynamic shared memory for high depths: (2^D - 8, 2, 32) ints
   int n_ge3 = std::max((1 << max_depth) - 8, 1);
   size_t smem_high = static_cast<size_t>(n_ge3) * 2 * 32 * sizeof(int);
-  // Additional for low depths: (warps_per_block, 7, 2, 32) int64
-  size_t smem_low = static_cast<size_t>(warps_per_block) * 7 * 2 * 32 * sizeof(int64_t);
+  // Additional for low depths: (warps_per_block, 7, 32) unsigned long long (packed)
+  size_t smem_low = static_cast<size_t>(warps_per_block) * 7 * 32 * sizeof(unsigned long long);
   size_t smem_bytes = smem_high + smem_low;
   auto* prop = at::cuda::getCurrentDeviceProperties();
   size_t smem_cap = prop->sharedMemPerBlockOptin ? (size_t)prop->sharedMemPerBlockOptin
