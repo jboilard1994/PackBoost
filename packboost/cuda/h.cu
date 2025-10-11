@@ -17,7 +17,7 @@ __global__ void _h_sm(
     const uint32_t* __restrict__ XS,  // [nfeatsets, 32*M]
     const int32_t*  __restrict__ Y,   // [N]
     const LF_T*     __restrict__ LF,  // [nfeatsets, N] (u16/u32/u64)
-    int64_t*      __restrict__ H,   // [nfeatsets, nodes, 2, 32] (int64)
+    long long*      __restrict__ H,   // [nfeatsets, nodes, 2, 32] (int64)
     int nfeatsets,
     int cols_32M,     // XS.shape[1] == 32*M
     int N,            // Y.shape[0]
@@ -247,7 +247,7 @@ torch::Tensor h_sm(
       XS_ptr,
       Y.data_ptr<int32_t>(),
       LF.data_ptr<uint16_t>(),
-      H.data_ptr<int64_t>(),
+      H.data_ptr<long long>(),
       nfeatsets, cols_32M, N, max_depth,
       warps_per_block, stride, nodes_tot
     );
@@ -259,7 +259,7 @@ torch::Tensor h_sm(
       XS_ptr,
       Y.data_ptr<int32_t>(),
       LF.data_ptr<uint32_t>(),
-      H.data_ptr<int64_t>(),
+      H.data_ptr<long long>(),
       nfeatsets, cols_32M, N, max_depth,
       warps_per_block, stride, nodes_tot
     );
@@ -270,8 +270,8 @@ torch::Tensor h_sm(
     _h_sm<uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
       XS_ptr,
       Y.data_ptr<int32_t>(),
-      LF.data_ptr<uint64_t>(),
-      H.data_ptr<int64_t>(),
+      static_cast<uint64_t*>(LF.data_ptr()),
+      H.data_ptr<long long>(),
       nfeatsets, cols_32M, N, max_depth,
       warps_per_block, stride, nodes_tot
     );
