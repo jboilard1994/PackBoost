@@ -62,7 +62,7 @@ torch::Tensor h_sm(
     torch::Tensor LF,
     int max_depth);
 
-torch::Tensor h_sm_pack_sc(
+torch::Tensor h_sm_butterfly_reduce(
     torch::Tensor XS,
     torch::Tensor Y,
     torch::Tensor LF,
@@ -129,6 +129,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Repack trees for features (Murky parity, CUDA)");
 
     m.def("h_sm", &h_sm, "PackBoost H (unweighted histogram, Murky parity; returns H)");
-    m.def("h_sm_pack_sc", &h_sm_pack_sc, "PackBoost H (unweighted histogram, Murky parity; returns H)");
+    m.def("h_sm_butterfly_reduce", &h_sm_butterfly_reduce, "PackBoost H (unweighted histogram, Murky parity; returns H)");
 
 }

@@ -288,150 +288,159 @@ torch::Tensor h_sm(
   return H;
 }
 
+// ---------------- Helpers ----------------
 
-// ======================= kernel =======================
-#define WARP_SIZE 32
-#define FULL_MASK 0xFFFFFFFFu
+// NEW: Warp-level reduction for int64_t using a butterfly-like pattern
+__device__ __forceinline__ int64_t warp_reduce_sum_i64(int64_t val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+    }
+    return val;
+}
+
+// NEW: H layout helper for the reduced tensor: [nfeatsets, nodes, 2]
+static inline __device__ unsigned long long int* Hptr_reduced(
+    int64_t* H, int nodes, int feat, int node, int chan
+) {
+  size_t idx = (static_cast<size_t>(feat) * nodes + node) * 2 + chan;
+  return reinterpret_cast<unsigned long long int*>(H + idx);
+}
+
 
 // ---------------- Kernel (templated on LF dtype) ----------------
 template <typename LF_T>
-__global__ void _h_sm_pack_sc(
+__global__ void _h_sm_butterfly_reduce(
     const uint32_t* __restrict__ XS,  // [nfeatsets, 32*M]
-    const int32_t*  __restrict__ Y,   // [N]
-    const LF_T*     __restrict__ LF,  // [nfeatsets, N] (u16/u32/u64)
-    int64_t*        __restrict__ H,   // [nfeatsets, nodes, 2, 32] (int64)
+    const int32_t* __restrict__ Y,   // [N]
+    const LF_T* __restrict__ LF,  // [nfeatsets, N] (u16/u32/u64)
+    int64_t* __restrict__ H,   // [nfeatsets, nodes, 2] (int64)
     int nfeatsets,
-    int cols_32M,     // XS.shape[1] == 32*M
-    int N,            // Y.shape[0]
+    int cols_32M,
+    int N,
     int max_depth,
     int warps_per_block,
-    int stride,       // tiles per warp along columns
-    int nodes_total   // (1<<max_depth)-1
+    int stride,
+    int nodes_total
 ){
   const int feat_set   = blockIdx.x;
-  const int block_warp = threadIdx.x >> 5;    // 0..(warps_per_block-1)
-  const int lane       = threadIdx.x & 31;    // 0..31
+  const int block_warp = threadIdx.x >> 5;
+  const int lane       = threadIdx.x & 31;
   const int gwarp      = warps_per_block * blockIdx.y + block_warp;
 
+  // --- Main computation loop (Unchanged) ---
   // Registers for depths 0..2
   int64_t hf0=0,  hw0=0;
   int64_t hf10=0, hf11=0, hw10=0, hw11=0;
   int64_t hf20=0, hf21=0, hf22=0, hf23=0;
   int64_t hw20=0, hw21=0, hw22=0, hw23=0;
 
-  // Shared histogram for depths >=3 : shape [(2^D - 8), packed(uint64), 32]
   int n_ge3 = (1 << max_depth) - 8;
   if (n_ge3 < 1) n_ge3 = 1;
 
-  extern __shared__ unsigned long long sh_packed[]; // packed (sum,count)
-  // Zero this lane’s column
+  extern __shared__ int shmem[];
   for (int i = 0; i < n_ge3; ++i) {
-    sh_packed[i * 32 + lane] = 0ull;
+    shmem[(i * 2 + 0) * 32 + lane] = 0;
+    shmem[(i * 2 + 1) * 32 + lane] = 0;
   }
   __syncthreads();
 
   const unsigned mask = __ballot_sync(__activemask(), true);
 
-  // Each warp processes 'stride' tiles of 32 columns
   for (int j = 0; j < stride; ++j) {
-    const int base = 32 * (stride * gwarp + j); // column start
+    const int base = 32 * (stride * gwarp + j);
     if (base < cols_32M) {
-      // Load lane’s locals
       const int jj_lane = base + lane;
-
-      int32_t  y_lane = 0;
-      uint32_t l32    = 0;
+      int32_t y_lane = 0;
+      uint32_t l32 = 0;
       if (jj_lane < N) {
         y_lane = Y[jj_lane];
-        // LF indexed [nfeatsets, N]
-        LF_T lval = LF[static_cast<size_t>(feat_set) * static_cast<size_t>(N) + jj_lane];
-        // Cast to 32-bit for warp shuffle (max_depth<=7 => safe)
+        LF_T lval = LF[static_cast<size_t>(feat_set) * N + jj_lane];
         l32 = static_cast<uint32_t>(lval);
       }
-
-      // XS row value for this lane (bits consumed across k)
-      uint32_t xfd = XS[static_cast<size_t>(feat_set) * static_cast<size_t>(cols_32M)
-                      + static_cast<size_t>(base + lane)];
-
+      uint32_t xfd = XS[static_cast<size_t>(feat_set) * cols_32M + base + lane];
       for (int k = 0; k < 32; ++k) {
-        const int jj_k = base + k;
-        if (jj_k < N) {
+        if (base + k < N) {
           const int v = static_cast<int>(xfd & 1u);
           xfd >>= 1;
-
-          const int32_t  yk = __shfl_sync(mask, y_lane, k);
-          uint32_t       lk = __shfl_sync(mask, l32,    k);
-
-          // d = 0
-          hf0 += static_cast<int64_t>(v) * static_cast<int64_t>(yk);
-          hw0 += v;
-
-          // d = 1
+          const int32_t yk = __shfl_sync(mask, y_lane, k);
+          uint32_t lk = __shfl_sync(mask, l32, k);
+          hf0 += v * (int64_t)yk; hw0 += v;
           unsigned tk = lk & 1u;
-          if (tk == 0u) { hf10 += v * (int64_t)yk; hw10 += v; }
-          else          { hf11 += v * (int64_t)yk; hw11 += v; }
+          if (tk == 0u) { hf10 += v * (int64_t)yk; hw10 += v; } else { hf11 += v * (int64_t)yk; hw11 += v; }
           lk >>= 1;
-
-          // d = 2
           tk = lk & 3u;
-          if      (tk == 0u) { hf20 += v * (int64_t)yk; hw20 += v; }
-          else if (tk == 1u) { hf21 += v * (int64_t)yk; hw21 += v; }
-          else if (tk == 2u) { hf22 += v * (int64_t)yk; hw22 += v; }
-          else               { hf23 += v * (int64_t)yk; hw23 += v; }
+          if (tk == 0u) { hf20 += v * (int64_t)yk; hw20 += v; } else if (tk == 1u) { hf21 += v * (int64_t)yk; hw21 += v; } else if (tk == 2u) { hf22 += v * (int64_t)yk; hw22 += v; } else { hf23 += v * (int64_t)yk; hw23 += v; }
           lk >>= 2;
-
-          // d >= 3  (single packed atomic in shared)
           for (int d = 3; d < max_depth; ++d) {
-            const unsigned to  = (1u << d) - 1u;
+            const unsigned to = (1u << d) - 1u;
             const unsigned tkd = lk & to;
             lk >>= d;
-            const int idx = static_cast<int>(to + tkd) - 7; // shift after first 7 nodes
-            atomicAdd(&sh_packed[idx * 32 + lane], pack_sc(v * yk, v));
+            const int idx = static_cast<int>(to + tkd) - 7;
+            atomicAdd(&shmem[(idx * 2 + 0) * 32 + lane], v * yk);
+            atomicAdd(&shmem[(idx * 2 + 1) * 32 + lane], v);
           }
         }
       }
     }
   }
 
-  // Write back depths 0..2 (per lane)
-  atomicAdd(Hptr(H, nodes_total, feat_set, 0, 0, lane), (unsigned long long int)hf0);
-  atomicAdd(Hptr(H, nodes_total, feat_set, 0, 1, lane), (unsigned long long int)hw0);
+  // --- OPTIMIZED WRITEBACK ---
 
-  atomicAdd(Hptr(H, nodes_total, feat_set, 1, 0, lane), (unsigned long long int)hf10);
-  atomicAdd(Hptr(H, nodes_total, feat_set, 2, 0, lane), (unsigned long long int)hf11);
-  atomicAdd(Hptr(H, nodes_total, feat_set, 1, 1, lane), (unsigned long long int)hw10);
-  atomicAdd(Hptr(H, nodes_total, feat_set, 2, 1, lane), (unsigned long long int)hw11);
+  // 1. Reduce register values for depths 0-2 across the warp
+  hf0 = warp_reduce_sum_i64(hf0); hw0 = warp_reduce_sum_i64(hw0);
+  hf10 = warp_reduce_sum_i64(hf10); hw10 = warp_reduce_sum_i64(hw10);
+  hf11 = warp_reduce_sum_i64(hf11); hw11 = warp_reduce_sum_i64(hw11);
+  hf20 = warp_reduce_sum_i64(hf20); hw20 = warp_reduce_sum_i64(hw20);
+  hf21 = warp_reduce_sum_i64(hf21); hw21 = warp_reduce_sum_i64(hw21);
+  hf22 = warp_reduce_sum_i64(hf22); hw22 = warp_reduce_sum_i64(hw22);
+  hf23 = warp_reduce_sum_i64(hf23); hw23 = warp_reduce_sum_i64(hw23);
 
-  atomicAdd(Hptr(H, nodes_total, feat_set, 3, 0, lane), (unsigned long long int)hf20);
-  atomicAdd(Hptr(H, nodes_total, feat_set, 4, 0, lane), (unsigned long long int)hf21);
-  atomicAdd(Hptr(H, nodes_total, feat_set, 5, 0, lane), (unsigned long long int)hf22);
-  atomicAdd(Hptr(H, nodes_total, feat_set, 6, 0, lane), (unsigned long long int)hf23);
-  atomicAdd(Hptr(H, nodes_total, feat_set, 3, 1, lane), (unsigned long long int)hw20);
-  atomicAdd(Hptr(H, nodes_total, feat_set, 4, 1, lane), (unsigned long long int)hw21);
-  atomicAdd(Hptr(H, nodes_total, feat_set, 5, 1, lane), (unsigned long long int)hw22);
-  atomicAdd(Hptr(H, nodes_total, feat_set, 6, 1, lane), (unsigned long long int)hw23);
+  // 2. Only lane 0 writes the warp's total to global memory
+  if (lane == 0) {
+    atomicAdd(Hptr_reduced(H, nodes_total, feat_set, 0, 0), hf0);
+    atomicAdd(Hptr_reduced(H, nodes_total, feat_set, 0, 1), hw0);
+    atomicAdd(Hptr_reduced(H, nodes_total, feat_set, 1, 0), hf10);
+    atomicAdd(Hptr_reduced(H, nodes_total, feat_set, 2, 0), hf11);
+    atomicAdd(Hptr_reduced(H, nodes_total, feat_set, 1, 1), hw10);
+    atomicAdd(Hptr_reduced(H, nodes_total, feat_set, 2, 1), hw11);
+    atomicAdd(Hptr_reduced(H, nodes_total, feat_set, 3, 0), hf20);
+    atomicAdd(Hptr_reduced(H, nodes_total, feat_set, 4, 0), hf21);
+    atomicAdd(Hptr_reduced(H, nodes_total, feat_set, 5, 0), hf22);
+    atomicAdd(Hptr_reduced(H, nodes_total, feat_set, 6, 0), hf23);
+    atomicAdd(Hptr_reduced(H, nodes_total, feat_set, 3, 1), hw20);
+    atomicAdd(Hptr_reduced(H, nodes_total, feat_set, 4, 1), hw21);
+    atomicAdd(Hptr_reduced(H, nodes_total, feat_set, 5, 1), hw22);
+    atomicAdd(Hptr_reduced(H, nodes_total, feat_set, 6, 1), hw23);
+  }
 
   __syncthreads();
 
-  // Drain shared histogram (d >= 3)
+  // 3. Drain and reduce shared histogram (d >= 3)
   const int rows_per_warp = (n_ge3 + warps_per_block - 1) / warps_per_block;
   for (int k = 0; k < rows_per_warp; ++k) {
     const int node = 7 + rows_per_warp * block_warp + k;
     if (node < nodes_total) {
-      const unsigned long long pc = sh_packed[(node - 7) * 32 + lane];
-      const int fsum = (int)(pc & 0xFFFFFFFFu);   // signed sum
-      const int csum = (int)(pc >> 32);          // count
+      const int base = ((node - 7) * 2) * 32 + lane;
+      int64_t fsum = static_cast<int64_t>(shmem[base + 0]);
+      int64_t csum = static_cast<int64_t>(shmem[base + 32]);
 
-      if (fsum) atomicAdd(Hptr(H, nodes_total, feat_set, node, 0, lane),
-                          (unsigned long long int)(long long)fsum);
-      if (csum) atomicAdd(Hptr(H, nodes_total, feat_set, node, 1, lane),
-                          (unsigned long long int)(long long)csum);
+      // Reduce values across the warp
+      fsum = warp_reduce_sum_i64(fsum);
+      csum = warp_reduce_sum_i64(csum);
+
+      // Lane 0 writes the final result
+      if (lane == 0) {
+        atomicAdd(Hptr_reduced(H, nodes_total, feat_set, node, 0), fsum);
+        atomicAdd(Hptr_reduced(H, nodes_total, feat_set, node, 1), csum);
+      }
     }
   }
 }
 
 
-torch::Tensor h_sm_pack_sc(
+// API: returns H tensor
+torch::Tensor h_sm_butterfly_reduce(
     torch::Tensor XS,
     torch::Tensor Y,
     torch::Tensor LF,
@@ -442,9 +451,11 @@ torch::Tensor h_sm_pack_sc(
   const int N         = static_cast<int>(Y.size(0));
   const int nodes_tot = (1 << max_depth) - 1;
 
-  auto H = torch::zeros({nfeatsets, nodes_tot, 2, 32},
-                        XS.options().dtype(torch::kLong).memory_format(c10::MemoryFormat::Contiguous));
+  // MODIFIED: Output H shape is now [nfeatsets, nodes, 2]
+  auto opts = XS.options().dtype(torch::kLong).memory_format(c10::MemoryFormat::Contiguous);
+  auto H    = torch::zeros({(int64_t)nfeatsets, (int64_t)nodes_tot, 2}, opts);
 
+  // Infer launch params (same as before)
   const int warps_per_block = infer_hist_warps_per_block(max_depth);
   int blocks_per_feat = 0, stride = 0;
   infer_grid_stride(nfeatsets, cols_32M, warps_per_block, blocks_per_feat, stride);
@@ -452,42 +463,46 @@ torch::Tensor h_sm_pack_sc(
   dim3 grid(nfeatsets, blocks_per_feat, 1);
   dim3 block(warps_per_block * 32, 1, 1);
 
-  // Dynamic shared memory (PACKED): (2^D - 8) * 32 * sizeof(uint64_t)
+  // Dynamic shared memory (same as before)
   const int n_ge3 = std::max((1 << max_depth) - 8, 1);
-  const size_t smem_bytes = static_cast<size_t>(n_ge3) * 32 * sizeof(unsigned long long);
-
+  const size_t smem_bytes = static_cast<size_t>(n_ge3) * 2 * 32 * sizeof(int);
   auto* prop = at::cuda::getCurrentDeviceProperties();
   size_t smem_cap = prop->sharedMemPerBlockOptin ? (size_t)prop->sharedMemPerBlockOptin
                                                  : (size_t)prop->sharedMemPerBlock;
-  TORCH_CHECK(smem_bytes <= smem_cap,
-              "Required dynamic shared memory (", smem_bytes,
-              ") exceeds device limit (", smem_cap, ")");
+  TORCH_CHECK(smem_bytes <= smem_cap, "Required dynamic shared memory exceeds device limit.");
 
   auto stream = at::cuda::getCurrentCUDAStream();
-
-  TORCH_CHECK(Y.scalar_type() == torch::kInt32, "Y must be int32.");
-  TORCH_CHECK(XS.scalar_type() == torch::kUInt32 || XS.scalar_type() == torch::kInt32,
-              "XS must be uint32/int32.");
+  
+  // Data checks (same as before)
+  TORCH_CHECK(Y.scalar_type() == torch::kInt32, "Y must be int32");
+  TORCH_CHECK(
+    XS.scalar_type() == torch::kUInt32 || XS.scalar_type() == torch::kInt32,
+    "XS must be uint32/int32"
+  );
   const uint32_t* XS_ptr = reinterpret_cast<const uint32_t*>(XS.data_ptr());
-
   const auto lf_dt = LF.scalar_type();
+
+  // Dispatch LF dtype to the NEW kernel
   if (lf_dt == torch::kUInt16) {
-    cudaFuncSetAttribute(_h_sm_pack_sc<uint16_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
-    _h_sm_pack_sc<uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
+    cudaFuncSetAttribute(_h_sm_butterfly_reduce<uint16_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
+    _h_sm_butterfly_reduce<uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
       XS_ptr, Y.data_ptr<int32_t>(), LF.data_ptr<uint16_t>(), H.data_ptr<int64_t>(),
-      nfeatsets, cols_32M, N, max_depth, warps_per_block, stride, nodes_tot);
+      nfeatsets, cols_32M, N, max_depth, warps_per_block, stride, nodes_tot
+    );
   } else if (lf_dt == torch::kUInt32) {
-    cudaFuncSetAttribute(_h_sm_pack_sc<uint32_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
-    _h_sm_pack_sc<uint32_t><<<grid, block, smem_bytes, stream.stream()>>>(
+    cudaFuncSetAttribute(_h_sm_butterfly_reduce<uint32_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
+    _h_sm_butterfly_reduce<uint32_t><<<grid, block, smem_bytes, stream.stream()>>>(
       XS_ptr, Y.data_ptr<int32_t>(), LF.data_ptr<uint32_t>(), H.data_ptr<int64_t>(),
-      nfeatsets, cols_32M, N, max_depth, warps_per_block, stride, nodes_tot);
+      nfeatsets, cols_32M, N, max_depth, warps_per_block, stride, nodes_tot
+    );
   } else if (lf_dt == torch::kUInt64) {
-    cudaFuncSetAttribute(_h_sm_pack_sc<uint64_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
-    _h_sm_pack_sc<uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
-      XS_ptr, Y.data_ptr<int32_t>(), (uint64_t*)LF.data_ptr(), H.data_ptr<int64_t>(),
-      nfeatsets, cols_32M, N, max_depth, warps_per_block, stride, nodes_tot);
+    cudaFuncSetAttribute(_h_sm_butterfly_reduce<uint64_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
+    _h_sm_butterfly_reduce<uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
+      XS_ptr, Y.data_ptr<int32_t>(), static_cast<uint64_t*>(LF.data_ptr()), H.data_ptr<int64_t>(),
+      nfeatsets, cols_32M, N, max_depth, warps_per_block, stride, nodes_tot
+    );
   } else {
-    TORCH_CHECK(false, "LF must be one of: uint16, uint32, uint64 (got ", lf_dt, ")");
+    TORCH_CHECK(false, "Unsupported LF dtype");
   }
 
   return H;
