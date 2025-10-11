@@ -414,18 +414,11 @@ torch::Tensor h_two_pass(
     torch::Tensor LF,   // [F, N], (u)int16/32/64
     int max_depth       // supports 1..9 (SMEM bound)
 ){
-    TORCH_CHECK(XS.is_cuda() && Y.is_cuda() && LF.is_cuda(), "XS, Y, LF must be CUDA.");
-    TORCH_CHECK(XS.dim()==2 && Y.dim()==1 && LF.dim()==2, "XS[F,32*M], Y[N], LF[F,N].");
-    TORCH_CHECK((XS.scalar_type()==c10::ScalarType::UInt || XS.scalar_type()==c10::ScalarType::Int),
-                "XS must be uint32/int32.");
-    TORCH_CHECK(Y.scalar_type()==c10::ScalarType::Int, "Y must be int32.");
-    TORCH_CHECK(max_depth>=1 && max_depth<=9, "This path supports max_depth ≤ 9.");
-
+    
     const int64_t F64    = XS.size(0);
     const int64_t cols64 = XS.size(1);
     const int64_t N64    = Y.size(0);
-    TORCH_CHECK(cols64 % 32 == 0, "XS second dim must be divisible by 32.");
-    TORCH_CHECK(F64<=INT_MAX && cols64<=INT_MAX && N64<=INT_MAX, "shape too large");
+    
 
     const int F        = (int)F64;
     const int cols_32M = (int)cols64;
