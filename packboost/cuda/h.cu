@@ -340,7 +340,6 @@ __global__ void _h_partials(
 
         const unsigned full = __activemask();
 
-        #pragma unroll
         for (int k = 0; k < 32; ++k) {
             const int jj_k = base + k;
             const unsigned mask_k = __ballot_sync(full, jj_k < N);
