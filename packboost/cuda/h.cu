@@ -477,19 +477,19 @@ torch::Tensor h_two_pass(
     const auto dt = LF.scalar_type();
 
     // ---------------- Kernel A launch ----------------
-    if (dt == c10::ScalarType::UInt16) {
+    if (dt == torch::kUInt16) {
         cudaFuncSetAttribute(_h_partials<uint16_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smemA);
         _h_partials<uint16_t><<<gridA, blockA, smemA, stream.stream()>>>(
             XS_u32, Y.data_ptr<int32_t>(), LF.data_ptr<uint16_t>(),
             SCR.data_ptr<int64_t>(), F, cols_32M, N, D,
             warps_per_block, stride_per_warp, nodes_tot, B);
-    } else if (dt == c10::ScalarType::UInt32) {
+    } else if (dt == torch::kUInt32) {
         cudaFuncSetAttribute(_h_partials<uint32_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smemA);
         _h_partials<uint32_t><<<gridA, blockA, smemA, stream.stream()>>>(
             XS_u32, Y.data_ptr<int32_t>(), LF.data_ptr<uint32_t>(),
             SCR.data_ptr<int64_t>(), F, cols_32M, N, D,
             warps_per_block, stride_per_warp, nodes_tot, B);
-    } else if (dt == c10::ScalarType::UInt64) {
+    } else if (dt == torch::kUInt64) {
         cudaFuncSetAttribute(_h_partials<uint64_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smemA);
         _h_partials<uint64_t><<<gridA, blockA, smemA, stream.stream()>>>(
             XS_u32, Y.data_ptr<int32_t>(), LF.data_ptr<uint64_t>(),
