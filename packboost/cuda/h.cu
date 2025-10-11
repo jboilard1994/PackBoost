@@ -281,3 +281,300 @@ torch::Tensor h_sm(
 
   return H;
 }
+
+__device__ __forceinline__ int idx_s02(int warp, int node, int ch, int lane) {
+  // [warps, 7 nodes, 2 chans, 32 lanes]
+  return (((warp * 7 + node) * 2 + ch) * 32 + lane);
+}
+
+__device__ __forceinline__ int idx_sGE3(int warp, int row, int ch, int lane, int rows_ge3) {
+  // [warps, rows_ge3, 2 chans, 32 lanes]
+  return (((warp * rows_ge3 + row) * 2 + ch) * 32 + lane);
+}
+
+// ---------------- Kernel ----------------
+template <typename LF_T>
+__global__ void _h_multiwarp_generic(
+    const uint32_t* __restrict__ XS,  // [nfeatsets, 32*M]
+    const int32_t*  __restrict__ Y,   // [N]
+    const LF_T*     __restrict__ LF,  // [nfeatsets, N] (u16/u32/u64)
+    int64_t*        __restrict__ H,   // [nfeatsets, nodes, 2, 32] (int64)
+    int nfeatsets,
+    int cols_32M,
+    int N,
+    int max_depth,                    // supports 7..9 (use uint64 LF for D=9)
+    int warps_per_block,
+    int stride,                       // tiles per warp along columns
+    int nodes_total                   // (1<<max_depth)-1
+){
+  const int feat_set = blockIdx.x;
+  const int wid      = threadIdx.x >> 5;     // warp id in block
+  const int lane     = threadIdx.x & 31;     // lane id
+  const int gwarp    = warps_per_block * blockIdx.y + wid;
+
+  // d<=2 accumulators (nodes 0..6)
+  int64_t hfs02[7];  // sum
+  int64_t hws02[7];  // count
+  #pragma unroll
+  for (int i=0;i<7;++i){ hfs02[i]=0; hws02[i]=0; }
+
+  // Shared memory layout
+  int rows_ge3 = (1 << max_depth) - 8;
+  if (rows_ge3 < 1) rows_ge3 = 1;
+
+  extern __shared__ int smem[]; // int32
+  const int s02_perwarp_ints  = 7 * 2 * 32;
+  const int sGE3_perwarp_ints = rows_ge3 * 2 * 32;
+
+  int* s02  = smem;                                       // [W,7,2,32]
+  int* sGE3 = s02 + warps_per_block * s02_perwarp_ints;   // [W,rows_ge3,2,32]
+
+  // Zero this warp's slices
+  #pragma unroll
+  for (int n = 0; n < 7; ++n) {
+    s02[idx_s02(wid, n, 0, lane)] = 0;
+    s02[idx_s02(wid, n, 1, lane)] = 0;
+  }
+  for (int r = lane; r < rows_ge3 * 32; r += 32) {
+    const int row  = r / 32;
+    const int lcol = r % 32;
+    sGE3[idx_sGE3(wid, row, 0, lcol, rows_ge3)] = 0;
+    sGE3[idx_sGE3(wid, row, 1, lcol, rows_ge3)] = 0;
+  }
+  __syncthreads();
+
+  const unsigned full_mask = __activemask();
+
+  // Process tiles owned by this warp
+  for (int j = 0; j < stride; ++j) {
+    const int base = 32 * (stride * gwarp + j);
+    if (base >= cols_32M) break;
+
+    // Lane-local loads (safe-load XS)
+    const int jj_lane = base + lane;
+    int32_t  y_lane = 0;
+    uint32_t l_lo   = 0;
+    uint32_t l_hi   = 0;
+    if (jj_lane < N) {
+      y_lane = Y[jj_lane];
+      const LF_T lval = LF[(size_t)feat_set * (size_t)N + jj_lane];
+      if constexpr (sizeof(LF_T) >= 8) {
+        const uint64_t v = static_cast<uint64_t>(lval);
+        l_lo = (uint32_t)(v & 0xFFFFFFFFu);
+        l_hi = (uint32_t)(v >> 32);
+      } else {
+        l_lo = (uint32_t)static_cast<uint64_t>(lval);
+        l_hi = 0u;
+      }
+    }
+    uint32_t xbits = 0;
+    if (base + lane < cols_32M) {
+      xbits = XS[(size_t)feat_set * (size_t)cols_32M + (base + lane)];
+    }
+
+    // Iterate columns in this 32-wide tile
+    #pragma unroll
+    for (int k = 0; k < 32; ++k) {
+      const int jj_k = base + k;
+
+      // Per-k participation mask, as requested
+      const unsigned mask_k = __ballot_sync(full_mask, jj_k < N);
+      if (!mask_k) break;  // all lanes agree there is no more work in this tile
+
+      // --- Do shuffles UNCONDITIONALLY (avoid deadlock) ---
+      const int32_t  yk   = __shfl_sync(mask_k, y_lane, k);
+      const uint32_t loK  = __shfl_sync(mask_k, l_lo,   k);
+      const uint32_t hiK  = __shfl_sync(mask_k, l_hi,   k);
+      uint64_t lk = (uint64_t)loK | ((uint64_t)hiK << 32);
+
+      // Now gate by v
+      const int v = (int)((xbits >> k) & 1u);
+      if (!v) continue;
+
+      // d=0 (node 0)
+      hfs02[0] += (int64_t)yk;
+      hws02[0] += 1;
+
+      // d=1..max_depth-1 (generic variable-length decode)
+      #pragma unroll
+      for (int d = 1; d < 10; ++d) {     // unroll upper bound; guard at runtime
+        if (d >= max_depth) break;
+        const uint64_t maskd = (1ull << d) - 1ull;
+        const uint64_t tkd   = lk & maskd;
+        lk >>= d;
+
+        const int node = ((1 << d) - 1) + (int)tkd;
+        if (node < 7) {
+          hfs02[node] += (int64_t)yk;
+          hws02[node] += 1;
+        } else {
+          const int row = node - 7;  // 0..rows_ge3-1
+          sGE3[idx_sGE3(wid, row, 0, lane, rows_ge3)] += (int)yk;
+          sGE3[idx_sGE3(wid, row, 1, lane, rows_ge3)] += 1;
+        }
+      }
+    } // k
+  } // j
+
+  // Spill d<=2 regs to s02 once
+  #pragma unroll
+  for (int n = 0; n < 7; ++n) {
+    s02[idx_s02(wid, n, 0, lane)] += (int)hfs02[n];
+    s02[idx_s02(wid, n, 1, lane)] += (int)hws02[n];
+  }
+  __syncthreads();
+
+  // Inter-warp butterfly merge (O(log W)) on s02 + sGE3
+  for (int s = 0; (1 << s) < warps_per_block; ++s) {
+    const int partner = wid ^ (1 << s);
+    __syncthreads();
+    if ((wid & ((1 << (s + 1)) - 1)) == 0 && partner < warps_per_block) {
+      // merge s02
+      #pragma unroll
+      for (int n = 0; n < 7; ++n) {
+        const int self_f = idx_s02(wid,     n, 0, lane);
+        const int self_c = idx_s02(wid,     n, 1, lane);
+        const int part_f = idx_s02(partner, n, 0, lane);
+        const int part_c = idx_s02(partner, n, 1, lane);
+        s02[self_f] += s02[part_f];
+        s02[self_c] += s02[part_c];
+      }
+      // merge sGE3 (stride lanes across rows)
+      for (int r = lane; r < rows_ge3 * 32; r += 32) {
+        const int row  = r / 32;
+        const int lcol = r % 32;
+        const int self_f = idx_sGE3(wid,     row, 0, lcol, rows_ge3);
+        const int self_c = idx_sGE3(wid,     row, 1, lcol, rows_ge3);
+        const int part_f = idx_sGE3(partner, row, 0, lcol, rows_ge3);
+        const int part_c = idx_sGE3(partner, row, 1, lcol, rows_ge3);
+        sGE3[self_f] += sGE3[part_f];
+        sGE3[self_c] += sGE3[part_c];
+      }
+    }
+  }
+  __syncthreads();
+
+  // Drain once per block (warp 0), preserving lane axis
+  if ((threadIdx.x >> 5) == 0) {
+    // nodes 0..6
+    #pragma unroll
+    for (int n = 0; n < 7; ++n) {
+      const int base = idx_s02(0, n, 0, lane);
+      const int64_t fsum = (int64_t)s02[base];
+      const int64_t csum = (int64_t)s02[base + 32];
+      if (fsum) atomicAdd(Hptr(H, nodes_total, feat_set, n, 0, lane), (unsigned long long)fsum);
+      if (csum) atomicAdd(Hptr(H, nodes_total, feat_set, n, 1, lane), (unsigned long long)csum);
+    }
+    // d>=3 (nodes 7..)
+    const int rows_ge3_local = rows_ge3;
+    for (int r = lane; r < rows_ge3_local * 32; r += 32) {
+      const int row  = r / 32;
+      const int lcol = r % 32;
+      const int node = 7 + row;
+      const int64_t fsum = (int64_t)sGE3[idx_sGE3(0, row, 0, lcol, rows_ge3_local)];
+      const int64_t csum = (int64_t)sGE3[idx_sGE3(0, row, 1, lcol, rows_ge3_local)];
+      if (fsum) atomicAdd(Hptr(H, nodes_total, feat_set, node, 0, lcol), (unsigned long long)fsum);
+      if (csum) atomicAdd(Hptr(H, nodes_total, feat_set, node, 1, lcol), (unsigned long long)csum);
+    }
+  }
+}
+
+// Murky-like heuristic, capped by SMEM
+static inline int heuristic_warps_per_block(int max_depth){
+  const int residual = 15 - 2 - 6 - max_depth; // 7 - max_depth
+  int lg2 = 4 - max(0, residual);              // -> {16,8,4,2,1}
+  if (lg2 < 0) lg2 = 0;
+  return 1 << lg2;
+}
+
+template <typename LF_T>
+static void launch_h_multiwarp_generic_typed(
+    const uint32_t* XS_ptr, const int32_t* Y_ptr, const LF_T* LF_ptr,
+    int64_t* H_ptr,
+    int nfeatsets, int cols_32M, int N, int max_depth,
+    cudaStream_t stream)
+{
+  const int rows_ge3 = max((1 << max_depth) - 8, 1);
+
+  auto* prop = at::cuda::getCurrentDeviceProperties();
+  const size_t smem_cap = prop->sharedMemPerBlockOptin
+                            ? (size_t)prop->sharedMemPerBlockOptin
+                            : (size_t)prop->sharedMemPerBlock;
+
+  const size_t s02_perwarp_bytes  = (size_t)7 * 2 * 32 * sizeof(int);
+  const size_t sGE3_perwarp_bytes = (size_t)rows_ge3 * 2 * 32 * sizeof(int);
+  const size_t perwarp_bytes      = s02_perwarp_bytes + sGE3_perwarp_bytes;
+
+  const int max_warps_by_smem = (int)max((size_t)1, smem_cap / perwarp_bytes);
+  int warps_per_block = max(1, min(heuristic_warps_per_block(max_depth), max_warps_by_smem));
+
+  int blocks_per_feat = 0, stride = 0;
+  infer_grid_stride(nfeatsets, cols_32M, warps_per_block, blocks_per_feat, stride);
+
+  const dim3 grid(nfeatsets, blocks_per_feat, 1);
+  const dim3 block(warps_per_block * 32, 1, 1);
+  const size_t smem_bytes = (size_t)warps_per_block * perwarp_bytes;
+
+  cudaFuncSetAttribute(_h_multiwarp_generic<LF_T>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       (int)smem_bytes);
+
+  _h_multiwarp_generic<LF_T><<<grid, block, smem_bytes, stream>>>(
+    XS_ptr, Y_ptr, LF_ptr, H_ptr,
+    nfeatsets, cols_32M, N, max_depth,
+    warps_per_block, stride, (1 << max_depth) - 1
+  );
+}
+
+torch::Tensor h_multiwarp_generic(
+    torch::Tensor XS,  // [nfeatsets, 32*M] (uint32/int32)
+    torch::Tensor Y,   // [N] (int32)
+    torch::Tensor LF,  // [nfeatsets, N] (uint16/32/64) — use uint64 for D=9
+    int max_depth)
+{
+  TORCH_CHECK(Y.scalar_type() == torch::kInt32, "Y must be int32");
+  TORCH_CHECK(
+    XS.scalar_type() == torch::kUInt32 || XS.scalar_type() == torch::kInt32,
+    "XS must be uint32/int32"
+  );
+
+  const int bits_needed = (max_depth - 1) * max_depth / 2; // d=1..D-1
+  const auto lf_dt = LF.scalar_type();
+  TORCH_CHECK(
+    (bits_needed <= 16 && (lf_dt == torch::kUInt16 || lf_dt == torch::kUInt32 || lf_dt == torch::kUInt64)) ||
+    (bits_needed <= 32 && (lf_dt == torch::kUInt32 || lf_dt == torch::kUInt64)) ||
+    (bits_needed <= 64 && (lf_dt == torch::kUInt64)),
+    "LF dtype too small for max_depth=", max_depth, " (need ", bits_needed, " bits). "
+    "Use uint64 for depth 9."
+  );
+
+  const int nfeatsets = (int)XS.size(0);
+  const int cols_32M  = (int)XS.size(1);
+  const int nodes_tot = (1 << max_depth) - 1;
+
+  auto H = torch::zeros({XS.size(0), nodes_tot, 2, 32},
+                        XS.options().dtype(torch::kLong).memory_format(c10::MemoryFormat::Contiguous));
+
+  const uint32_t* XS_ptr = reinterpret_cast<const uint32_t*>(XS.data_ptr());
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  if (lf_dt == torch::kUInt16) {
+    launch_h_multiwarp_generic_typed<uint16_t>(
+      XS_ptr, Y.data_ptr<int32_t>(), LF.data_ptr<uint16_t>(),
+      H.data_ptr<int64_t>(), nfeatsets, cols_32M, (int)Y.size(0), max_depth, stream.stream());
+  } else if (lf_dt == torch::kUInt32) {
+    launch_h_multiwarp_generic_typed<uint32_t>(
+      XS_ptr, Y.data_ptr<int32_t>(), LF.data_ptr<uint32_t>(),
+      H.data_ptr<int64_t>(), nfeatsets, cols_32M, (int)Y.size(0), max_depth, stream.stream());
+  } else if (lf_dt == torch::kUInt64) {
+    launch_h_multiwarp_generic_typed<uint64_t>(
+      XS_ptr, Y.data_ptr<int32_t>(), reinterpret_cast<const uint64_t*>(LF.data_ptr()),
+      H.data_ptr<int64_t>(), nfeatsets, cols_32M, (int)Y.size(0), max_depth, stream.stream());
+  } else {
+    TORCH_CHECK(false, "LF must be one of: uint16, uint32, uint64");
+  }
+
+  TORCH_CHECK(cudaGetLastError() == cudaSuccess,
+              "h_multiwarp_generic launch failed: ", cudaGetErrorString(cudaGetLastError()));
+  return H;
+}
