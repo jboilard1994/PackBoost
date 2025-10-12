@@ -33,15 +33,11 @@ __global__ void _prep_vars(
   
       for (int k = 0; k < nfolds; ++k) {
         T v = (T)0;
-        int off = 0; 
-  
+        
         #pragma unroll
         for (int d = 1; d < max_depth; ++d) {
-          // NEW: pack the full d-bit code (0 .. 2^d-1)
-            unsigned code = (unsigned)L[ ((long long)k * (max_depth - 1) + (d - 1)) * (long long)N + j ];
-            v |= (T)((T)code << off);
-            off += d;
-
+          unsigned bit = (unsigned)(L[( (long long)k * (max_depth -1) + (d - 1) ) * (long long)N + j]);
+          v |= (T)((T)bit << (d*(d-1)/2));
         }
   
         LE[(long long)k * (long long)N + j] = v;

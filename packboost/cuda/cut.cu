@@ -120,7 +120,7 @@ extern "C" __global__ void cut_cuda_kernel(
 
 // -------- C++ launcher --------
 void cut_cuda_launcher(
-    torch::Tensor F,      // int16 (stores uint16)
+    torch::Tensor F,      // uint16 (stores uint16)
     torch::Tensor FST,    // uint8
     torch::Tensor H,      // int64
     torch::Tensor H0,     // int64
@@ -142,7 +142,7 @@ void cut_cuda_launcher(
   auto stream = at::cuda::getCurrentCUDAStream();
 
   cut_cuda_kernel<<<grid, block, 0, stream.stream()>>>(
-      reinterpret_cast<const uint16_t*>(F.data_ptr<int16_t>()),
+      reinterpret_cast<const uint16_t*>(F.data_ptr<uint16_t>()),
       FST.data_ptr<uint8_t>(),
       H.data_ptr<int64_t>(),
       H0.data_ptr<int64_t>(),

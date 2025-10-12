@@ -89,7 +89,9 @@ class PackBoost(BaseEstimator, RegressorMixin):
         Fsch_cpu = torch.from_numpy(
             rng.randint(0, bF, size=(rounds, lanes * nfeatsets), dtype=np.uint16)
         ).contiguous()                                       # keep CPU copy for fast et_sample_1b CPU path (if needed)
-        Fsch_dev_i16 = Fsch_cpu.to(device=device, dtype=torch.int16)  # for cut() which expects int16 storage
+        # in fit(), right after you build Fsch_cpu (np.uint16)
+        self.Fsch_u16 = Fsch_cpu.to(device=device, dtype=torch.uint16).contiguous()
+        self.Fsch_i16 = self.Fsch_u16.view(torch.int16).contiguous()  # same storage, different dtype view
 
         # FST: [rounds, nfeatsets, D] uint8; depth-wise shuffled tiling of [0..nfolds-1]
         base = torch.arange(nfolds, dtype=torch.uint8, device=device)
@@ -100,6 +102,8 @@ class PackBoost(BaseEstimator, RegressorMixin):
             for d in range(D):
                 perm = torch.randperm(nfeatsets, device=device)
                 FST[s, :, d] = row[perm]
+
+        FST = FST.contiguous()
 
         # -------- outputs --------
         V = torch.empty((rounds, nfolds, 2 * nodes), dtype=torch.int32, device=device)
@@ -141,7 +145,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             #    Fast path: GPU (XB on device) – your kernel creates XS directly on device.
             #    Fallback: if XB were on CPU, we’d use the CPU path with Fsch_cpu.
             if XB.is_cuda and torch.cuda.is_available():
-                XS = self.et_sample_1b(XB, Fsch_dev_i16.to(torch.uint16), t).contiguous()
+                XS = self.et_sample_1b(XB, self.Fsch_u16, t).contiguous()
             else:
                 XS = self.et_sample_1b(XB, Fsch_cpu, t).to(device)    # move to device for H()
 
@@ -154,10 +158,9 @@ class PackBoost(BaseEstimator, RegressorMixin):
             # (d) histograms
             H  = self.H (XS, G, LF, D).contiguous()                   # [nfeatsets, nodes, 2, 32] int64
             H0 = self.h0(G, LE, D).contiguous()                       # [nfolds, 2^D, 2] int64
-            H0i = H0[:, :nodes, :].contiguous()                       # drop leaf plane
 
             # (e) choose best cuts (writes into V/I for round t)
-            self.cut(Fsch_dev_i16, FST, H, H0i, V, I,
+            self.cut(self.Fsch_u16, FST, H, H0, V, I,
                     tree_set=t, L2=L2, lr=lr_per_fold,
                     qgrad_bits=qgrad_bits, max_depth=D)
 
@@ -180,12 +183,12 @@ class PackBoost(BaseEstimator, RegressorMixin):
             self.tree_set = t + 1
 
             # free big temporaries ASAP
-            del XS, LE, G, LF, H, H0, H0i
+            del XS, LE, G, LF, H, H0
             if device.type == "cuda" and (t % 256 == 255):
                 torch.cuda.empty_cache()
 
         # -------- stash artifacts for inference --------
-        self.Fsch = Fsch_dev_i16            # int16 storage, device
+        self.Fsch = self.Fsch_i16            # int16 storage, device
         self.FST  = FST                     # uint8, device
         self.V    = V
         self.I    = I
@@ -519,7 +522,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             return V, I
 
         # ---------------- CPU fallback (vectorized, mirrors kernel tie rules) ----------------
-        assert F.dtype   == torch.int16 and FST.dtype == torch.uint8
+        assert F.dtype   == torch.uint16 and FST.dtype == torch.uint8
         assert H.dtype   == torch.int64 and H0.dtype  == torch.int64
         assert V.dtype   == torch.int32 and I.dtype   == torch.int16
 
