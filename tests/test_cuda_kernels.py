@@ -355,7 +355,7 @@ def test_advance_and_predict_matches_cpu_reference():
         P_cpu = torch.zeros(N, dtype=torch.int32)
         P_gpu = P_cpu.cuda()
 
-        X_cpu = torch.randint(0, 2**32, (R, M), dtype=torch.int64).to(torch.int32)
+        X_cpu = torch.randint(0, 2**32, (R, M), dtype=torch.int64).to(torch.uint32)
         X_gpu = X_cpu.cuda()
 
         L_old_cpu = torch.zeros((K0, Dm, N), dtype=L_dtype)
