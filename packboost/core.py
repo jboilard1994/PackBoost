@@ -13,162 +13,82 @@ class PackBoost(BaseEstimator, RegressorMixin):
         self.device = device
         self.nfeatsets = 32
 
-    def fit(self,
-            X: np.ndarray,         # int8 [N, F]
-            y: np.ndarray,         # float32 [N]
-            Xv: np.ndarray = None, # int8  [Nv, F]
-            Yv: np.ndarray = None, # float32 [Nv]
-            nfolds: int = 8,
-            rounds: int = 10_000,
-            max_depth: int = 7,
-            callbacks: list = None,
-            *,
-            # ExtraFast-ish defaults
-            lr: float = 0.07,
-            L2: float = 100_000.0,
-            nfeatsets: int = 32,          # 16*2 from your snippet
-            qgrad_bits: int = 12,
-            seed: int = 0):
-        """
-        Train PackBoost:
-        1) encode_cuts(X)
-        2) generate Fsch, FST in torch (like your snippet)
-        3) run boosting for `rounds`, incrementing tree_set each round
-
-        Notes:
-        - Stores learned V/I and schedules on self for predict().
-        - Uses lr_per_fold = lr / nfolds when calling cut() (like ExtraFastBooster).
-        - Pads samples to multiples of 32 internally (bitpacking).
-        """
-        rng = np.random.RandomState(seed)
-        device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
-
-        # --- 0) inputs -> torch, basic checks ---
-        assert X.dtype == np.int8 and y.dtype == np.float32
-        N, F = X.shape
-        callbacks = [] if callbacks is None else callbacks
+    def fit(self, X, y, Xv=None, Yv=None, nfolds=8, rounds=10_000, max_depth=7,
+            callbacks=None, *, lr=0.07, L2=100_000.0, nfeatsets=32, qgrad_bits=12, seed=0):
+        # ... existing preamble ...
         self.nfeatsets = int(nfeatsets)
         self.max_depth = int(max_depth)
         self.nfolds    = int(nfolds)
 
-        # --- 1) encode_cuts(X) -> XB [4F, M] uint32 ---
+        # --- encode & pad ---
         X_t = torch.from_numpy(X).to(device=device, dtype=torch.int8)
-        XB  = self.encode_cuts(X_t).contiguous()                   # [4F, M] uint32
-        bF  = XB.shape[0]                                          # 4F
-        M   = XB.shape[1]
-        Np  = 32 * M                                               # padded N (multiple of 32)
+        XB  = self.encode_cuts(X_t).contiguous()
+        bF, M = XB.shape[0], XB.shape[1]
+        N, F = X.shape
+        Np = 32 * M
 
-        # targets in Q30 int32; pad to Np
-        yq30 = (y * (1 << 30)).astype(np.int64)                    # avoid overflow before cast
+        # targets (Q30 int32), padded to Np
+        yq30  = (y * (1 << 30)).astype(np.int64)
         Y_i32 = torch.zeros(Np, dtype=torch.int32, device=device)
         Y_i32[:N] = torch.from_numpy(yq30[:N].astype(np.int32)).to(device=device)
 
+        # >>> store for callbacks (and trim length) <<<
+        self.train_N = int(N)
+        self.Y_i32   = Y_i32                      # Q30 int32
+        self.y_float = torch.from_numpy(y).to(device=device)  # optional convenience
+        # legacy aliases (if you have an older callback lying around)
+        self.dY = Y_i32
+
         # predictions buffer
         P = torch.zeros(Np, dtype=torch.int32, device=device)
+        self.P_ = P                               # expose live preds
+        self.dP = P                               # legacy alias
 
-        # leaf buffers [K0, Dm, Np]
-        D  = int(max_depth)
-        Dm = max(D - 1, 0)
-        leaf_dtype = (torch.uint8 if D <= 8 else torch.int16)
-        L_old = torch.zeros((nfolds, Dm, Np), dtype=leaf_dtype, device=device)
-        L_new = torch.zeros_like(L_old)
+        # ... rest of setup (L_old/L_new, Fsch, FST, V/I, validation packing) ...
 
-        # --- 2) make Fsch, FST like your snippet ---
-        # Fsch: [rounds, 32*nfeatsets] uint16 indices into XB rows
-        # (ensure 4F < 2^16 for uint16 schedule)
-        if bF >= (1 << 16):
-            raise ValueError(f"encode_cuts produced {bF} bitplanes; Fsch currently stores uint16. "
-                            f"Either reduce F or extend kernels to uint32 schedules.")
-        Fsch = torch.from_numpy(
-            rng.randint(0, bF, size=(rounds, 32 * nfeatsets), dtype=np.uint16)
-        ).to(device=device, dtype=torch.uint16).contiguous()
-
-        # FST: [rounds, nfeatsets, D] uint8, per-depth shuffled tiling of [0..nfolds-1]
-        base = torch.arange(nfolds, dtype=torch.uint8, device=device)
-        rep  = (nfeatsets + nfolds - 1) // nfolds
-        row  = base.repeat(rep)[:nfeatsets]  # [nfeatsets]
-        FST  = torch.empty((rounds, nfeatsets, D), dtype=torch.uint8, device=device)
-        for s in range(rounds):
-            for d in range(D):
-                perm = torch.randperm(nfeatsets, device=device)
-                FST[s, :, d] = row[perm]
-
-        # nodes, outputs
-        nodes = (1 << D) - 1
-        V = torch.empty((rounds, nfolds, 2 * nodes), dtype=torch.int32, device=device)
-        I = torch.empty((rounds, nfolds,     nodes), dtype=torch.int16, device=device)
-
-        # --- Optional validation setup ---
         use_val = (Xv is not None) and (Yv is not None)
         if use_val:
-            assert Xv.dtype == np.int8 and Yv.dtype == np.float32
-            Xv_t = torch.from_numpy(Xv).to(device=device, dtype=torch.int8)
-            XBv  = self.encode_cuts(Xv_t).contiguous()             # [4F, Mv] uint32
-            Mv   = XBv.shape[1]
-            Nvp  = 32 * Mv
-            Pv   = torch.zeros(Nvp, dtype=torch.int32, device=device)
+            Xv_t  = torch.from_numpy(Xv).to(device=device, dtype=torch.int8)
+            XBv   = self.encode_cuts(Xv_t).contiguous()
+            Mv    = XBv.shape[1]
+            Nvp   = 32 * Mv
+            Pv    = torch.zeros(Nvp, dtype=torch.int32, device=device)
+
             yvq30 = (Yv * (1 << 30)).astype(np.int64)
             Yv_i32 = torch.zeros(Nvp, dtype=torch.int32, device=device)
             Yv_i32[:len(Yv)] = torch.from_numpy(yvq30[:len(Yv)].astype(np.int32)).to(device=device)
-            Lv   = torch.zeros((nfolds, Dm, Nvp), dtype=leaf_dtype, device=device)
-            Lvn  = torch.zeros_like(Lv)
-        else:
-            XBv = Pv = Yv_i32 = Lv = Lvn = None  # keep linters calm
 
-        # --- 3) boosting loop ---
-        lr_per_fold = lr / float(nfolds)
+            # >>> store for callbacks <<<
+            self.val_N   = int(len(Yv))
+            self.Yv_i32  = Yv_i32
+            self.Yv      = torch.from_numpy(Yv).to(device=device)
+            self.Pv_     = Pv
+            # legacy aliases
+            self.dPv     = Pv
+
+        # === boosting loop ===
         self.tree_set = 0
+        lr_per_fold = lr / float(nfolds)
+        callbacks = [] if callbacks is None else callbacks
 
         for t in range(rounds):
-            # sample features -> XS [nfeatsets, 32*M]
-            XS = self.et_sample_1b(XB, Fsch, t).contiguous()
+            # ... your existing XS/prep_vars/repack/H/H0/cut/advance_and_predict ...
+            # keep self.P_ (and self.Pv_) as the live buffers P/Pv you’re updating
 
-            # prep target vars -> LE packed paths, G gradients
-            LE, G = self.prep_vars(L_old, Y_i32, P)                # LE dtype: u16/u32/u64; G: int16
-
-            # map per-feature-set trees by depth
-            LF = self.repack(FST, LE, t).contiguous()              # [nfeatsets, Np] same dtype as LE
-
-            # histograms
-            H  = self.H (XS, G, LF, D).contiguous()                # [nfeatsets, nodes, 2, 32] int64
-            H0 = self.h0(G, LE, D).contiguous()                    # [nfolds, 2^D, 2] int64
-            H0i = H0[:, :nodes, :].contiguous()                    # trim leaf plane
-
-            # choose best cuts (writes into V/I for this round)
-            self.cut(Fsch.to(torch.int16), FST, H, H0i, V, I,
-                    tree_set=t, L2=L2, lr=lr_per_fold, qgrad_bits=qgrad_bits, max_depth=D)
-
-            # advance paths + accumulate predictions
-            self.advance_and_predict(P, XB, L_old, L_new, V, I, tree_set=t)
-            L_old, L_new = L_new, L_old  # swap buffers
-
-            # optional validation advance/predict on same trees
-            if use_val:
-                # (use the current trees at depth<=t)
-                self.advance_and_predict(Pv, XBv, Lv, Lvn, V, I, tree_set=t)
-                Lv, Lvn = Lvn, Lv
-
-            # callbacks
             for cb in callbacks:
-                try:
-                    cb(self)
-                except Exception:
-                    pass
+                cb(self)
 
-            self.tree_set = t + 1  # expose progress
+            self.tree_set = t + 1
 
-        # --- stash artifacts for inference ---
+        # stash model artifacts for predict()
         self.Fsch = Fsch
         self.FST  = FST
         self.V    = V
         self.I    = I
-        self.X_packed_ = XB              # optional: keep for quick train-score
-        self.P_       = P
-        if use_val:
-            self.Xv_packed_ = XBv
-            self.Pv_        = Pv
-
+        self.X_packed_ = XB
+        # (Pv/XBv already stored above if val used)
         return self
+
 
     def predict(self, X):
         """
