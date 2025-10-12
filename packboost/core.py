@@ -435,6 +435,13 @@ class PackBoost(BaseEstimator, RegressorMixin):
         assert I.dtype == torch.int16 and V.dtype == torch.int32
         device = P.device
 
+        # Workaround: PyTorch doesn't support advanced indexing on CPU uint32 tensors.
+        # Use an int64 "view" for indexing/bit ops (values remain exact in [0, 2^32-1]).
+        if X.device.type == "cpu" and X.dtype == torch.uint32:
+            X_ix = X.to(torch.int64)                # copy (safe & simple)
+        else:
+            X_ix = X.to(torch.int64, copy=False)    # no copy for int32
+
         k = torch.arange(N, device=device, dtype=torch.long)
         word_idx = (k >> 5)
         bit_off  = (k & 31).to(torch.int64)
@@ -449,8 +456,10 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 lo = leaf_prev + ((1 << depth) - 1)
 
                 li = (I[tree_set, f].gather(0, lo.to(torch.long)).to(torch.int64) & 0xFFFF)
-                words = X[li, word_idx]
-                x = ((words >> bit_off) & 1).to(torch.int64)
+
+                # Index using the int64 proxy, then bit-extract
+                words = X_ix[li, word_idx]                      # int64
+                x     = ((words >> bit_off) & 1).to(torch.int64)
 
                 leaf_new = (leaf_prev << 1) + x
                 if depth < Dm:
