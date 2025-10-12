@@ -62,6 +62,15 @@ torch::Tensor h_sm(
     torch::Tensor LF,
     int max_depth);
 
+void cut_cuda_launcher(
+    torch::Tensor F,      // int16 (stores uint16)
+    torch::Tensor FST,    // uint8
+    torch::Tensor H,      // int64
+    torch::Tensor H0,     // int64
+    torch::Tensor V,      // int32
+    torch::Tensor I,      // int16 (stores uint16)
+    int tree_set, double L2, double lr, int qgrad_bits, int max_depth);
+
 namespace {
 
 torch::Tensor encode_cuts_binding(torch::Tensor X) {
@@ -123,5 +132,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Repack trees for features (Murky parity, CUDA)");
 
     m.def("h_sm", &h_sm, "PackBoost H (unweighted histogram, Murky parity; returns H)");
+    m.def("cut_cuda", &cut_cuda_launcher, "PackBoost cut_cuda (CUDA)");
+
 
 }

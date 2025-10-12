@@ -260,3 +260,133 @@ class PackBoost(BaseEstimator, RegressorMixin):
         # stack channels: [F, nodes, 2, 32]
         H = torch.stack([H_sum, H_cnt], dim=2).contiguous()
         return H
+
+    def cut(self,
+            F:  torch.Tensor,   # [rounds, 32*K1]         int16 (uint16 storage)
+            FST:torch.Tensor,   # [rounds, K1, D]         uint8
+            H:  torch.Tensor,   # [K1, nodes, 2, 32]      int64
+            H0: torch.Tensor,   # [K0, nodes, 2]          int64
+            V:  torch.Tensor,   # [rounds, K0, 2*nodes]   int32 (OUT)
+            I:  torch.Tensor,   # [rounds, K0, nodes]     int16 (uint16 storage, OUT)
+            tree_set: int,
+            L2: float,
+            lr: float,
+            qgrad_bits: int,
+            max_depth: int):
+        """
+        CPU: vectorized, correct (global argmax over (k,lane) for each (leaf, fold))
+        GPU: calls kernels.cut_cuda
+        """
+        use_cuda = (F.is_cuda or FST.is_cuda or H.is_cuda or H0.is_cuda or V.is_cuda or I.is_cuda)
+        if use_cuda and torch.cuda.is_available():
+            kernels.cut_cuda(
+                F.contiguous(), FST.contiguous(),
+                H.contiguous(), H0.contiguous(),
+                V, I,
+                int(tree_set), float(L2), float(lr),
+                int(qgrad_bits), int(max_depth),
+            )
+            return V, I
+
+        # -------- CPU vectorized path (all torch ops) --------
+        assert F.dtype   == torch.int16, "F must be torch.int16 (uint16 storage)"
+        assert FST.dtype == torch.uint8, "FST must be torch.uint8"
+        assert H.dtype   == torch.int64 and H0.dtype == torch.int64, "H/H0 must be torch.int64"
+        assert V.dtype   == torch.int32 and I.dtype == torch.int16, "V int32, I int16 (uint16 storage)"
+
+        device = H.device
+        K1, nodes = H.shape[0], H.shape[1]
+        lanes = 32
+        K0 = H0.shape[0]
+        D  = FST.shape[2]
+        assert H.shape[2] == 2 and H.shape[3] == 32, "H must be [K1, nodes, 2, 32]"
+        assert nodes == (1 << max_depth) - 1, "nodes must equal 2^max_depth - 1"
+
+        # depth(leaf) = floor(log2(leaf+1))
+        leaves = torch.arange(nodes, device=device, dtype=torch.float32) + 1.0
+        depth  = torch.floor(torch.log2(leaves)).to(torch.long)                          # [nodes]
+        assert depth.max().item() < D, "depth exceeds FST depth dimension"
+
+        # L2_eff(leaf) and qscale(leaf)
+        L2_eff = torch.tensor(L2, dtype=torch.float32, device=device) * torch.pow(2.0, 5.0 - depth.float())        # [nodes]
+        shift  = 31 - int(qgrad_bits)
+        pow2   = float(1 << shift)
+        qscale = torch.tensor(lr, dtype=torch.float32, device=device) * pow2 * torch.pow(2.0, -(float(max_depth) - depth.float()))  # [nodes]
+
+        # Gather tree_fold per (k, leaf): tf_all[k, n] = FST[tree_set, k, depth[n]]
+        FST_ts = FST[tree_set]                                                                                      # [K1, D]
+        tf_all = FST_ts.gather(1, depth.unsqueeze(0).expand(K1, nodes)).to(torch.long)                              # [K1, nodes]
+
+        # Stats
+        H_sum = H[:, :, 0, :].to(torch.float32)  # [K1, nodes, 32]
+        H_cnt = H[:, :, 1, :].to(torch.float32)  # [K1, nodes, 32]
+        H0_sum = H0[:, :, 0].to(torch.float32)   # [K0, nodes]
+        H0_cnt = H0[:, :, 1].to(torch.float32)   # [K0, nodes]
+
+        # Fold totals per (k, leaf)
+        leaf_idx_K1N = torch.arange(nodes, device=device, dtype=torch.long).unsqueeze(0).expand(K1, nodes)
+        G01 = H0_sum[tf_all, leaf_idx_K1N]                                                                              # [K1, nodes]
+        N01 = H0_cnt[tf_all, leaf_idx_K1N]                                                                              # [K1, nodes]
+
+        # Broadcast shapes
+        L2e   = L2_eff.view(1, nodes, 1)                                                                               # [1, n, 1]
+        G0    = H_sum                                                                                                  # [K1, n, 32]
+        N0    = H_cnt                                                                                                  # [K1, n, 32]
+        G1    = G01.unsqueeze(-1) - G0                                                                                 # [K1, n, 32]
+        N1    = N01.unsqueeze(-1) - N0                                                                                 # [K1, n, 32]
+        V0f   = G0 / (N0 + L2e)                                                                                        # [K1, n, 32]
+        V1f   = G1 / (N1 + L2e)                                                                                        # [K1, n, 32]
+        S     = (G0 * V0f) + (G1 * V1f)                                                                                # [K1, n, 32]
+
+        # Group-by (fold) argmax over (k, lane) for each leaf:
+        Q = K1 * lanes
+        S_flat  = S.reshape(Q, nodes)                                                                                  # [Q, n]
+        tf_flat = tf_all.repeat_interleave(lanes, dim=0)                                                               # [Q, n]
+
+        # One-hot mask per fold: [K0, Q, n]
+        M = torch.nn.functional.one_hot(tf_flat.T, num_classes=K0).permute(2, 1, 0).to(torch.bool)                    # [K0,Q,n]
+        neg_inf = torch.tensor(-1e38, dtype=S_flat.dtype, device=device)
+        S_masked = torch.where(M, S_flat.unsqueeze(0), neg_inf)                                                        # [K0,Q,n]
+
+        # Max across Q (k*lane) for each (fold, leaf)
+        Smax, argQ = S_masked.max(dim=1)                                                                               # [K0, n], [K0, n]
+        has_any = M.any(dim=1)                                                                                         # [K0, n]
+
+        # Decode (k_idx, lane_idx)
+        k_idx   = (argQ // lanes).to(torch.long)                                                                       # [K0, n]
+        lane_ix = (argQ %  lanes).to(torch.long)                                                                       # [K0, n]
+
+        # Gather selected per (fold, leaf)
+        leaf_ix = torch.arange(nodes, device=device, dtype=torch.long).unsqueeze(0).expand(K0, nodes)                  # [K0, n]
+        fold_ix = torch.arange(K0,    device=device, dtype=torch.long).unsqueeze(1).expand(K0, nodes)                  # [K0, n]
+
+        G0_sel = H_sum[k_idx, leaf_ix, lane_ix]                                                                         # [K0, n]
+        N0_sel = H_cnt[k_idx, leaf_ix, lane_ix]                                                                         # [K0, n]
+        G01_sel = H0_sum[fold_ix, leaf_ix]                                                                              # [K0, n]
+        N01_sel = H0_cnt[fold_ix, leaf_ix]                                                                              # [K0, n]
+
+        L2_sel = L2_eff[leaf_ix]                                                                                        # [K0, n]
+        qs_sel = qscale[leaf_ix]                                                                                        # [K0, n]
+
+        V0_sel = G0_sel / (N0_sel + L2_sel)                                                                             # [K0, n]
+        V1_sel = (G01_sel - G0_sel) / ((N01_sel - N0_sel) + L2_sel)                                                     # [K0, n]
+
+        # Quantize to int32
+        L_vals = torch.round(qs_sel * V0_sel).to(torch.int32)                                                           # [K0, n]
+        R_vals = torch.round(qs_sel * V1_sel).to(torch.int32)                                                           # [K0, n]
+
+        # Feature indices from F[tree_set, 32*k + lane]  -> store into I (int16 storage)
+        F_row = F[tree_set]                                                                                             # [32*K1] (int16)
+        feat_pos = (k_idx * lanes + lane_ix).reshape(-1)                                                                # [(K0*n)]
+        feat_vals = F_row.index_select(0, feat_pos).view(K0, nodes).to(torch.int16)                                     # [K0,n]
+
+        # Write only where a candidate exists
+        fi, li = torch.nonzero(has_any, as_tuple=True)
+
+        V_ts = V[tree_set]                                                                                              # [K0, 2*nodes]
+        I_ts = I[tree_set]                                                                                              # [K0, nodes]
+        V_ts[fi, 2 * li]     = L_vals[fi, li]
+        V_ts[fi, 2 * li + 1] = R_vals[fi, li]
+        I_ts[fi, li]         = feat_vals[fi, li]
+
+        return V, I
