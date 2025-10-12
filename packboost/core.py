@@ -273,12 +273,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
             lr: float,
             qgrad_bits: int,
             max_depth: int):
-        """
-        CPU: vectorized, mirrors CUDA tie rules:
-            - per lane: argmax over k with tie -> earliest k
-            - across lanes: tie -> highest lane index
-        GPU: calls kernels.cut_cuda
-        """
         use_cuda = (F.is_cuda or FST.is_cuda or H.is_cuda or H0.is_cuda or V.is_cuda or I.is_cuda)
         if use_cuda and torch.cuda.is_available():
             kernels.cut_cuda(
