@@ -257,19 +257,16 @@ def test_h_matches_cpu_reference():
             msg=f"H mismatch K={K} D={D} N={N} nfeatsets={nfeatsets}"
         )
 
-
-
 def test_cut_matches_cpu_reference():
     pack_cpu = PackBoost(device="cpu")
     pack_gpu = PackBoost(device="cuda")
 
     torch.manual_seed(1234)
 
-    # (K = nfolds, D = max_depth (<=7 keeps H() light), N = samples, nfeatsets = K1, rounds)
     cases = [
-        (1, 3, 1,                 7,   2),          # tiny sanity
-        (4, 5, 33,                17,  3),          # tail nfeatsets + N just over warp
-        (8, 7, 32 * 256 + 3,      32,  3),          # moderately large
+        (1, 3, 1,                 7,   2),
+        (4, 5, 33,                17,  3),
+        (8, 7, 32 * 256 + 3,      32,  3),
     ]
 
     base_L2 = 10_000.0
@@ -277,22 +274,16 @@ def test_cut_matches_cpu_reference():
     qgrad_bits = 12
 
     for K, D, N, nfeatsets, rounds in cases:
-        # Keep PackBoost metadata aligned where relevant
         pack_cpu.nfeatsets = pack_gpu.nfeatsets = nfeatsets
 
-        # ---- Build Murky parity inputs via prep_vars ----
-        # L_bits corresponds to d = 1..D-1 (2-bit codes per level, 0..3)
         L_bits = torch.randint(0, 4, (K, max(D - 1, 0), N), dtype=torch.uint8)
 
-        # Q30-ish Y/P so prep_vars produces the same G as in other tests
         lo, hi = -(1 << 30), (1 << 30) - 1
         Y_raw  = torch.randint(lo, hi + 1, (N,), dtype=torch.int32)
         P_raw  = torch.randint(lo, hi + 1, (N,), dtype=torch.int32)
 
-        # CPU reference packing (determines LE dtype automatically)
-        LE_ref, G_ref = pack_cpu.prep_vars(L_bits, Y_raw, P_raw)        # LE: u16/u32/u64; G: int16
+        LE_ref, G_ref = pack_cpu.prep_vars(L_bits, Y_raw, P_raw)
 
-        # ---- FST wiring: [rounds, nfeatsets, D]; each depth is a shuffled tiling of [0..K-1] ----
         FST = torch.empty((rounds, nfeatsets, D), dtype=torch.uint8)
         base = torch.arange(K, dtype=torch.uint8)
         rep  = (nfeatsets + K - 1) // K
@@ -302,40 +293,30 @@ def test_cut_matches_cpu_reference():
                 perm = torch.randperm(nfeatsets)
                 FST[s, :, d] = row[perm]
 
-        # Pick a valid tree_set
         tree_set = min(1, rounds - 1)
 
-        # ---- Repack trees for features (CPU reference) ----
-        LF_ref = pack_cpu.repack(FST, LE_ref, tree_set)                 # [nfeatsets, N], same dtype as LE_ref
+        LF_ref = pack_cpu.repack(FST, LE_ref, tree_set)
 
-        # ---- Make XS (packed feature bitplanes) ----
         M = (N + 31) // 32
         XS_cpu = torch.randint(0, 2 ** 32, (nfeatsets, 32 * M), dtype=torch.int64).to(torch.uint32)
 
-        # ---- Build H (feature histograms) and H0 (featureless) on CPU ----
-        # Use G_ref as "Y" for histogram construction
-        H_ref  = pack_cpu.H(XS_cpu, G_ref, LF_ref, D)                   # [nfeatsets, (1<<D)-1, 2, 32] int64
-        H0_full = pack_cpu.h0(G_ref, LE_ref, D)                         # [K, 1<<D, 2] int64
-        H0_ref  = H0_full[:, : (1 << D) - 1, :]                         # drop leaf plane -> [K, (1<<D)-1, 2]
+        H_ref   = pack_cpu.H(XS_cpu, G_ref, LF_ref, D)
+        H0_full = pack_cpu.h0(G_ref, LE_ref, D)
+        H0_ref  = H0_full[:, : (1 << D) - 1, :]
 
-        # ---- Schedule/outputs for cut ----
-        # F just carries indices; dtype must be int16 (uint16 storage)
         F_row_elems = 32 * nfeatsets
-        F = torch.randint(0, 2**16, (rounds, F_row_elems), dtype=torch.int16)   # stores uint16 payload
-        V_cpu = torch.zeros((rounds, K, 2 * ((1 << D) - 1)), dtype=torch.int32)
-        I_cpu = torch.zeros((rounds, K,     (1 << D) - 1), dtype=torch.int16)   # stores uint16 payload
+        # FIX: generate in int32 0..65535, then cast to int16 (uint16 payload in storage)
+        F = torch.randint(0, 1 << 16, (rounds, F_row_elems), dtype=torch.int32).to(torch.int16)
 
-        # lr is scaled by nfolds in the original training loop
+        V_cpu = torch.zeros((rounds, K, 2 * ((1 << D) - 1)), dtype=torch.int32)
+        I_cpu = torch.zeros((rounds, K,     ((1 << D) - 1)), dtype=torch.int16)
+
         lr_eff = base_lr / float(K)
 
-        # ---- CPU reference cut ----
-        pack_cpu.cut(
-            F, FST, H_ref, H0_ref, V_cpu, I_cpu,
-            tree_set=tree_set, L2=base_L2, lr=lr_eff,
-            qgrad_bits=qgrad_bits, max_depth=D
-        )
+        pack_cpu.cut(F, FST, H_ref, H0_ref, V_cpu, I_cpu,
+                     tree_set=tree_set, L2=base_L2, lr=lr_eff,
+                     qgrad_bits=qgrad_bits, max_depth=D)
 
-        # ---- GPU cut ----
         F_gpu   = F.cuda()
         FST_gpu = FST.cuda()
         H_gpu   = H_ref.cuda()
@@ -343,19 +324,10 @@ def test_cut_matches_cpu_reference():
         V_gpu   = torch.zeros_like(V_cpu, device="cuda")
         I_gpu   = torch.zeros_like(I_cpu, device="cuda")
 
-        pack_gpu.cut(
-            F_gpu, FST_gpu, H_gpu, H0_gpu, V_gpu, I_gpu,
-            tree_set=tree_set, L2=base_L2, lr=lr_eff,
-            qgrad_bits=qgrad_bits, max_depth=D
-        )
+        pack_gpu.cut(F_gpu, FST_gpu, H_gpu, H0_gpu, V_gpu, I_gpu,
+                     tree_set=tree_set, L2=base_L2, lr=lr_eff,
+                     qgrad_bits=qgrad_bits, max_depth=D)
         torch.cuda.synchronize()
 
-        # ---- Checks ----
-        assert V_gpu.shape == V_cpu.shape == (rounds, K, 2 * ((1 << D) - 1))
-        assert I_gpu.shape == I_cpu.shape == (rounds, K,     ((1 << D) - 1))
-
-        # Exact equality (same integer math & tie policy)
-        torch.testing.assert_close(V_gpu.cpu(), V_cpu, rtol=0, atol=0,
-                                   msg=f"V mismatch K={K} D={D} N={N} nfeatsets={nfeatsets} rounds={rounds}")
-        torch.testing.assert_close(I_gpu.cpu(), I_cpu, rtol=0, atol=0,
-                                   msg=f"I mismatch K={K} D={D} N={N} nfeatsets={nfeatsets} rounds={rounds}")
+        torch.testing.assert_close(V_gpu.cpu(), V_cpu, rtol=0, atol=0)
+        torch.testing.assert_close(I_gpu.cpu(), I_cpu, rtol=0, atol=0)
