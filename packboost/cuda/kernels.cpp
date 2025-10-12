@@ -72,11 +72,20 @@ void cut_cuda_launcher(
     int tree_set, double L2, double lr, int qgrad_bits, int max_depth);
 
 
+static void launch_advpred(
+    torch::Tensor P,  // int32 [N]
+    torch::Tensor X,  // int32 (bitwise uint32) [R, M]
+    torch::Tensor L_old,
+    torch::Tensor L_new,
+    torch::Tensor V,  // int32 [rounds, K0, 2*nodes]
+    torch::Tensor I,  // int16 [rounds, K0, nodes] (uint16 payload)
+    int tree_set);
+
 void advance_and_predict_launcher(
     torch::Tensor P, torch::Tensor X, torch::Tensor L_old, torch::Tensor L_new,
     torch::Tensor V, torch::Tensor I,
     int tree_set, int depths);
-    
+
 namespace {
 
 torch::Tensor encode_cuts_binding(torch::Tensor X) {
