@@ -76,7 +76,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         self.dP    = P
 
         # leaf buffers
-        L_old = torch.zeros((nfolds, Dm, N), dtype=leaf_dtype, device=device)
+        L_old = torch.zeros((nfolds, Dm, Np), dtype=leaf_dtype, device=device)
         L_new = torch.zeros_like(L_old)
 
         # -------- 2) schedules like your snippet --------
@@ -106,8 +106,8 @@ class PackBoost(BaseEstimator, RegressorMixin):
         FST = FST.contiguous()
 
         # -------- outputs --------
-        V = torch.empty((rounds, nfolds, 2 * nodes), dtype=torch.int32, device=device)
-        I = torch.empty((rounds, nfolds,     nodes), dtype=torch.int16, device=device)
+        V = torch.zeros((rounds, nfolds, 2 * nodes), dtype=torch.int32, device=device)
+        I = torch.zeros((rounds, nfolds,     nodes), dtype=torch.int16, device=device)
 
         # -------- optional validation --------
         use_val = (Xv is not None) and (Yv is not None)
@@ -163,6 +163,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             self.cut(self.Fsch_u16, FST, H, H0[:, : H.size(1), :].contiguous(), V, I,
                     tree_set=t, L2=L2, lr=lr_per_fold,
                     qgrad_bits=qgrad_bits, max_depth=D)
+            #print(V, I)
 
             # (f) advance + predict
             self.advance_and_predict(P, XB, L_old, L_new, V, I, tree_set=t)
@@ -518,11 +519,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 int(qgrad_bits), int(max_depth),
             )
             return V, I
-
-        # ---------------- CPU fallback (vectorized, mirrors kernel tie rules) ----------------
-        assert F.dtype   == torch.uint16 and FST.dtype == torch.uint8
-        assert H.dtype   == torch.int64 and H0.dtype  == torch.int64
-        assert V.dtype   == torch.int32 and I.dtype   == torch.int16
 
         device = H.device
         K1, nodes = H.shape[0], H.shape[1]
