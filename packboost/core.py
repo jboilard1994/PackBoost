@@ -413,7 +413,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                             tree_set: int):
         """
         Advance paths for depths= min(tree_set+1, Dm+1) and accumulate predictions into P.
-        GPU: CUDA kernel (launcher infers stride). CPU: vectorized equivalent.
+        GPU: CUDA kernel (launcher infers stride). CPU: vectorized equivalent for testing.
         """
         use_cuda = (P.is_cuda or X.is_cuda or L_old.is_cuda or L_new.is_cuda or V.is_cuda or I.is_cuda)
         K0, Dm, N = L_old.shape
