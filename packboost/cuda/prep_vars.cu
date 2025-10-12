@@ -45,7 +45,7 @@ __global__ void _prep_vars(
         LE[(long long)k * (long long)N + j] = v;
       }
   
-      int32_t g32 = (Y[j] - P[j]) >> 20; //31 - qgrad_mbits
+      int32_t g32 = (Y[j] - P[j]) >> 20; //32 - qgrad_mbits
       G[j] = sat_i16_by_mbits(g32);
     }
 }

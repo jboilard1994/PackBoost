@@ -307,7 +307,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         L_bits = (L & 1).to(le_dtype)
         LE = (L_bits * weights.view(1, max_depth, 1)).sum(dim=1, dtype=le_dtype)
 
-        g = (Y.to(torch.int32) - P.to(torch.int32)) >> 19
+        g = (Y.to(torch.int32) - P.to(torch.int32)) >> 20
         G = g.clamp_(-32767, 32767).to(torch.int16)
 
         return LE.contiguous().to(dtype=dtype), G.contiguous()
