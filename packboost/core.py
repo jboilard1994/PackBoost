@@ -25,25 +25,16 @@ class PackBoost(BaseEstimator, RegressorMixin):
             *,
             lr: float = 0.07,
             L2: float = 100_000.0,
-            nfeatsets: int = 32,     # 16*2 from your example
+            nfeatsets: int = 32,
             qgrad_bits: int = 12,
             seed: int = 0):
-        """
-        1) encode_cuts(X)
-        2) generate Fsch (uint16) and FST (uint8) like your ExtraFast snippet
-        3) run boosting for `rounds`, updating tree_set each round
 
-        Stores:
-        - self.V [rounds, nfolds, 2*nodes], self.I [rounds, nfolds, nodes]
-        - self.Fsch, self.FST
-        - self.P_ (train preds, padded), self.Y_i32 (Q30), self.train_N
-        - self.Pv_, self.Yv_i32, self.val_N  (if validation)
-        """
         assert X.dtype == np.int8 and y.dtype == np.float32
-        device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
+        dev = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
+        use_cuda = (dev.type == "cuda")
         callbacks = [] if callbacks is None else callbacks
 
-        # -------- metadata --------
+        # ---- meta ----
         self.nfeatsets = int(nfeatsets)
         self.nfolds    = int(nfolds)
         self.max_depth = int(max_depth)
@@ -53,117 +44,120 @@ class PackBoost(BaseEstimator, RegressorMixin):
         lanes  = 32
         leaf_dtype = (torch.uint8 if D <= 8 else torch.int16)
 
-        # -------- 1) encode_cuts(X) --------
+        # ---- 1) encode_cuts on GPU ----
         N, F = X.shape
         self.train_N = int(N)
 
-        X_t = torch.from_numpy(X).to(device=device, dtype=torch.int8)
-        XB  = self.encode_cuts(X_t).contiguous()         # [4F, M] uint32
+        X_t  = torch.from_numpy(X).to(dev, dtype=torch.int8)
+        XB   = self.encode_cuts(X_t).contiguous()                 # [4F, M] uint32 (GPU if available)
         bF, M = XB.shape
-        Np = 32 * M                                      # padded length
+        Np = 32 * M
 
-        # Q30 targets (padded) and preds buffer
+        # targets/preds (Q30 int32)
         yq30  = (y * (1 << 30)).astype(np.int64)
-        Y_i32 = torch.zeros(Np, dtype=torch.int32, device=device)
-        Y_i32[:N] = torch.from_numpy(yq30[:N].astype(np.int32)).to(device=device)
-        P = torch.zeros(Np, dtype=torch.int32, device=device)
+        Y_i32 = torch.zeros(Np, dtype=torch.int32, device=dev)
+        Y_i32[:N] = torch.from_numpy(yq30[:N].astype(np.int32)).to(device=dev)
+        P = torch.zeros(Np, dtype=torch.int32, device=dev)
 
-        # stash for callbacks
+        # expose for callbacks
         self.Y_i32 = Y_i32
         self.P_    = P
-        # legacy aliases (some callbacks expect these names)
-        self.dY    = Y_i32
+        self.dY    = Y_i32   # legacy aliases for older callbacks
         self.dP    = P
 
-        # leaf buffers
-        L_old = torch.zeros((nfolds, Dm, Np), dtype=leaf_dtype, device=device)
+        # path buffers
+        L_old = torch.zeros((nfolds, Dm, Np), dtype=leaf_dtype, device=dev)
         L_new = torch.zeros_like(L_old)
 
-        # -------- 2) schedules like your snippet --------
+        # ---- 2) schedules (like your snippet) ----
         rng = np.random.RandomState(seed)
-
-        # Fsch: [rounds, 32*nfeatsets] uint16 indices into XB rows
         if bF >= (1 << 16):
-            raise ValueError(f"encode_cuts produced {bF} bitplanes (4*F). "
-                            f"Current schedule dtype is uint16; please reduce F or extend to uint32 schedules.")
-        Fsch_cpu = torch.from_numpy(
+            raise ValueError(f"encode_cuts produced {bF} bitplanes; uint16 schedule would overflow.")
+        # Keep two dtypes: uint16 (GPU gather) and int16 (for cut kernel)
+        Fsch_u16 = torch.from_numpy(
             rng.randint(0, bF, size=(rounds, lanes * nfeatsets), dtype=np.uint16)
-        ).contiguous()                                       # keep CPU copy for fast et_sample_1b CPU path (if needed)
-        Fsch_dev_i16 = Fsch_cpu.to(device=device, dtype=torch.int16)  # for cut() which expects int16 storage
+        ).to(device=dev, dtype=torch.uint16).contiguous()
+        Fsch_i16 = Fsch_u16.to(torch.int16)  # reinterpret storage for cut()
 
-        # FST: [rounds, nfeatsets, D] uint8; depth-wise shuffled tiling of [0..nfolds-1]
-        base = torch.arange(nfolds, dtype=torch.uint8, device=device)
+        base = torch.arange(nfolds, dtype=torch.uint8, device=dev)
         rep  = (nfeatsets + nfolds - 1) // nfolds
-        row  = base.repeat(rep)[:nfeatsets]                  # [nfeatsets]
-        FST  = torch.empty((rounds, nfeatsets, D), dtype=torch.uint8, device=device)
+        row  = base.repeat(rep)[:nfeatsets]
+        FST  = torch.empty((rounds, nfeatsets, D), dtype=torch.uint8, device=dev)
         for s in range(rounds):
             for d in range(D):
-                perm = torch.randperm(nfeatsets, device=device)
-                FST[s, :, d] = row[perm]
+                FST[s, :, d] = row[torch.randperm(nfeatsets, device=dev)]
 
-        # -------- outputs --------
-        V = torch.empty((rounds, nfolds, 2 * nodes), dtype=torch.int32, device=device)
-        I = torch.empty((rounds, nfolds,     nodes), dtype=torch.int16, device=device)
+        # outputs
+        V = torch.empty((rounds, nfolds, 2 * nodes), dtype=torch.int32, device=dev)
+        I = torch.empty((rounds, nfolds,     nodes), dtype=torch.int16, device=dev)
 
-        # -------- optional validation --------
+        # ---- preallocate reusable scratch on device ----
+        XS = torch.empty((nfeatsets, 32 * M), dtype=torch.uint32, device=dev)
+        if   Dm > 8:  le_dtype = torch.uint64
+        elif Dm > 6:  le_dtype = torch.uint32
+        else:         le_dtype = torch.uint16
+        LE = torch.empty((nfolds,     Np), dtype=le_dtype, device=dev)
+        LF = torch.empty((nfeatsets,  Np), dtype=le_dtype, device=dev)
+
+        # ---- optional validation (GPU) ----
         use_val = (Xv is not None) and (Yv is not None)
         if use_val:
             assert Xv.dtype == np.int8 and Yv.dtype == np.float32
             Nv = int(Xv.shape[0])
             self.val_N = Nv
 
-            Xv_t = torch.from_numpy(Xv).to(device=device, dtype=torch.int8)
+            Xv_t = torch.from_numpy(Xv).to(dev, dtype=torch.int8)
             XBv  = self.encode_cuts(Xv_t).contiguous()
             Mv   = XBv.shape[1]
             Nvp  = 32 * Mv
 
-            Pv = torch.zeros(Nvp, dtype=torch.int32, device=device)
+            Pv = torch.zeros(Nvp, dtype=torch.int32, device=dev)
             yvq30 = (Yv * (1 << 30)).astype(np.int64)
-            Yv_i32 = torch.zeros(Nvp, dtype=torch.int32, device=device)
-            Yv_i32[:Nv] = torch.from_numpy(yvq30[:Nv].astype(np.int32)).to(device=device)
+            Yv_i32 = torch.zeros(Nvp, dtype=torch.int32, device=dev)
+            Yv_i32[:Nv] = torch.from_numpy(yvq30[:Nv].astype(np.int32)).to(device=dev)
 
-            # stash for callbacks
             self.Pv_    = Pv
             self.Yv_i32 = Yv_i32
-            self.Yv     = torch.from_numpy(Yv).to(device=device)
+            self.Yv     = torch.from_numpy(Yv).to(device=dev)
 
-            Lv  = torch.zeros((nfolds, Dm, Nvp), dtype=leaf_dtype, device=device)
+            Lv  = torch.zeros((nfolds, Dm, Nvp), dtype=leaf_dtype, device=dev)
             Lvn = torch.zeros_like(Lv)
         else:
             XBv = Pv = Yv_i32 = Lv = Lvn = None
 
-        # -------- 3) boosting loop --------
+        # ---- 3) boosting loop (all GPU gathers) ----
         lr_per_fold = lr / float(nfolds)
         self.tree_set = 0
 
         for t in range(rounds):
-            # (a) sample features -> XS [nfeatsets, 32*M] uint32
-            #    Fast path: GPU (XB on device) – your kernel creates XS directly on device.
-            #    Fallback: if XB were on CPU, we’d use the CPU path with Fsch_cpu.
-            if XB.is_cuda and torch.cuda.is_available():
-                XS = self.et_sample_1b(XB, Fsch_dev_i16.to(torch.uint16), t).contiguous()
-            else:
-                XS = self.et_sample_1b(XB, Fsch_cpu, t).to(device)    # move to device for H()
+            # (a) GPU feature sampling -> XS (reuse XS buffer)
+            #    We call the kernel directly into the preallocated XS to avoid per-iter allocs.
+            #    kernels.et_sample_1b(XB, XS, Fsch_u16, t) writes into XS in-place.
+            kernels.et_sample_1b(XB.contiguous(), XS.contiguous(), Fsch_u16.contiguous(), int(t))
 
-            # (b) prep packed paths and gradients
-            LE, G = self.prep_vars(L_old, Y_i32, P)                   # LE: u16/u32/u64; G: int16
+            # (b) prep_vars
+            LE_t, G = self.prep_vars(L_old, Y_i32, P)   # returns new tensors
+            LE.copy_(LE_t)                               # reuse prealloc
+            del LE_t
 
-            # (c) repack trees for features (device)
-            LF = self.repack(FST, LE, t).contiguous()                 # [nfeatsets, Np]
+            # (c) repack
+            LF_t = self.repack(FST, LE, t)
+            LF.copy_(LF_t)
+            del LF_t
 
             # (d) histograms
-            H  = self.H (XS, G, LF, D).contiguous()                   # [nfeatsets, nodes, 2, 32] int64
-            H0 = self.h0(G, LE, D).contiguous()                       # [nfolds, 2^D, 2] int64
-            H0i = H0[:, :nodes, :].contiguous()                       # drop leaf plane
+            H  = self.H (XS, G, LF, D).contiguous()
+            H0 = self.h0(G, LE, D).contiguous()
+            H0i = H0[:, :nodes, :].contiguous()
 
-            # (e) choose best cuts (writes into V/I for round t)
-            self.cut(Fsch_dev_i16, FST, H, H0i, V, I,
+            # (e) cut (uses int16 schedule view)
+            self.cut(Fsch_i16, FST, H, H0i, V, I,
                     tree_set=t, L2=L2, lr=lr_per_fold,
                     qgrad_bits=qgrad_bits, max_depth=D)
 
             # (f) advance + predict
             self.advance_and_predict(P, XB, L_old, L_new, V, I, tree_set=t)
-            L_old, L_new = L_new, L_old   # ping-pong
+            L_old, L_new = L_new, L_old
 
             # (g) validation forward (optional)
             if use_val:
@@ -179,19 +173,20 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
             self.tree_set = t + 1
 
-            # free big temporaries ASAP
-            del XS, LE, G, LF, H, H0, H0i
-            if device.type == "cuda" and (t % 256 == 255):
+            # free small temps promptly
+            del H, H0, H0i, G
+            if use_cuda and (t % 256 == 255):
                 torch.cuda.empty_cache()
 
-        # -------- stash artifacts for inference --------
-        self.Fsch = Fsch_dev_i16            # int16 storage, device
-        self.FST  = FST                     # uint8, device
+        # ---- stash for inference ----
+        self.Fsch = Fsch_i16           # int16 storage for cut
+        self.FST  = FST
         self.V    = V
         self.I    = I
-        self.X_packed_ = XB                 # keep packed train X if you want quick train scoring
+        self.X_packed_ = XB            # (optionally keep for quick train-score)
 
         return self
+
 
 
     def predict(self, X):
