@@ -38,7 +38,6 @@ __global__ void _encode_cuts(
 
         // 1) Load a 32x32 tile into shared with rotated column index (k+wi)%32
         //    Source: X[f, 32*k + i_in] if in range, else 0
-        #pragma unroll
         for (int k = 0; k < 32; ++k) {
             const int col = 32*k + i_in;
             uint32_t v = 0u;
@@ -51,7 +50,6 @@ __global__ void _encode_cuts(
         __syncwarp();
 
         // 2) Read back rotated to realize the 32x32 transpose logic
-        #pragma unroll
         for (int k = 0; k < 32; ++k) {
             const uint32_t v = sm[k][(k + wi) & 31];
             v0 |= ((v > 0u) ? 1u : 0u) << k;

@@ -76,7 +76,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         self.dP    = P
 
         # leaf buffers
-        L_old = torch.zeros((nfolds, Dm, Np), dtype=leaf_dtype, device=device)
+        L_old = torch.zeros((nfolds, Dm, N), dtype=leaf_dtype, device=device)
         L_new = torch.zeros_like(L_old)
 
         # -------- 2) schedules like your snippet --------
@@ -160,7 +160,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             H0 = self.h0(G, LE, D).contiguous()                       # [nfolds, 2^D, 2] int64
 
             # (e) choose best cuts (writes into V/I for round t)
-            self.cut(self.Fsch_u16, FST, H, H0, V, I,
+            self.cut(self.Fsch_u16, FST, H, H0[:, : H.size(1), :].contiguous(), V, I,
                     tree_set=t, L2=L2, lr=lr_per_fold,
                     qgrad_bits=qgrad_bits, max_depth=D)
 
@@ -290,30 +290,28 @@ class PackBoost(BaseEstimator, RegressorMixin):
             return kernels.prep_vars(L.contiguous(), Y.contiguous(), P.contiguous())
 
         K, Dm, N = L.shape
-        max_depth = Dm
+        max_depth = Dm + 1      # align with CUDA’s notion
 
-        if   max_depth > 8:
-            le_dtype = torch.int64
-            dtype = torch.uint64
+        if max_depth > 8:
+            le_dtype, out_dtype = torch.int64, torch.uint64
         elif max_depth > 6:
-            le_dtype = torch.int32
-            dtype = torch.uint32
+            le_dtype, out_dtype = torch.int32, torch.uint32
         else:
-            le_dtype = torch.int16
-            dtype = torch.uint16
+            le_dtype, out_dtype = torch.int16, torch.uint16
 
         device = L.device
-        d = torch.arange(1, max_depth+1, device=device)
-        offsets = (d * (d - 1)) // 2                      # [Dm], int64
-        weights = (torch.ones_like(offsets, dtype=le_dtype) << offsets)  # [Dm] le_dtype
+        offsets = (torch.arange(1, max_depth, device=device, dtype=torch.int64) *
+                torch.arange(0, max_depth - 1, device=device, dtype=torch.int64)) // 2
+        weights = (torch.ones_like(offsets, dtype=torch.int64) << offsets)
 
-        L_bits = L.to(le_dtype)
-        LE = (L_bits * weights.view(1, max_depth, 1)).sum(dim=1, dtype=le_dtype)
+        L_bits = L.to(torch.int64)
+        LE = (L_bits * weights.view(1, -1, 1)).sum(dim=1, dtype=torch.int64)
+        LE = LE.to(out_dtype)
 
         g = (Y.to(torch.int32) - P.to(torch.int32)) >> 20
         G = g.clamp_(-32767, 32767).to(torch.int16)
 
-        return LE.contiguous().to(dtype=dtype), G.contiguous()
+        return LE.contiguous().to(dtype=out_dtype), G.contiguous()
 
 
     def h0(self, G: torch.Tensor, LE: torch.Tensor, max_depth: int) -> torch.Tensor:
