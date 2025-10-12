@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <cstdint>
 #include <ATen/cuda/CUDAContext.h>
+#include <math.h>          // <- add this
 
 constexpr int WARP_SIZE = 32;
 constexpr unsigned FULL_MASK = 0xFFFFFFFFu;
@@ -53,10 +54,10 @@ extern "C" __global__ void cut_cuda_kernel(
     n01s[k] = static_cast<float>(H0[base + 1]);
   }
 
-  const float L2_eff = L2 * __exp2f(5.0f - (float)depth);
+  const float L2_eff = L2 * ldexpf(1.0f, 5 - depth);
   const int shift = 31 - qgrad_bits;
   const float pow2 = (float)(1u << shift);
-  const float depth_scale = __exp2f(-(float)(max_depth - depth));
+  const float depth_scale = ldexpf(1.0f, -(max_depth - depth));
   const float qscale = lr * pow2 * depth_scale;
 
   for (int k = 0; k < K1; ++k) {
