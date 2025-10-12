@@ -1,8 +1,8 @@
-// cut_cuda.cu (H, H0 now use int64_t)
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <cstdint>
+#include <ATen/cuda/CUDAContext.h>
 
 constexpr int WARP_SIZE = 32;
 constexpr unsigned FULL_MASK = 0xFFFFFFFFu;
@@ -138,7 +138,9 @@ void cut_cuda_launcher(
   const dim3 grid(nodes, 1, 1);
   const dim3 block(WARP_SIZE, 1, 1);
 
-  cut_cuda_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  cut_cuda_kernel<<<grid, block, 0, stream.stream()>>>(
       reinterpret_cast<const uint16_t*>(F.data_ptr<int16_t>()),
       FST.data_ptr<uint8_t>(),
       H.data_ptr<int64_t>(),
