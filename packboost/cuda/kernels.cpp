@@ -84,7 +84,7 @@ static void launch_advpred(
 void advance_and_predict_launcher(
     torch::Tensor P, torch::Tensor X, torch::Tensor L_old, torch::Tensor L_new,
     torch::Tensor V, torch::Tensor I,
-    int tree_set, int depths);
+    int tree_set);
 
 namespace {
 
