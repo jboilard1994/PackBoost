@@ -170,6 +170,57 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
         return self
 
+    def predict(self, X):
+        """
+        Predict with the currently trained model.
+
+        X : np.ndarray[int8] or torch.Tensor[int8] of shape [N, F]
+            Raw discrete features (0..4 expected per your pipeline).
+        Returns:
+            np.ndarray[int32] if X is numpy, else torch.Tensor[int32] (length N).
+        """
+        # --- device & inputs ---
+        device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
+        if isinstance(X, np.ndarray):
+            assert X.dtype == np.int8, "X must be int8"
+            X_t = torch.from_numpy(X).to(device=device, dtype=torch.int8)
+            return_numpy = True
+        else:
+            # torch path
+            assert torch.is_tensor(X) and X.dtype == torch.int8, "X must be torch.int8"
+            X_t = X.to(device=device, dtype=torch.int8, copy=False)
+            return_numpy = False
+
+        N = X_t.shape[0]
+        # guardrails
+        assert hasattr(self, "V") and hasattr(self, "I"), "Model not fitted: missing V/I"
+        assert hasattr(self, "tree_set") and self.tree_set > 0, "Model has no trees"
+
+        # --- 1) encode cuts -> packed uint32 words [4F, M] ---
+        XB = self.encode_cuts(X_t).contiguous()           # [4F, M] uint32
+        M  = XB.shape[1]
+        Np = 32 * M                                       # padded length
+
+        # --- 2) buffers ---
+        P  = torch.zeros(Np, dtype=torch.int32, device=device)
+        D  = int(self.max_depth)
+        Dm = max(D - 1, 0)
+        leaf_dtype = (torch.uint8 if D <= 8 else torch.int16)
+        L  = torch.zeros((self.nfolds, Dm, Np), dtype=leaf_dtype, device=device)
+        Ln = torch.zeros_like(L)
+
+        # --- 3) walk trees round-by-round ---
+        for k in range(int(self.tree_set)):
+            self.advance_and_predict(P, XB, L, Ln, self.V, self.I, tree_set=k)
+            L, Ln = Ln, L  # ping-pong
+
+        # --- 4) trim padding & return ---
+        out = P[:N]
+        if return_numpy:
+            return out.detach().cpu().numpy()
+        return out
+
+
     
     def encode_cuts(self, X: torch.Tensor) -> torch.Tensor:
         # X: [N, F], int8 expected
