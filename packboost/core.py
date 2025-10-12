@@ -16,6 +16,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
     def fit(self, X, y, Xv=None, Yv=None, nfolds=8, rounds=10_000, max_depth=7,
             callbacks=None, *, lr=0.07, L2=100_000.0, nfeatsets=32, qgrad_bits=12, seed=0):
         # ... existing preamble ...
+        device = self.device
         self.nfeatsets = int(nfeatsets)
         self.max_depth = int(max_depth)
         self.nfolds    = int(nfolds)
