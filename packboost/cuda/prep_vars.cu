@@ -37,9 +37,11 @@ __global__ void _prep_vars(
   
         #pragma unroll
         for (int d = 1; d < max_depth; ++d) {
-          unsigned bit = (unsigned)(L[( (long long)k * (max_depth -1) + (d - 1) ) * (long long)N + j] & 1u);
-          v |= (T)((T)bit << off);
-          off += d;
+          // NEW: pack the full d-bit code (0 .. 2^d-1)
+            unsigned code = (unsigned)L[ ((long long)k * (max_depth - 1) + (d - 1)) * (long long)N + j ];
+            v |= (T)((T)code << off);
+            off += d;
+
         }
   
         LE[(long long)k * (long long)N + j] = v;
