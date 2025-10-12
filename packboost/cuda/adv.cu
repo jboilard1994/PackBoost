@@ -1,8 +1,9 @@
-// packboost/cuda/advance_and_predict.cu
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <cstdint>
+#include <ATen/cuda/CUDAContext.h>
+#include <math.h>          // <- add this
 
 constexpr int WARP_SIZE = 32;
 
