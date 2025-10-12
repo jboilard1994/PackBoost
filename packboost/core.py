@@ -401,3 +401,66 @@ class PackBoost(BaseEstimator, RegressorMixin):
             I_ts[f, nodes_ar] = F_row.index_select(0, feat_pos).to(torch.int16)
 
         return V, I
+
+    def advance_and_predict(self,
+                            P: torch.Tensor,     # [N], int32 (in/out)
+                            X: torch.Tensor,     # [R, M], uint32/int32
+                            L_old: torch.Tensor, # [K0, Dm, N], uint8/uint16
+                            L_new: torch.Tensor, # [K0, Dm, N], same dtype
+                            V: torch.Tensor,     # [rounds, K0, 2*nodes], int32
+                            I: torch.Tensor,     # [rounds, K0, nodes], int16 (uint16 payload)
+                            tree_set: int):
+        """
+        Advance paths for depths= min(tree_set+1, Dm+1) and accumulate predictions into P.
+        GPU: CUDA kernel (launcher infers stride). CPU: vectorized equivalent.
+        """
+        use_cuda = (P.is_cuda or X.is_cuda or L_old.is_cuda or L_new.is_cuda or V.is_cuda or I.is_cuda)
+        K0, Dm, N = L_old.shape
+        nodes = I.shape[2]
+        depths = min(tree_set + 1, Dm + 1)
+
+        if use_cuda and torch.cuda.is_available():
+            from packboost.cuda import kernels
+            kernels.advance_and_predict(
+                P.contiguous(), X.contiguous(),
+                L_old.contiguous(), L_new.contiguous(),
+                V.contiguous(), I.contiguous(),
+                int(tree_set)
+            )
+            return P, L_new
+
+        # -------- CPU vectorized path --------
+        assert P.dtype == torch.int32 and X.dtype in (torch.int32, torch.uint32)
+        assert I.dtype == torch.int16 and V.dtype == torch.int32
+        device = P.device
+
+        k = torch.arange(N, device=device, dtype=torch.long)
+        word_idx = (k >> 5)
+        bit_off  = (k & 31).to(torch.int64)
+
+        for depth in range(depths):
+            for f in range(K0):
+                if depth == 0:
+                    leaf_prev = torch.zeros(N, dtype=torch.int64, device=device)
+                else:
+                    leaf_prev = L_old[f, depth - 1].to(torch.int64)
+
+                lo = leaf_prev + ((1 << depth) - 1)
+
+                li = (I[tree_set, f].gather(0, lo.to(torch.long)).to(torch.int64) & 0xFFFF)
+                words = X[li, word_idx]
+                x = ((words >> bit_off) & 1).to(torch.int64)
+
+                leaf_new = (leaf_prev << 1) + x
+                if depth < Dm:
+                    if L_new.dtype == torch.uint8:
+                        L_new[f, depth] = leaf_new.to(torch.uint8)
+                    elif L_new.dtype == torch.int16:
+                        L_new[f, depth] = leaf_new.to(torch.int16)
+                    else:
+                        raise AssertionError("L_new must be uint8 or int16")
+
+                add_idx = (2 * lo + 1 + x).to(torch.long)
+                P.add_(V[tree_set, f].gather(0, add_idx))
+
+        return P, L_new

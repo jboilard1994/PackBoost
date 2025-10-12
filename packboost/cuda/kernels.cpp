@@ -71,6 +71,12 @@ void cut_cuda_launcher(
     torch::Tensor I,      // int16 (stores uint16)
     int tree_set, double L2, double lr, int qgrad_bits, int max_depth);
 
+
+void advance_and_predict_launcher(
+    torch::Tensor P, torch::Tensor X, torch::Tensor L_old, torch::Tensor L_new,
+    torch::Tensor V, torch::Tensor I,
+    int tree_set, int depths);
+    
 namespace {
 
 torch::Tensor encode_cuts_binding(torch::Tensor X) {
@@ -133,6 +139,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("h_sm", &h_sm, "PackBoost H (unweighted histogram, Murky parity; returns H)");
     m.def("cut_cuda", &cut_cuda_launcher, "PackBoost cut_cuda (CUDA)");
+    m.def("advance_and_predict", &advance_and_predict_launcher,
+        "PackBoost advance_and_predict (CUDA)");
 
 
 }

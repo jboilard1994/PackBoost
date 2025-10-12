@@ -331,3 +331,61 @@ def test_cut_matches_cpu_reference():
 
         torch.testing.assert_close(V_gpu.cpu(), V_cpu, rtol=0, atol=0)
         torch.testing.assert_close(I_gpu.cpu(), I_cpu, rtol=0, atol=0)
+
+def test_advance_and_predict_matches_cpu_reference():
+    import pytest, torch
+    from packboost.core import PackBoost
+    pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+
+    torch.manual_seed(2025)
+
+    cases = [
+        (1, 3,  1,         4096, 2),
+        (4, 5,  33,        8192, 3),
+        (8, 8,  32*256+7,  65536, 3),
+    ]
+
+    for K0, D, N, R, rounds in cases:
+        nodes = (1 << D) - 1
+        Dm = D - 1
+        M = (N + 31) // 32
+
+        L_dtype = (torch.uint8 if D <= 8 else torch.int16)
+
+        P_cpu = torch.zeros(N, dtype=torch.int32)
+        P_gpu = P_cpu.cuda()
+
+        X_cpu = torch.randint(0, 2**32, (R, M), dtype=torch.int64).to(torch.int32)
+        X_gpu = X_cpu.cuda()
+
+        L_old_cpu = torch.zeros((K0, Dm, N), dtype=L_dtype)
+        L_new_cpu = torch.zeros_like(L_old_cpu)
+        L_old_gpu = L_old_cpu.cuda()
+        L_new_gpu = L_new_cpu.cuda()
+
+        V_cpu = torch.randint(-(1<<15), 1<<15, (rounds, K0, 2*nodes), dtype=torch.int32)
+        V_gpu = V_cpu.cuda()
+
+        I_vals = torch.randint(0, R, (rounds, K0, nodes), dtype=torch.int32) & 0xFFFF
+        I_cpu  = I_vals.to(torch.int16)
+        I_gpu  = I_cpu.cuda()
+
+        tree_set = min(1, rounds - 1)
+
+        pack_cpu = PackBoost(device="cpu")
+        pack_gpu = PackBoost(device="cuda")
+
+        P_ref, Ln_ref = pack_cpu.advance_and_predict(
+            P_cpu.clone(), X_cpu, L_old_cpu.clone(), L_new_cpu.clone(),
+            V_cpu, I_cpu, tree_set
+        )
+
+        P_out, Ln_out = pack_gpu.advance_and_predict(
+            P_gpu.clone(), X_gpu, L_old_gpu.clone(), L_new_gpu.clone(),
+            V_gpu, I_gpu, tree_set
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(P_out.cpu(), P_ref, rtol=0, atol=0)
+        torch.testing.assert_close(Ln_out.cpu(), Ln_ref, rtol=0, atol=0)
+
