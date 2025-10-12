@@ -17,6 +17,7 @@ def _load_extension() -> ModuleType:
         str(src_dir / "prep_vars.cu"),
         str(src_dir / "h0.cu"),
         str(src_dir / "h.cu"),
+        str(src_dir / "cut.cu"),
         str(src_dir / "repack.cu"),
     ]
     return load(
