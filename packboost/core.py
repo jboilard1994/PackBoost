@@ -62,6 +62,9 @@ class PackBoost(BaseEstimator, RegressorMixin):
         bF, M = XB.shape
         Np = 32 * M                                      # padded length
 
+        del X_t
+        torch.cuda.empty_cache()
+
         # Q30 targets (padded) and preds buffer
         yq30  = (y * (1 << 30)).astype(np.int64)
         Y_i32 = torch.zeros(Np, dtype=torch.int32, device=device)
@@ -91,7 +94,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         ).contiguous()                                       # keep CPU copy for fast et_sample_1b CPU path (if needed)
         # in fit(), right after you build Fsch_cpu (np.uint16)
         self.Fsch_u16 = Fsch_cpu.to(device=device, dtype=torch.uint16).contiguous()
-        self.Fsch_i16 = self.Fsch_u16.view(torch.int16).contiguous()  # same storage, different dtype view
+        #self.Fsch_i16 = self.Fsch_u16.view(torch.int16).contiguous()  # same storage, different dtype view
 
         # FST: [rounds, nfeatsets, D] uint8; depth-wise shuffled tiling of [0..nfolds-1]
         base = torch.arange(nfolds, dtype=torch.uint8, device=device)
@@ -133,6 +136,9 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
             Lv  = torch.zeros((nfolds, Dm, Nvp), dtype=leaf_dtype, device=device)
             Lvn = torch.zeros_like(Lv)
+
+            del Xv_t
+            torch.cuda.empty_cache()
         else:
             XBv = Pv = Yv_i32 = Lv = Lvn = None
 
@@ -189,7 +195,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 torch.cuda.empty_cache()
 
         # -------- stash artifacts for inference --------
-        self.Fsch = self.Fsch_i16            # int16 storage, device
+        self.Fsch = self.Fsch_u16            # int16 storage, device
         self.FST  = FST                     # uint8, device
         self.V    = V
         self.I    = I
@@ -236,6 +242,9 @@ class PackBoost(BaseEstimator, RegressorMixin):
         leaf_dtype = (torch.uint8 if D <= 8 else torch.int16)
         L  = torch.zeros((self.nfolds, Dm, Np), dtype=leaf_dtype, device=device)
         Ln = torch.zeros_like(L)
+
+        del X_t
+        torch.cuda.empty_cache()
 
         # --- 3) walk trees round-by-round ---
         for k in range(int(self.tree_set)):
