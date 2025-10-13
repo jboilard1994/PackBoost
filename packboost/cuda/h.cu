@@ -215,6 +215,17 @@ static inline void infer_grid_stride(
   blocks_per_feat_out = blocks_per_feat;
   stride_out = stride;
 }
+
+static inline int choose_warps_that_fit(size_t smem_high, size_t smem_cap) {
+  int wpb = 16;                        // try aggressive
+  while (wpb > 1) {
+    size_t smem_low = (size_t)wpb * 7 * 32 * sizeof(unsigned long long);
+    if (smem_high + smem_low <= smem_cap) break;
+    wpb >>= 1;                          // 16→8→4→2→1
+  }
+  return (wpb < 1) ? 1 : wpb;
+}
+
 // API: returns H tensor; creates it inside like your h0_sm
 // XS: [nfeatsets, N] (torch.uint32)
 // Y : [N] (torch.int16)
@@ -234,20 +245,23 @@ torch::Tensor h_sm(
   auto opts = XS.options().dtype(torch::kLong).memory_format(c10::MemoryFormat::Contiguous);
   auto H = torch::zeros({XS.size(0), nodes_tot, 2, 32}, opts);
   // Infer launch params (Murky defaults)
-  const int warps_per_block = infer_hist_warps_per_block(max_depth);
+  int n_ge3 = std::max((1 << max_depth) - 8, 1);
+  size_t smem_high = (size_t)n_ge3 * 2 * 32 * sizeof(int);
+  auto* prop = at::cuda::getCurrentDeviceProperties();
+  size_t smem_cap = prop->sharedMemPerBlockOptin ? (size_t)prop->sharedMemPerBlockOptin
+                                                 : (size_t)prop->sharedMemPerBlock;
+  const int warps_per_block = choose_warps_that_fit(smem_high, smem_cap);
   int blocks_per_feat = 0, stride = 0;
   infer_grid_stride(nfeatsets, cols_32M, warps_per_block, blocks_per_feat, stride);
   dim3 grid(nfeatsets, blocks_per_feat, 1);
   dim3 block(warps_per_block * 32, 1, 1);
   // Dynamic shared memory for high depths: (2^D - 8, 2, 32) ints
-  int n_ge3 = std::max((1 << max_depth) - 8, 1);
-  size_t smem_high = static_cast<size_t>(n_ge3) * 2 * 32 * sizeof(int);
+  //int n_ge3 = std::max((1 << max_depth) - 8, 1);
+  //size_t smem_high = static_cast<size_t>(n_ge3) * 2 * 32 * sizeof(int);
   // Additional for low depths: (warps_per_block, 7, 32) unsigned long long (packed)
   size_t smem_low = static_cast<size_t>(warps_per_block) * 7 * 32 * sizeof(unsigned long long);
   size_t smem_bytes = smem_high + smem_low;
-  auto* prop = at::cuda::getCurrentDeviceProperties();
-  size_t smem_cap = prop->sharedMemPerBlockOptin ? (size_t)prop->sharedMemPerBlockOptin
-                                                 : (size_t)prop->sharedMemPerBlock;
+  
   TORCH_CHECK(smem_bytes <= smem_cap,
               "Required dynamic shared memory (", smem_bytes,
               ") exceeds device limit (", smem_cap, ")");

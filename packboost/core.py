@@ -27,7 +27,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             L2: float = 100_000.0,
             nfeatsets: int = 32,     # 16*2 from your example
             qgrad_bits: int = 12,
-            seed: int = 0):
+            seed: int = 42):
         """
         1) encode_cuts(X)
         2) generate Fsch (uint16) and FST (uint8) like your ExtraFast snippet
