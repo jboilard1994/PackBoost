@@ -36,7 +36,7 @@ __global__ void _prep_vars(
         
         #pragma unroll
         for (int d = 1; d < max_depth; ++d) {
-          unsigned bit = (unsigned)(L[( (long long)k * (max_depth -1) + (d - 1) ) * (long long)N + j]);
+          unsigned bit = (unsigned)(L[( (long long)k * (max_depth -1) + (d - 1) ) * (long long)N + j] & 1u);
           v |= ((uint64_t)bit << ((d*(d-1))/2));
         }
   

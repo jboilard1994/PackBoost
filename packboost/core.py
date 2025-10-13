@@ -305,7 +305,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 torch.arange(0, max_depth - 1, device=device, dtype=torch.int64)) // 2
         weights = (torch.ones_like(offsets, dtype=torch.int64) << offsets)
 
-        L_bits = L.to(torch.int64)
+        L_bits = (L & 1).to(torch.int64)
         LE = (L_bits * weights.view(1, -1, 1)).sum(dim=1, dtype=torch.int64)
         LE = LE.to(out_dtype)
 
