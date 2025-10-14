@@ -507,7 +507,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         return H
 
     def cut(self,
-            F:  torch.Tensor,   # [rounds, 32*K1]         int16 (uint16 storage)
+            F:  torch.Tensor,   # [rounds, 32*K1]         uint16 (uint16 storage)
             FST:torch.Tensor,   # [rounds, K1, D]         uint8
             H:  torch.Tensor,   # [K1, nodes, 2, 32]      int64
             H0: torch.Tensor,   # [K0, nodes, 2]          int64
@@ -632,8 +632,9 @@ class PackBoost(BaseEstimator, RegressorMixin):
             V1_sel = (G01_sel - G0_sel) / ((N01_sel - N0_sel) + L2_sel)
 
             # Quantize to int32 (round like CUDA)
-            V_ts[f, 2 * nodes_ar]     = torch.round(qs_sel * V0_sel).to(torch.int32)
-            V_ts[f, 2 * nodes_ar + 1] = torch.round(qs_sel * V1_sel).to(torch.int32)
+            V_ts[f, 2*nodes_ar    ] = torch.trunc(qs_sel * V0_sel).to(torch.int32)
+            V_ts[f, 2*nodes_ar + 1] = torch.trunc(qs_sel * V1_sel).to(torch.int32)
+
 
             # Feature indices: I = F[tree_set, 32*k* + lane*] (stored int16 with uint16 payload)
             F_row = F[tree_set]  # [32*K1], int16 storage

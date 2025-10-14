@@ -85,8 +85,8 @@ extern "C" __global__ void cut_cuda_kernel(
 
     if (mxs[tree_fold] < S_bits) {
       mxs[tree_fold] = S_bits;
-      vls[tree_fold] = (int)roundf(qscale * V0f);
-      vrs[tree_fold] = (int)roundf(qscale * V1f);
+      vls[tree_fold] = __float2int_rz(qscale * V0f);
+      vrs[tree_fold] = __float2int_rz(qscale * V1f);
       fs [tree_fold] = (uint16_t)k;
     }
   }

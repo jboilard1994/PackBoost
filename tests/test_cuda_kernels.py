@@ -317,7 +317,7 @@ def test_cut_matches_cpu_reference():
                      tree_set=tree_set, L2=base_L2, lr=lr_eff,
                      qgrad_bits=qgrad_bits, max_depth=D)
 
-        F_gpu   = F.cuda()
+        F_gpu   = F.cuda().to(torch.uint16)
         FST_gpu = FST.cuda()
         H_gpu   = H_ref.cuda()
         H0_gpu  = H0_ref.cuda()
