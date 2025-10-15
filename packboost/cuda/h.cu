@@ -153,6 +153,7 @@ __global__ void _h_sm(
   for (int tmp = warps_per_block; tmp > 1; tmp >>= 1) ++log_wpb;
   // Butterfly reduction for low depths
   for (int s = 0; s < log_wpb; ++s) {
+    __syncthreads();
     const int ofs = 1 << s;
     if ((block_warp & ofs) == 0 && (block_warp + ofs) < warps_per_block) {
       for (int ndi = 0; ndi < low_nodes; ++ndi) {
