@@ -5,7 +5,7 @@
 #include <tuple>
 
 __device__ __forceinline__ int16_t sat_i16_by_mbits(int x){
-    const int lo = -((1<<15) - 1); // grad_mbits = 15
+    const int lo = -((1<<15)); // grad_mbits = 15
     const int hi =  ((1<<15) - 1);
     x = (x < lo) ? lo : x;
     x = (x > hi) ? hi : x;
@@ -36,14 +36,15 @@ __global__ void _prep_vars(
         
         #pragma unroll
         for (int d = 1; d < max_depth; ++d) {
-          unsigned bit = (unsigned)(L[( (long long)k * (max_depth -1) + (d - 1) ) * (long long)N + j]);
-          v |= ((uint64_t)bit << ((d*(d-1))/2));
+          unsigned bit = (unsigned)(L[((size_t)k * (size_t)(max_depth - 1) + (size_t)(d - 1)) * (size_t)N + (size_t)j]);
+          bit &= ((1u << d) - 1u);
+          v |= ((uint64_t)bit) << ((d*(d-1))/2);
         }
   
         LE[(long long)k * (long long)N + j] = (T)v;
       }
   
-      int32_t g32 = (Y[j] - P[j]) >> 20; //32 - qgrad_mbits
+      int32_t g32 = (int32_t)((long long)(((long long)Y[j] - (long long)P[j])) >> 20); //32 - qgrad_mbits
       G[j] = sat_i16_by_mbits(g32);
     }
 }

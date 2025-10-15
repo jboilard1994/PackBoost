@@ -300,28 +300,21 @@ class PackBoost(BaseEstimator, RegressorMixin):
             return kernels.prep_vars(L.contiguous(), Y.contiguous(), P.contiguous())
 
         K, Dm, N = L.shape
-        max_depth = Dm + 1      # align with CUDA’s notion
+        max_depth = Dm + 1
+        LE = torch.zeros((K, N), dtype=torch.int64, device=L.device)
 
-        if max_depth > 8:
-            le_dtype, out_dtype = torch.int64, torch.uint64
-        elif max_depth > 6:
-            le_dtype, out_dtype = torch.int32, torch.uint32
-        else:
-            le_dtype, out_dtype = torch.int16, torch.uint16
+        for d in range(1, max_depth):
+            off = (d*(d-1)) // 2
+            field = (L[:, d-1].to(torch.int64) & ((1 << d) - 1))
+            LE |= (field << off)
 
-        device = L.device
-        offsets = (torch.arange(1, max_depth, device=device, dtype=torch.int64) *
-                torch.arange(0, max_depth - 1, device=device, dtype=torch.int64)) // 2
-        weights = (torch.ones_like(offsets, dtype=torch.int64) << offsets)
-
-        L_bits = (L & 1).to(torch.int64)
-        LE = (L_bits * weights.view(1, -1, 1)).sum(dim=1, dtype=torch.int64)
+        out_dtype = torch.uint64 if Dm>8 else (torch.uint32 if Dm>6 else torch.uint16)
         LE = LE.to(out_dtype)
 
         g = (Y.to(torch.int32) - P.to(torch.int32)) >> 20
         G = g.clamp_(-32767, 32767).to(torch.int16)
 
-        return LE.contiguous().to(dtype=out_dtype), G.contiguous()
+        return LE.contiguous(), G.contiguous()
 
 
     def h0(self, G: torch.Tensor, LE: torch.Tensor, max_depth: int) -> torch.Tensor:

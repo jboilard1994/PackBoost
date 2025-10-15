@@ -151,7 +151,11 @@ def test_repack_matches_cpu_reference():
 
     for K, D, N, nfeatsets, nsets in cases:
         # Build LE via prep_vars to ensure Murky-identical bit packing
-        L = torch.randint(0, 4, (K, D - 1, N), dtype=torch.uint8)
+
+        L = torch.empty((K, D, N), dtype=torch.uint8)
+        for d in range(1, D+1):
+            L[:, d-1].random_(0, 1 << d)  # valid range: 0 .. (2^d - 1)
+
         Y = torch.zeros(N, dtype=torch.int32)
         P = torch.zeros(N, dtype=torch.int32)
         LE, _ = pack_cpu.prep_vars(L, Y, P)  # dtype auto: u16/u32/u64 based on D

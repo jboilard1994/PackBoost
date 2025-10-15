@@ -1,9 +1,8 @@
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
-#include <cstdint>
 #include <ATen/cuda/CUDAContext.h>
-#include <math.h>          // <- add this
+#include <math.h>
 
 constexpr int WARP_SIZE = 32;
 constexpr unsigned FULL_MASK = 0xFFFFFFFFu;
@@ -29,73 +28,73 @@ extern "C" __global__ void cut_cuda_kernel(
     // hyperparams
     float L2, float lr, int qgrad_bits, int max_depth)
 {
+  #pragma fp_contract(off)
+
   const int leaf = blockIdx.x;
   const int wi   = threadIdx.x;
   if (blockDim.x != WARP_SIZE || wi >= WARP_SIZE) return;
   if (leaf >= nodes) return;
-  if (tree_set < 0 || tree_set >= treesets) return;
+  if ((unsigned)tree_set >= (unsigned)treesets) return;
   if (K0 > CUTCUDA_MAX_FOLDS) return;
 
   const int depth = depth_from_leaf(leaf);
-  if (depth < 0 || depth >= D) return;
+  if ((unsigned)depth >= (unsigned)D) return;
 
-  int   mxs[CUTCUDA_MAX_FOLDS];
-  int   vls[CUTCUDA_MAX_FOLDS];
-  int   vrs[CUTCUDA_MAX_FOLDS];
-  uint16_t fs[CUTCUDA_MAX_FOLDS];
+  // ---- per-fold scratch
+  int       mxs[CUTCUDA_MAX_FOLDS];
+  int       vls[CUTCUDA_MAX_FOLDS];
+  int       vrs[CUTCUDA_MAX_FOLDS];
+  uint16_t  fs [CUTCUDA_MAX_FOLDS];
+  float     g01s[CUTCUDA_MAX_FOLDS];
+  float     n01s[CUTCUDA_MAX_FOLDS];
 
-  float g01s[CUTCUDA_MAX_FOLDS];
-  float n01s[CUTCUDA_MAX_FOLDS];
-
-  for (int k = 0; k < K0; ++k) {
-    mxs[k] = -100000000;
-    const size_t base = ((size_t)k * nodes + leaf) * 2u;
-    g01s[k] = static_cast<float>(H0[base + 0]);
-    n01s[k] = static_cast<float>(H0[base + 1]);
+  // sentinel init + fold totals
+  for (int f = 0; f < K0; ++f) {
+    mxs[f] = -100000000;              // negative -> smaller than any valid S_bits
+    vls[f] = 0;  vrs[f] = 0;  fs[f] = 0;
+    const size_t base = ((size_t)f * (size_t)nodes + (size_t)leaf) * 2u;
+    g01s[f] = (float)H0[base + 0];
+    n01s[f] = (float)H0[base + 1];
   }
 
-  const float L2_eff = L2 * ldexpf(1.0f, 5 - depth);
-  const int shift = 31 - qgrad_bits;
-  const float pow2 = (float)(1u << shift);
-  const float depth_scale = ldexpf(1.0f, -(max_depth - depth));
-  const float qscale = lr * pow2 * depth_scale;
+  // scalars (match CPU pow; stay in fp32)
+  const float L2_eff = L2 * powf(2.0f, 5.0f - (float)depth);
+  const float qscale = lr * (float)(1u << (31 - qgrad_bits))
+                       * powf(2.0f, -(float)(max_depth - depth));
 
+  // ---- per-candidate search (each lane keeps its own best per fold)
   for (int k = 0; k < K1; ++k) {
-    const size_t fst_idx = (((size_t)tree_set * K1) + k) * (size_t)D + depth;
+    const size_t fst_idx = (((size_t)tree_set * (size_t)K1) + (size_t)k) * (size_t)D + (size_t)depth;
     const int tree_fold = (int)FST[fst_idx];
-    if (tree_fold < 0 || tree_fold >= K0) continue;
+    if ((unsigned)tree_fold >= (unsigned)K0) continue;
 
-    const size_t h_base = ((((size_t)k * nodes) + leaf) * 2u) * 32u + wi;
-    const float G0 = static_cast<float>(H[h_base + 0 * 32u]);
-    const float N0 = static_cast<float>(H[h_base + 1 * 32u]);
+    const size_t h_base = ((((size_t)k * (size_t)nodes) + (size_t)leaf) * 2u) * 32u + (size_t)wi;
 
-    const float G01 = g01s[tree_fold];
-    const float N01 = n01s[tree_fold];
+    const float G0   = __ll2float_rn(H[h_base + 0 * 32u]);
+    const float N0   = __ll2float_rn(H[h_base + 1 * 32u]);
+    const float G1   = __fsub_rn(g01s[tree_fold], G0);
+    const float N1   = __fsub_rn(n01s[tree_fold], N0);
 
-    const float G1 = G01 - G0;
-    const float N1 = N01 - N0;
+    const float V0f  = __fdiv_rn(G0, __fadd_rn(N0, L2_eff));
+    const float V1f  = __fdiv_rn(G1, __fadd_rn(N1, L2_eff));
 
-    const float V0f = G0 / (N0 + L2_eff);
-    const float V1f = G1 / (N1 + L2_eff);
-
-    const float S0 = G0 * V0f;
-    const float S1 = G1 * V1f;
-
-    const int S_bits = __float_as_int(S0 + S1);
+    const float S0   = __fmul_rn(G0, V0f);
+    const float S1   = __fmul_rn(G1, V1f);
+    const int   S_bits = __float_as_int(__fadd_rn(S0, S1));
 
     if (mxs[tree_fold] < S_bits) {
       mxs[tree_fold] = S_bits;
-      vls[tree_fold] = __float2int_rz(qscale * V0f);
-      vrs[tree_fold] = __float2int_rz(qscale * V1f);
+      vls[tree_fold] = __float2int_rz(__fmul_rn(qscale, V0f));
+      vrs[tree_fold] = __float2int_rz(__fmul_rn(qscale, V1f));
       fs [tree_fold] = (uint16_t)k;
     }
   }
 
   __syncwarp(FULL_MASK);
 
+  // ---- warp-reduce per fold + write
   for (int fold = 0; fold < K0; ++fold) {
-    int mx  = mxs[fold];
-    int mxw = mx;
+    int mxw = mxs[fold];
 
     #pragma unroll
     for (int p = 0; p < 5; ++p) {
@@ -103,16 +102,23 @@ extern "C" __global__ void cut_cuda_kernel(
       mxw = (partner > mxw) ? partner : mxw;
     }
 
-    const unsigned msk = __ballot_sync(FULL_MASK, mx == mxw);
-    const bool is_max = (mx == mxw) && ((1u << wi) > (msk >> 1));
+    // empty fold? skip (matches CPU continue)
+    if (mxw == -100000000) continue;
 
-    if (is_max) {
-      const size_t v_base = (((size_t)tree_set * K0) + fold) * (size_t)(2 * nodes) + (size_t)(2 * leaf);
+    const unsigned msk = __ballot_sync(FULL_MASK, mxs[fold] == mxw);
+    if (msk == 0) continue; // paranoia
+
+    const int winner_lane = 31 - __clz(msk);
+    if (wi == winner_lane) {
+      const size_t v_base = (((size_t)tree_set * (size_t)K0) + (size_t)fold)
+                          * (size_t)(2 * nodes) + (size_t)(2 * leaf);
       V[v_base + 0] = vls[fold];
       V[v_base + 1] = vrs[fold];
 
-      const size_t f_idx = (size_t)tree_set * (size_t)(32 * K1) + (size_t)fs[fold] * 32u + wi;
-      const size_t i_idx = (((size_t)tree_set * K0) + fold) * (size_t)nodes + (size_t)leaf;
+      const size_t f_idx = (size_t)tree_set * (size_t)(32 * K1)
+                         + (size_t)fs[fold] * 32u + (size_t)winner_lane;
+      const size_t i_idx = (((size_t)tree_set * (size_t)K0) + (size_t)fold)
+                         * (size_t)nodes + (size_t)leaf;
       I[i_idx] = F[f_idx];
     }
   }
@@ -128,13 +134,11 @@ void cut_cuda_launcher(
     torch::Tensor I,      // int16 (stores uint16)
     int tree_set, double L2, double lr, int qgrad_bits, int max_depth)
 {
-
   const int treesets = F.size(0);
   const int K1       = H.size(0);
   const int nodes    = H.size(1);
-
   const int K0       = H0.size(0);
-  const int D = FST.size(2);
+  const int D        = FST.size(2);
 
   const dim3 grid(nodes, 1, 1);
   const dim3 block(WARP_SIZE, 1, 1);
