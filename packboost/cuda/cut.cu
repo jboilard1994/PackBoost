@@ -140,7 +140,7 @@ void cut_cuda_launcher(
   const int K0       = H0.size(0);
   const int D        = FST.size(2);
 
-  const dim3 grid(nodes, 1, 1);
+  const dim3 grid((1<<max_depth) -1, 1, 1);
   const dim3 block(WARP_SIZE, 1, 1);
 
   auto stream = at::cuda::getCurrentCUDAStream();

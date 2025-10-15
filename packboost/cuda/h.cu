@@ -53,14 +53,14 @@ __global__ void _h_sm(
   int* sh_high = shmem;
   unsigned long long* sh_low = (unsigned long long*)(shmem + n_ge3 * 2 * 32);
   // Zero this lane’s column for both channels in high
-  
+  //const unsigned mask = __activemask();
+  const unsigned mask = __ballot_sync(__activemask(), true);
   #pragma unroll
   for (int i = 0; i < n_ge3; ++i) {
     sh_high[(i * 2 + 0) * 32 + lane] = 0; // sum(y)
     sh_high[(i * 2 + 1) * 32 + lane] = 0; // count
   }
   __syncthreads();
-  const unsigned mask = __ballot_sync(__activemask(), true);
   // Each warp processes 'stride' tiles of 32 columns
   for (int j = 0; j < stride; ++j) {
     const int base = 32 * (stride * gwarp + j); // column start
@@ -78,8 +78,11 @@ __global__ void _h_sm(
       }
 
         // Load this lane's 32-bit tile
-        uint32_t xfd_local = XS[static_cast<size_t>(feat_set) * static_cast<size_t>(cols_32M)
-            + static_cast<size_t>(base + lane)];
+        uint32_t xfd_local = 0u;
+        if (base + lane < cols_32M) {
+          xfd_local = XS[static_cast<size_t>(feat_set) * static_cast<size_t>(cols_32M)
+              + static_cast<size_t>(base + lane)];
+          }
 
         // Mask off bits beyond N for the tail tile (uniform)
         const int rem = N - base;
@@ -150,7 +153,6 @@ __global__ void _h_sm(
   for (int tmp = warps_per_block; tmp > 1; tmp >>= 1) ++log_wpb;
   // Butterfly reduction for low depths
   for (int s = 0; s < log_wpb; ++s) {
-    __syncthreads();
     const int ofs = 1 << s;
     if ((block_warp & ofs) == 0 && (block_warp + ofs) < warps_per_block) {
       for (int ndi = 0; ndi < low_nodes; ++ndi) {
