@@ -25,94 +25,84 @@ class PackBoost(BaseEstimator, RegressorMixin):
             *,
             lr: float = 0.07,
             L2: float = 100_000.0,
-            nfeatsets: int = 32,     # 16*2 from your example
+            nfeatsets: int = 32,     # e.g., 16*2
             qgrad_bits: int = 12,
             seed: int = 42):
         """
-        1) encode_cuts(X)
-        2) generate Fsch (uint16) and FST (uint8) like your ExtraFast snippet
-        3) run boosting for `rounds`, updating tree_set each round
-
-        Stores:
-        - self.V [rounds, nfolds, 2*nodes], self.I [rounds, nfolds, nodes]
-        - self.Fsch, self.FST
-        - self.P_ (train preds, padded), self.Y_i32 (Q30), self.train_N
-        - self.Pv_, self.Yv_i32, self.val_N  (if validation)
+        Orchestration aligned to Murky EFBoost:
+        - Only feature planes are padded; labels/preds/leaves remain length N.
+        - I is uint16. Leaves are uint8 (D<=8) else uint16.
+        - L2 and lr/nfolds scaling applied inside cut() as in EFBoost.
         """
         assert X.dtype == np.int8 and y.dtype == np.float32
         device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
         callbacks = [] if callbacks is None else callbacks
 
-        # -------- metadata --------
+        # ---------- meta ----------
         self.nfeatsets = int(nfeatsets)
         self.nfolds    = int(nfolds)
         self.max_depth = int(max_depth)
-        D  = self.max_depth
-        Dm = max(D - 1, 0)
+        D   = self.max_depth
+        Dm  = max(D - 1, 0)
         nodes  = (1 << D) - 1
         lanes  = 32
-        leaf_dtype = (torch.uint8 if D <= 8 else torch.int16)
+        leaf_dtype = (torch.uint8 if D <= 8 else torch.uint16)
 
-        # -------- 1) encode_cuts(X) --------
+        # ---------- 1) encode_cuts(X) ----------
         N, F = X.shape
         self.train_N = int(N)
 
         X_t = torch.from_numpy(X).to(device=device, dtype=torch.int8)
-        XB  = self.encode_cuts(X_t).contiguous()         # [4F, M] uint32
+        XB  = self.encode_cuts(X_t).contiguous()                    # [4F, M] uint32
         bF, M = XB.shape
-        Np = 32 * M                                      # padded length
-
+        Np = 32 * M                                                 # padded length for XS/XB only
         del X_t
-        torch.cuda.empty_cache()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
-        # Q30 targets (padded) and preds buffer
+        # Q30 labels (length **N**, not Np) and preds buffer
         yq30  = (y * (1 << 30)).astype(np.int64)
-        Y_i32 = torch.zeros(Np, dtype=torch.int32, device=device)
-        Y_i32[:N] = torch.from_numpy(yq30[:N].astype(np.int32)).to(device=device)
-        P = torch.zeros(Np, dtype=torch.int32, device=device)
+        Y_i32 = torch.from_numpy(yq30[:N].astype(np.int32)).to(device=device)
+        P     = torch.zeros(N, dtype=torch.int32, device=device)
 
-        # stash for callbacks
+        # stash for callbacks / parity dumps
         self.Y_i32 = Y_i32
         self.P_    = P
-        # legacy aliases (some callbacks expect these names)
-        self.dY    = Y_i32
+        self.dY    = Y_i32  # legacy
         self.dP    = P
 
-        # leaf buffers
-        L_old = torch.zeros((nfolds, Dm, Np), dtype=leaf_dtype, device=device)
+        # leaf buffers (length **N**)
+        L_old = torch.zeros((nfolds, Dm, N), dtype=leaf_dtype, device=device)
         L_new = torch.zeros_like(L_old)
 
-        # -------- 2) schedules like your snippet --------
+        # ---------- 2) schedules ----------
         rng = np.random.RandomState(seed)
 
-        # Fsch: [rounds, 32*nfeatsets] uint16 indices into XB rows
+        # Fsch: [rounds, 32*nfeatsets] uint16 indices into XB rows (0..bF-1)
         if bF >= (1 << 16):
             raise ValueError(f"encode_cuts produced {bF} bitplanes (4*F). "
-                            f"Current schedule dtype is uint16; please reduce F or extend to uint32 schedules.")
-        Fsch_cpu = torch.from_numpy(
+                            f"Schedule dtype is uint16; reduce F or extend to uint32.")
+        Fsch_cpu = torch.from_numpy(  # keep a CPU copy in case you run CPU path
             rng.randint(0, bF, size=(rounds, lanes * nfeatsets), dtype=np.uint16)
-        ).contiguous()                                       # keep CPU copy for fast et_sample_1b CPU path (if needed)
-        # in fit(), right after you build Fsch_cpu (np.uint16)
-        self.Fsch_u16 = Fsch_cpu.to(device=device, dtype=torch.uint16).contiguous()
-        #self.Fsch_i16 = self.Fsch_u16.view(torch.int16).contiguous()  # same storage, different dtype view
+        ).contiguous()
+        self.Fsch = Fsch_cpu.to(device=device, dtype=torch.uint16).contiguous()  # uint16 on device
 
         # FST: [rounds, nfeatsets, D] uint8; depth-wise shuffled tiling of [0..nfolds-1]
         base = torch.arange(nfolds, dtype=torch.uint8, device=device)
         rep  = (nfeatsets + nfolds - 1) // nfolds
-        row  = base.repeat(rep)[:nfeatsets]                  # [nfeatsets]
+        row  = base.repeat(rep)[:nfeatsets]                                     # [nfeatsets]
         FST  = torch.empty((rounds, nfeatsets, D), dtype=torch.uint8, device=device)
         for s in range(rounds):
             for d in range(D):
                 perm = torch.randperm(nfeatsets, device=device)
                 FST[s, :, d] = row[perm]
-
         FST = FST.contiguous()
 
-        # -------- outputs --------
-        V = torch.zeros((rounds, nfolds, 2 * nodes), dtype=torch.int32, device=device)
-        I = torch.zeros((rounds, nfolds,     nodes), dtype=torch.int16, device=device)
+        # ---------- 3) outputs ----------
+        V = torch.zeros((rounds, nfolds, 2 * nodes), dtype=torch.int32,  device=device)
+        I = torch.zeros((rounds, nfolds,     nodes), dtype=torch.uint16, device=device)  # <- uint16
 
-        # -------- optional validation --------
+        # ---------- 4) optional validation ----------
         use_val = (Xv is not None) and (Yv is not None)
         if use_val:
             assert Xv.dtype == np.int8 and Yv.dtype == np.float32
@@ -120,62 +110,56 @@ class PackBoost(BaseEstimator, RegressorMixin):
             self.val_N = Nv
 
             Xv_t = torch.from_numpy(Xv).to(device=device, dtype=torch.int8)
-            XBv  = self.encode_cuts(Xv_t).contiguous()
-            Mv   = XBv.shape[1]
-            Nvp  = 32 * Mv
-
-            Pv = torch.zeros(Nvp, dtype=torch.int32, device=device)
+            XBv  = self.encode_cuts(Xv_t).contiguous()                           # [4F, Mv]
+            Mv   = XBv.shape[1]                                                  # we won't pad Pv/Yv to 32*Mv
+            Pv   = torch.zeros(Nv, dtype=torch.int32, device=device)
             yvq30 = (Yv * (1 << 30)).astype(np.int64)
-            Yv_i32 = torch.zeros(Nvp, dtype=torch.int32, device=device)
-            Yv_i32[:Nv] = torch.from_numpy(yvq30[:Nv].astype(np.int32)).to(device=device)
+            Yv_i32 = torch.from_numpy(yvq30[:Nv].astype(np.int32)).to(device=device)
 
-            # stash for callbacks
             self.Pv_    = Pv
             self.Yv_i32 = Yv_i32
             self.Yv     = torch.from_numpy(Yv).to(device=device)
 
-            Lv  = torch.zeros((nfolds, Dm, Nvp), dtype=leaf_dtype, device=device)
+            Lv  = torch.zeros((nfolds, Dm, Nv), dtype=leaf_dtype, device=device)
             Lvn = torch.zeros_like(Lv)
 
             del Xv_t
-            torch.cuda.empty_cache()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
         else:
             XBv = Pv = Yv_i32 = Lv = Lvn = None
 
-        # -------- 3) boosting loop --------
+        # ---------- 5) boosting loop ----------
         lr_per_fold = lr / float(nfolds)
         self.tree_set = 0
 
         for t in range(rounds):
-            # (a) sample features -> XS [nfeatsets, 32*M] uint32
-            #    Fast path: GPU (XB on device) – your kernel creates XS directly on device.
-            #    Fallback: if XB were on CPU, we’d use the CPU path with Fsch_cpu.
+            # (a) sample features -> XS [nfeatsets, 32*M] uint32 (device)
             if XB.is_cuda and torch.cuda.is_available():
-                XS = self.et_sample_1b(XB, self.Fsch_u16, t).contiguous()
+                XS = self.et_sample_1b(XB, self.Fsch, t).contiguous()
             else:
-                XS = self.et_sample_1b(XB, Fsch_cpu, t).to(device)    # move to device for H()
+                XS = self.et_sample_1b(XB, Fsch_cpu, t).to(device)  # CPU fallback then to device
 
-            # (b) prep packed paths and gradients
-            LE, G = self.prep_vars(L_old, Y_i32, P)                   # LE: u16/u32/u64; G: int16
+            # (b) packed leaves + quantized gradients (length **N**)
+            LE, G = self.prep_vars(L_old, Y_i32, P)                 # LE: u16/u32/u64 ; G: int16
 
-            # (c) repack trees for features (device)
-            LF = self.repack(FST, LE, t).contiguous()                 # [nfeatsets, Np]
+            # (c) repack by feature schedule (device), output length **N**
+            LF = self.repack(FST, LE, t).contiguous()               # [nfeatsets, N]
 
-            # (d) histograms
-            H  = self.H (XS, G, LF, D).contiguous()                   # [nfeatsets, nodes, 2, 32] int64
-            H0 = self.h0(G, LE, D).contiguous()                       # [nfolds, 2^D, 2] int64
+            # (d) histograms (XS uses 32*M; G/LF use N; kernels must guard by N)
+            H  = self.H (XS, G, LF, D).contiguous()                 # [nfeatsets, nodes, 2, 32] int64
+            H0 = self.h0(G, LE, D).contiguous()                     # [nfolds, 2**D, 2] int64
 
             # (e) choose best cuts (writes into V/I for round t)
-            self.cut(self.Fsch_u16, FST, H, H0[:, : H.size(1), :].contiguous(), V, I,
+            self.cut(self.Fsch, FST, H, H0[:, : H.size(1), :].contiguous(), V, I,
                     tree_set=t, L2=L2, lr=lr_per_fold,
                     qgrad_bits=qgrad_bits, max_depth=D)
-            #print(V, I)
 
-            # (f) advance + predict
+            # (f) advance + predict (length **N**)
             self.advance_and_predict(P, XB, L_old, L_new, V, I, tree_set=t)
             L_old, L_new = L_new, L_old   # ping-pong
 
-            # (g) validation forward (optional)
+            # (g) validation forward (optional, length **Nv**)
             if use_val:
                 self.advance_and_predict(Pv, XBv, Lv, Lvn, V, I, tree_set=t)
                 Lv, Lvn = Lvn, Lv
@@ -194,14 +178,14 @@ class PackBoost(BaseEstimator, RegressorMixin):
             if device.type == "cuda" and (t % 256 == 255):
                 torch.cuda.empty_cache()
 
-        # -------- stash artifacts for inference --------
-        self.Fsch = self.Fsch_u16            # int16 storage, device
-        self.FST  = FST                     # uint8, device
-        self.V    = V
-        self.I    = I
-        self.X_packed_ = XB                 # keep packed train X if you want quick train scoring
+        # ---------- 6) stash artifacts for inference ----------
+        self.FST  = FST                         # uint8, device
+        self.V    = V                           # int32, device
+        self.I    = I                           # uint16, device
+        self.X_packed_ = XB                     # keep packed train X if you want quick train scoring
 
         return self
+
 
 
     def predict(self, X):
@@ -500,12 +484,12 @@ class PackBoost(BaseEstimator, RegressorMixin):
         return H
 
     def cut(self,
-            F:  torch.Tensor,   # [rounds, 32*K1]         uint16 (uint16 storage)
-            FST:torch.Tensor,   # [rounds, K1, D]         uint8
-            H:  torch.Tensor,   # [K1, nodes, 2, 32]      int64
-            H0: torch.Tensor,   # [K0, nodes, 2]          int64
-            V:  torch.Tensor,   # [rounds, K0, 2*nodes]   int32 (OUT)
-            I:  torch.Tensor,   # [rounds, K0, nodes]     int16 (uint16 storage, OUT)
+            F:  torch.Tensor,   # [rounds, 32*K1]        uint16 (preferred) or int16 storage
+            FST:torch.Tensor,   # [rounds, K1, D]        uint8
+            H:  torch.Tensor,   # [K1, nodes, 2, 32]     int64
+            H0: torch.Tensor,   # [K0, nodes, 2]         int64
+            V:  torch.Tensor,   # [rounds, K0, 2*nodes]  int32 (OUT)
+            I:  torch.Tensor,   # [rounds, K0, nodes]    uint16 (OUT; legacy int16 also accepted)
             tree_set: int,
             L2: float,
             lr: float,
@@ -513,6 +497,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             max_depth: int):
         use_cuda = (F.is_cuda or FST.is_cuda or H.is_cuda or H0.is_cuda or V.is_cuda or I.is_cuda)
         if use_cuda and torch.cuda.is_available():
+            from packboost.cuda import kernels
             kernels.cut_cuda(
                 F.contiguous(), FST.contiguous(),
                 H.contiguous(), H0.contiguous(),
@@ -522,25 +507,26 @@ class PackBoost(BaseEstimator, RegressorMixin):
             )
             return V, I
 
+        # -------- CPU reference --------
         device = H.device
-        K1, nodes = H.shape[0], H.shape[1]
+        K1, nodes = int(H.shape[0]), int(H.shape[1])
         lanes = 32
-        K0 = H0.shape[0]
-        D  = FST.shape[2]
+        K0 = int(H0.shape[0])
+        D  = int(FST.shape[2])
         assert H.shape[2] == 2 and H.shape[3] == 32
         assert nodes == (1 << max_depth) - 1
+        assert I.dtype in (torch.uint16, torch.int16), "I must be uint16 or int16"
 
         # depth(leaf) = floor(log2(leaf+1))
         leaves = torch.arange(nodes, device=device, dtype=torch.float32) + 1.0
         depth  = torch.floor(torch.log2(leaves)).to(torch.long)  # [nodes]
 
-        # L2_eff(leaf) and qscale(leaf)
+        # L2 scaling & qscale (match CUDA)
         L2_eff = torch.tensor(L2, dtype=torch.float32, device=device) * torch.pow(
             torch.tensor(2.0, dtype=torch.float32, device=device), 5.0 - depth.float()
         )  # [nodes]
-        shift  = 31 - int(qgrad_bits)
-        pow2   = float(1 << shift)
-        qscale = torch.tensor(lr, dtype=torch.float32, device=device) * pow2 * torch.pow(
+        shift  = 31 - int(qgrad_bits)  # matches CUDA kernel
+        qscale = torch.tensor(lr, dtype=torch.float32, device=device) * float(1 << shift) * torch.pow(
             torch.tensor(2.0, dtype=torch.float32, device=device), -(float(max_depth) - depth.float())
         )  # [nodes]
 
@@ -570,19 +556,21 @@ class PackBoost(BaseEstimator, RegressorMixin):
         V1f = G1 / (N1 + L2e)                        # [K1, n, 32]
         S   = (G0 * V0f) + (G1 * V1f)                # [K1, n, 32]
 
-        # Bit-cast float32 -> int32 like the kernel compares
+        # Bit-cast float32 -> int32 for tie-consistent compares (CPU: round-trip via NumPy)
         S_bits = torch.from_numpy(S.contiguous().cpu().numpy().view(np.int32)).to(device=device)  # [K1,n,32] int32
 
-        # k-index for lexicographic tie (prefer earliest k)
+        # k-index for lexicographic tie (prefer earlier k)
         k_idx = torch.arange(K1, device=device, dtype=torch.int64).view(K1, 1, 1).expand(K1, nodes, lanes)
+        lane_ids = torch.arange(lanes, device=device, dtype=torch.int32).view(1, lanes)
+        min_i64 = torch.iinfo(torch.int64).min
+        nodes_ar = torch.arange(nodes, device=device, dtype=torch.long)
 
         # Output views for this tree_set
         V_ts = V[tree_set]  # [K0, 2*nodes]
         I_ts = I[tree_set]  # [K0, nodes]
 
-        lane_ids = torch.arange(lanes, device=device, dtype=torch.int32).view(1, lanes)
-        min_i64 = torch.iinfo(torch.int64).min
-        nodes_ar = torch.arange(nodes, device=device, dtype=torch.long)
+        # Robust view of F as unsigned for indexing (supports uint16 or int16 storage)
+        F_row_u = (F[tree_set].to(torch.int64) & 0xFFFF)  # [32*K1] int64 holding u16 values
 
         # Iterate over folds (K0 usually small)
         for f in range(K0):
@@ -594,47 +582,48 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
             # Lexicographic key:
             #   high 32 bits = S_bits (score compare)
-            #   low  32 bits = (0xFFFFFFFF - k)  -> earlier k wins on ties
+            #   low  32 bits = (0xFFFFFFFF - k)  -> earlier k wins ties
             key_hi = S_bits.to(torch.int64)
             key_lo = (0xFFFFFFFF - k_idx)  # fits in int64
             key    = (key_hi << 32) | key_lo
             key    = torch.where(Mf3, key, torch.full_like(key, min_i64))
 
             # Per-lane max over k (earliest k on ties)
-            key_lane_max, argk_lane = key.max(dim=0)                 # [n, 32], [n, 32]
-            Sbits_lane = (key_lane_max >> 32).to(torch.int32)        # [n, 32]
+            key_lane_max, argk_lane = key.max(dim=0)                  # [n, 32], [n, 32]
+            Sbits_lane = (key_lane_max >> 32).to(torch.int32)         # [n, 32]
 
-            # Lane tie-break: highest lane among equals
-            Smax_per_leaf, _ = Sbits_lane.max(dim=1, keepdim=True)   # [n, 1]
-            winners = (Sbits_lane == Smax_per_leaf)                  # [n, 32]
+            # Lane tie-break: highest lane among equals (matches CUDA ballot winner)
+            Smax_per_leaf, _ = Sbits_lane.max(dim=1, keepdim=True)    # [n, 1]
+            winners = (Sbits_lane == Smax_per_leaf)                   # [n, 32]
             chosen_lane = (winners.to(torch.int32) * lane_ids).amax(dim=1)  # [n]
 
             # Chosen k for each leaf
-            k_star = argk_lane[nodes_ar, chosen_lane]                # [n]
+            k_star = argk_lane[nodes_ar, chosen_lane]                 # [n]
 
             # Gather stats for (k*, lane*)
-            G0_sel  = H_sum[k_star, nodes_ar, chosen_lane]           # [n]
-            N0_sel  = H_cnt[k_star, nodes_ar, chosen_lane]           # [n]
-            G01_sel = H0_sum[f, nodes_ar]                            # [n]
-            N01_sel = H0_cnt[f, nodes_ar]                            # [n]
+            G0_sel  = H_sum[k_star, nodes_ar, chosen_lane]            # [n]
+            N0_sel  = H_cnt[k_star, nodes_ar, chosen_lane]            # [n]
+            G01_sel = H0_sum[f, nodes_ar]                             # [n]
+            N01_sel = H0_cnt[f, nodes_ar]                             # [n]
 
             L2_sel = L2_eff                                          # [n]
-            qs_sel = qscale                                          # [n]
+            qs_sel = qscale                                           # [n]
 
             V0_sel = G0_sel / (N0_sel + L2_sel)
             V1_sel = (G01_sel - G0_sel) / ((N01_sel - N0_sel) + L2_sel)
 
-            # Quantize to int32 (round like CUDA)
+            # Quantize to int32 (CUDA uses trunc toward zero)
             V_ts[f, 2*nodes_ar    ] = torch.trunc(qs_sel * V0_sel).to(torch.int32)
             V_ts[f, 2*nodes_ar + 1] = torch.trunc(qs_sel * V1_sel).to(torch.int32)
 
-
-            # Feature indices: I = F[tree_set, 32*k* + lane*] (stored int16 with uint16 payload)
-            F_row = F[tree_set]  # [32*K1], int16 storage
+            # Feature indices: I = F[tree_set, 32*k* + lane*] (store as uint16)
             feat_pos = (k_star.to(torch.int64) * lanes + chosen_lane.to(torch.int64))  # [n]
-            I_ts[f, nodes_ar] = F_row.index_select(0, feat_pos).to(torch.int16)
+            # new — gather as int64, mask to u16 range, cast once, then row-copy
+            vals_u16 = (F_row_u.index_select(0, feat_pos) & 0xFFFF).to(torch.uint16)  # [nodes]
+            I_ts[f].copy_(vals_u16)  # write the entire row; avoids index_put on UInt16
 
         return V, I
+
 
     def advance_and_predict(self,
                             P: torch.Tensor,     # [N], int32 (in/out)
@@ -642,13 +631,10 @@ class PackBoost(BaseEstimator, RegressorMixin):
                             L_old: torch.Tensor, # [K0, Dm, N], uint8/uint16
                             L_new: torch.Tensor, # [K0, Dm, N], same dtype
                             V: torch.Tensor,     # [rounds, K0, 2*nodes], int32
-                            I: torch.Tensor,     # [rounds, K0, nodes], int16 (uint16 payload)
+                            I: torch.Tensor,     # [rounds, K0, nodes], uint16 (or legacy int16)
                             tree_set: int):
-        """
-        Advance paths for depths= min(tree_set+1, Dm+1) and accumulate predictions into P.
-        GPU: CUDA kernel (launcher infers stride). CPU: vectorized equivalent for testing.
-        """
-        use_cuda = (P.is_cuda or X.is_cuda or L_old.is_cuda or L_new.is_cuda or V.is_cuda or I.is_cuda)
+
+        use_cuda = any(t.is_cuda for t in (P, X, L_old, L_new, V, I))
         K0, Dm, N = L_old.shape
         nodes = I.shape[2]
         depths = min(tree_set + 1, Dm + 1)
@@ -658,22 +644,23 @@ class PackBoost(BaseEstimator, RegressorMixin):
             kernels.advance_and_predict(
                 P.contiguous(), X.contiguous(),
                 L_old.contiguous(), L_new.contiguous(),
-                V.contiguous(), I.contiguous(),
-                int(tree_set)
+                V.contiguous(), I.contiguous(), int(tree_set)
             )
             return P, L_new
 
         # -------- CPU vectorized path --------
         assert P.dtype == torch.int32 and X.dtype in (torch.int32, torch.uint32)
-        assert I.dtype == torch.int16 and V.dtype == torch.int32
+        assert V.dtype == torch.int32
+        assert I.dtype in (torch.uint16, torch.int16), "I must be uint16 or int16"
+
         device = P.device
 
-        # Workaround: PyTorch doesn't support advanced indexing on CPU uint32 tensors.
-        # Use an int64 "view" for indexing/bit ops (values remain exact in [0, 2^32-1]).
-        if X.device.type == "cpu" and X.dtype == torch.uint32:
-            X_ix = X.to(torch.int64)                # copy (safe & simple)
-        else:
-            X_ix = X.to(torch.int64, copy=False)    # no copy for int32
+        # Use int64 proxy for bit ops on X
+        X_ix = X.to(torch.int64) if (X.device.type == "cpu" and X.dtype == torch.uint32) else X.to(torch.int64, copy=False)
+
+        # >>> NEW: make an int64 view of I row(s) to allow gather on CPU, keep unsigned semantics
+        # One-time cast (copy) is fine for CPU test path.
+        I_ix = I.to(torch.int64) & 0xFFFF  # shape [rounds, K0, nodes], values treated as unsigned 16-bit
 
         k = torch.arange(N, device=device, dtype=torch.long)
         word_idx = (k >> 5)
@@ -688,22 +675,24 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
                 lo = leaf_prev + ((1 << depth) - 1)
 
-                li = (I[tree_set, f].gather(0, lo.to(torch.long)).to(torch.int64) & 0xFFFF)
+                # >>> CHANGED: gather from I_ix (int64), not I (uint16), to avoid unsupported gather
+                li = I_ix[tree_set, f].gather(0, lo.to(torch.long))  # int64
 
-                # Index using the int64 proxy, then bit-extract
                 words = X_ix[li, word_idx]                      # int64
                 x     = ((words >> bit_off) & 1).to(torch.int64)
 
-                leaf_new = (leaf_prev << 1) + x
+                leaf_new = (leaf_prev << 1) | x
                 if depth < Dm:
                     if L_new.dtype == torch.uint8:
                         L_new[f, depth] = leaf_new.to(torch.uint8)
-                    elif L_new.dtype == torch.int16:
-                        L_new[f, depth] = leaf_new.to(torch.int16)
+                    elif L_new.dtype == torch.uint16:
+                        L_new[f, depth] = leaf_new.to(torch.uint16)
                     else:
-                        raise AssertionError("L_new must be uint8 or int16")
+                        raise AssertionError("L_new must be uint8 or uint16")
 
                 add_idx = (2 * lo + 1 + x).to(torch.long)
                 P.add_(V[tree_set, f].gather(0, add_idx))
 
         return P, L_new
+
+

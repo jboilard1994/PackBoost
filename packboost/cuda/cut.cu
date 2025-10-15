@@ -151,7 +151,7 @@ void cut_cuda_launcher(
       H.data_ptr<int64_t>(),
       H0.data_ptr<int64_t>(),
       V.data_ptr<int32_t>(),
-      reinterpret_cast<uint16_t*>(I.data_ptr<int16_t>()),
+      reinterpret_cast<uint16_t*>(I.data_ptr<uint16_t>()),
       treesets, K0, K1, nodes, D, tree_set,
       static_cast<float>(L2),
       static_cast<float>(lr),

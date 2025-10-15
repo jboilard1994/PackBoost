@@ -95,7 +95,7 @@ static void launch_advpred(
         L_old.data_ptr<uint8_t>(),
         L_new.data_ptr<uint8_t>(),
         V.data_ptr<int32_t>(),
-        reinterpret_cast<const uint16_t*>(I.data_ptr<int16_t>()),
+        reinterpret_cast<const uint16_t*>(I.data_ptr<uint16_t>()),
         N, R, M, K0, Dm, nodes, rounds, tree_set, stride);
   } else if (L_old.scalar_type() == at::kShort && L_new.scalar_type() == at::kShort) {
     advance_and_predict_kernel<uint16_t><<<grid, block, 0, stream.stream()>>>(
@@ -104,7 +104,7 @@ static void launch_advpred(
         L_old.data_ptr<uint16_t>(),
         L_new.data_ptr<uint16_t>(),
         V.data_ptr<int32_t>(),
-        reinterpret_cast<const uint16_t*>(I.data_ptr<int16_t>()),
+        reinterpret_cast<const uint16_t*>(I.data_ptr<uint16_t>()),
         N, R, M, K0, Dm, nodes, rounds, tree_set, stride);
   } else {
     TORCH_CHECK(false, "L_old/L_new must both be uint8 or both be int16 (uint16)");

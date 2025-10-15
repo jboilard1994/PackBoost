@@ -280,7 +280,10 @@ def test_cut_matches_cpu_reference():
     for K, D, N, nfeatsets, rounds in cases:
         pack_cpu.nfeatsets = pack_gpu.nfeatsets = nfeatsets
 
-        L_bits = torch.randint(0, 4, (K, max(D - 1, 0), N), dtype=torch.uint8)
+        # Valid-by-depth random L bits
+        L_bits = torch.empty((K, max(D - 1, 0), N), dtype=torch.uint8)
+        for d in range(1, D):
+            L_bits[:, d-1].random_(0, 1 << d)
 
         lo, hi = -(1 << 30), (1 << 30) - 1
         Y_raw  = torch.randint(lo, hi + 1, (N,), dtype=torch.int32)
@@ -288,6 +291,7 @@ def test_cut_matches_cpu_reference():
 
         LE_ref, G_ref = pack_cpu.prep_vars(L_bits, Y_raw, P_raw)
 
+        # FST depth-wise shuffled tiling
         FST = torch.empty((rounds, nfeatsets, D), dtype=torch.uint8)
         base = torch.arange(K, dtype=torch.uint8)
         rep  = (nfeatsets + K - 1) // K
@@ -309,11 +313,11 @@ def test_cut_matches_cpu_reference():
         H0_ref  = H0_full[:, : (1 << D) - 1, :]
 
         F_row_elems = 32 * nfeatsets
-        # FIX: generate in int32 0..65535, then cast to int16 (uint16 payload in storage)
-        F = torch.randint(0, 1 << 16, (rounds, F_row_elems), dtype=torch.int32).to(torch.int16)
+        # Generate as uint16 directly
+        F = torch.randint(0, 1 << 16, (rounds, F_row_elems), dtype=torch.int64).to(torch.uint16)
 
         V_cpu = torch.zeros((rounds, K, 2 * ((1 << D) - 1)), dtype=torch.int32)
-        I_cpu = torch.zeros((rounds, K,     ((1 << D) - 1)), dtype=torch.int16)
+        I_cpu = torch.zeros((rounds, K,     ((1 << D) - 1)), dtype=torch.uint16)
 
         lr_eff = base_lr / float(K)
 
@@ -321,7 +325,8 @@ def test_cut_matches_cpu_reference():
                      tree_set=tree_set, L2=base_L2, lr=lr_eff,
                      qgrad_bits=qgrad_bits, max_depth=D)
 
-        F_gpu   = F.cuda().to(torch.uint16)
+        # GPU
+        F_gpu   = F.cuda()
         FST_gpu = FST.cuda()
         H_gpu   = H_ref.cuda()
         H0_gpu  = H0_ref.cuda()
@@ -335,6 +340,7 @@ def test_cut_matches_cpu_reference():
 
         torch.testing.assert_close(V_gpu.cpu(), V_cpu, rtol=0, atol=0)
         torch.testing.assert_close(I_gpu.cpu(), I_cpu, rtol=0, atol=0)
+
 
 def test_advance_and_predict_matches_cpu_reference():
     import pytest, torch
@@ -371,7 +377,7 @@ def test_advance_and_predict_matches_cpu_reference():
         V_gpu = V_cpu.cuda()
 
         I_vals = torch.randint(0, R, (rounds, K0, nodes), dtype=torch.int32) & 0xFFFF
-        I_cpu  = I_vals.to(torch.int16)
+        I_cpu  = I_vals.to(torch.uint16)
         I_gpu  = I_cpu.cuda()
 
         tree_set = min(1, rounds - 1)

@@ -230,7 +230,7 @@ static inline int choose_warps_that_fit(size_t smem_high, size_t smem_cap) {
 // XS: [nfeatsets, N] (torch.uint32)
 // Y : [N] (torch.int16)
 // LF: [nfeatsets, N] (torch.uint16/32/64)
-// max_depth: <= 7 (this SMEM variant)
+// max_depth: <= 8 (this SMEM variant)
 torch::Tensor h_sm(
     torch::Tensor XS,
     torch::Tensor Y,
