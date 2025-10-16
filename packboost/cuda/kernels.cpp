@@ -167,7 +167,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("h0_sm", &h0_sm, "H0 (featureless, unweighted) Murky-parity launcher");
     m.def("h0_sm_butterfly", &h0_sm_butterfly, "H0 butterfly reduce-scatter launcher");
 
-    m.def("h0_des", &h0_des, "H0 butterfly reduce-scatter launcher");
+    m.def("h0_des", &h0_des_butterfly, "H0 butterfly reduce-scatter launcher");
 
     m.def("repack_trees_for_features",
         &repack_trees_for_features_cuda,
@@ -178,7 +178,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     
     m.def("cut_cuda", &cut_cuda_launcher, "PackBoost cut_cuda (CUDA)");
 
-    m.def("cut_cuda_des", &cut_cuda_des_launcher, "PackBoost cut_cuda (CUDA)");
+    m.def("cut_cuda_des", &cut_des_cuda_launcher, "PackBoost cut_cuda (CUDA)");
     
     m.def("advance_and_predict", &advance_and_predict_launcher,
         "PackBoost advance_and_predict (CUDA)");

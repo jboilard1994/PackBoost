@@ -71,7 +71,7 @@ extern "C" __global__ void cut_des_cuda_kernel(
   #pragma unroll
   for (int f = 0; f < CUTCUDA_MAX_FOLDS; ++f) {
     if (f >= K0) break;
-    best_dir[f]   = -CUDART_INF_F;
+    best_dir[f]   = -INFINITY;
     best_sbits[f] = INT_MIN;
     best_vl[f]    = 0;
     best_vr[f]    = 0;
