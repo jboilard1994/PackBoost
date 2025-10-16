@@ -18,6 +18,9 @@ def _load_extension() -> ModuleType:
         str(src_dir / "h0.cu"),
         str(src_dir / "h.cu"),
         str(src_dir / "cut.cu"),
+        str(src_dir / "h0_des.cu"),
+        str(src_dir / "h_des.cu"),
+        str(src_dir / "cut_des.cu"),
         str(src_dir / "adv.cu"),
         str(src_dir / "repack.cu"),
     ]

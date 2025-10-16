@@ -27,12 +27,15 @@ class PackBoost(BaseEstimator, RegressorMixin):
             L2: float = 100_000.0,
             nfeatsets: int = 32,     # e.g., 16*2
             qgrad_bits: int = 12,
-            seed: int = 42):
+            seed: int = 42,
+            era_ids: np.ndarray | None = None  # NEW (sorted, contiguous eras)
+            ):
         """
-        Orchestration aligned to Murky EFBoost:
-        - Only feature planes are padded; labels/preds/leaves remain length N.
-        - I is uint16. Leaves are uint8 (D<=8) else uint16.
-        - L2 and lr/nfolds scaling applied inside cut() as in EFBoost.
+        If `era_ids` is provided (sorted, contiguous eras), use DES:
+        - H0 -> per-era parents via h0_des()
+        - H  -> per-era left stats via h_des()
+        - cut -> directional-only DES via cut_des()
+        Otherwise, fall back to the original non-DES route.
         """
         assert X.dtype == np.int8 and y.dtype == np.float32
         device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
@@ -48,10 +51,25 @@ class PackBoost(BaseEstimator, RegressorMixin):
         lanes  = 32
         leaf_dtype = (torch.uint8 if D <= 8 else torch.uint16)
 
-        # ---------- 1) encode_cuts(X) ----------
+        # ---------- 0) eras -> era_bounds (contiguous offsets) ----------
         N, F = X.shape
         self.train_N = int(N)
+        if era_ids is None:
+            era_bounds = torch.tensor([0, N], device=device, dtype=torch.int64)
+            self.era_bounds_ = era_bounds
+            use_des = False
+        else:
+            # accept numpy/torch; assume already sorted by era and contiguous
+            e_np = era_ids if isinstance(era_ids, np.ndarray) else np.asarray(era_ids)
+            assert e_np.shape[0] == N, "era_ids must be length N"
+            # boundaries where era changes
+            change = np.flatnonzero(e_np[1:] != e_np[:-1]) + 1
+            bounds_np = np.concatenate(([0], change, [N])).astype(np.int64)
+            era_bounds = torch.from_numpy(bounds_np).to(device=device)
+            self.era_bounds_ = era_bounds
+            use_des = True
 
+        # ---------- 1) encode_cuts(X) ----------
         X_t = torch.from_numpy(X).to(device=device, dtype=torch.int8)
         XB  = self.encode_cuts(X_t).contiguous()                    # [4F, M] uint32
         bF, M = XB.shape
@@ -111,7 +129,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
             Xv_t = torch.from_numpy(Xv).to(device=device, dtype=torch.int8)
             XBv  = self.encode_cuts(Xv_t).contiguous()                           # [4F, Mv]
-            Mv   = XBv.shape[1]                                                  # we won't pad Pv/Yv to 32*Mv
+            Mv   = XBv.shape[1]                                                  # no need to pad Pv/Yv to 32*Mv
             Pv   = torch.zeros(Nv, dtype=torch.int32, device=device)
             yvq30 = (Yv * (1 << 30)).astype(np.int64)
             Yv_i32 = torch.from_numpy(yvq30[:Nv].astype(np.int32)).to(device=device)
@@ -146,14 +164,27 @@ class PackBoost(BaseEstimator, RegressorMixin):
             # (c) repack by feature schedule (device), output length **N**
             LF = self.repack(FST, LE, t).contiguous()               # [nfeatsets, N]
 
-            # (d) histograms (XS uses 32*M; G/LF use N; kernels must guard by N)
-            H  = self.H (XS, G, LF, D).contiguous()                 # [nfeatsets, nodes, 2, 32] int64
-            H0 = self.h0(G, LE, D).contiguous()                     # [nfolds, 2**D, 2] int64
-
-            # (e) choose best cuts (writes into V/I for round t)
-            self.cut(self.Fsch, FST, H, H0[:, : H.size(1), :].contiguous(), V, I,
-                    tree_set=t, L2=L2, lr=lr_per_fold,
-                    qgrad_bits=qgrad_bits, max_depth=D)
+            # (d) histograms
+            if use_des:
+                # DES path: per-era H (left) and per-era H0 (parents)
+                He  = self.h_des(XS, G, LF, D, era_bounds=self.era_bounds_).contiguous()   # [K1, nE, nodes, 2, 32]
+                H0e = self.h0_des(G, LE, D, era_bounds=self.era_bounds_).contiguous()      # [K0, nE, 2**D, 2]
+                # trim parents to `nodes` for cut kernel (same as non-DES slice)
+                H0e = H0e[:, :, :He.size(2), :].contiguous()                                # [K0, nE, nodes, 2]
+                # (e) choose best cuts (DES directional-only)
+                self.cut_des(self.Fsch, FST, He, H0e, V, I,
+                            tree_set=t, L2=L2, lr=lr_per_fold,
+                            qgrad_bits=qgrad_bits, max_depth=D)
+                # free DES temps early
+                del He, H0e
+            else:
+                # Non-DES path (original)
+                H  = self.H (XS, G, LF, D).contiguous()                                     # [K1, nodes, 2, 32]
+                H0 = self.h0(G, LE, D).contiguous()                                         # [K0, 2**D, 2]
+                self.cut(self.Fsch, FST, H, H0[:, : H.size(1), :].contiguous(), V, I,
+                        tree_set=t, L2=L2, lr=lr_per_fold,
+                        qgrad_bits=qgrad_bits, max_depth=D)
+                del H, H0
 
             # (f) advance + predict (length **N**)
             self.advance_and_predict(P, XB, L_old, L_new, V, I, tree_set=t)
@@ -174,7 +205,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             self.tree_set = t + 1
 
             # free big temporaries ASAP
-            del XS, LE, G, LF, H, H0
+            del XS, LE, G, LF
             if device.type == "cuda" and (t % 256 == 255):
                 torch.cuda.empty_cache()
 
@@ -185,6 +216,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         self.X_packed_ = XB                     # keep packed train X if you want quick train scoring
 
         return self
+
 
 
 
@@ -694,5 +726,104 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 P.add_(V[tree_set, f].gather(0, add_idx))
 
         return P, L_new
+    
+        # -------- DES: H0 per-era (parents) --------
+    def h0_des(self,
+               G:  torch.Tensor,   # [N] int16
+               LE: torch.Tensor,   # [nfolds, N] (u16/u32/u64)
+               max_depth: int,
+               era_bounds: torch.Tensor | None = None  # [nE+1] int32/int64 (device-matched)
+               ) -> torch.Tensor:
+        """
+        Returns H0e: [nfolds, nE, 2**D, 2] int64
+        (sum,count) per fold, per era, per parent node.
+        """
+        nfolds, N = int(LE.size(0)), int(LE.size(1))
+        if era_bounds is None:
+            era_bounds = torch.tensor([0, N], device=LE.device, dtype=torch.int64)
+        else:
+            era_bounds = era_bounds.to(device=LE.device, dtype=torch.int64).contiguous()
+        nE = int(era_bounds.numel() - 1)
+
+        # ---- GPU path ----
+        use_cuda = (G.is_cuda or LE.is_cuda or era_bounds.is_cuda) and torch.cuda.is_available()
+        if use_cuda:
+            return kernels.h0_des(
+                G.contiguous(), LE.contiguous(), era_bounds.contiguous(), int(max_depth)
+            ).contiguous()
+
+        # ---- CPU fallback ----
+        # Support nE==1 cheaply by reusing existing CPU h0() and adding era dim.
+        if nE == 1:
+            H0 = self.h0(G, LE, max_depth)  # [nfolds, 2**D, 2]
+            return H0.unsqueeze(1).contiguous()  # [nfolds, 1, 2**D, 2]
+        raise NotImplementedError("CPU multi-era H0 (DES) not implemented; pass era_bounds with nE==1 or use CUDA.")
 
 
+    # -------- DES: H per-era (left child stats per candidate) --------
+    def h_des(self,
+              XS: torch.Tensor,   # [K1(=nfeatsets), 32*M] uint32/int32
+              Y:  torch.Tensor,   # [N] int16
+              LF: torch.Tensor,   # [K1, N] (u16/u32/u64)
+              max_depth: int,
+              era_bounds: torch.Tensor | None = None  # [nE+1] (contiguous eras)
+              ) -> torch.Tensor:
+        """
+        Returns He: [K1, nE, (2**D)-1, 2, 32] int64
+        channel 0=sum(y*v), 1=count(v); last dim is lane (0..31).
+        """
+        K1, cols_32M = int(XS.size(0)), int(XS.size(1))
+        N = int(Y.size(0))
+        if era_bounds is None:
+            era_bounds = torch.tensor([0, N], device=XS.device, dtype=torch.int64)
+        else:
+            era_bounds = era_bounds.to(device=XS.device, dtype=torch.int64).contiguous()
+
+        # ---- GPU path ----
+        use_cuda = (XS.is_cuda or Y.is_cuda or LF.is_cuda or era_bounds.is_cuda) and torch.cuda.is_available()
+        if use_cuda:
+            return kernels.h_des(
+                XS.contiguous(), Y.contiguous(), LF.contiguous(),
+                era_bounds.contiguous(), int(max_depth)
+            ).contiguous()
+
+        # ---- CPU fallback ----
+        # Single-era: reuse existing CPU H() and add era dim.
+        if int(era_bounds.numel()) == 2:
+            H_all = self.H(XS, Y, LF, max_depth)  # [K1, nodes, 2, 32]
+            return H_all.unsqueeze(1).contiguous()  # [K1, 1, nodes, 2, 32]
+        raise NotImplementedError("CPU multi-era H (DES) not implemented; pass single-era bounds or use CUDA.")
+
+
+    # -------- DES: directional cut (tie-break by classic score), per spec --------
+    def cut_des(self,
+                F:  torch.Tensor,   # [rounds, 32*K1] uint16 (feature ids per lane)
+                FST:torch.Tensor,   # [rounds, K1, D] uint8 (fold id per candidate/depth)
+                H:  torch.Tensor,   # [K1, nE, nodes, 2, 32] int64  (left stats per era)
+                H0: torch.Tensor,   # [K0, nE, nodes, 2]     int64  (parent stats per era)
+                V:  torch.Tensor,   # [rounds, K0, 2*nodes]  int32  (OUT)
+                I:  torch.Tensor,   # [rounds, K0, nodes]    uint16 (OUT)
+                *,
+                tree_set: int,
+                L2: float,
+                lr: float,
+                qgrad_bits: int,
+                max_depth: int):
+        """
+        Directional-only DES:
+          score = |mean_e sign(v_R - v_L)| over eras with both children non-empty.
+        Tie-break = classic (S0 + S1) as int-bits.
+        """
+        use_cuda = any(t.is_cuda for t in (F, FST, H, H0, V, I)) and torch.cuda.is_available()
+        if use_cuda:
+            kernels.cut_cuda_des(
+                F.contiguous(), FST.contiguous(),
+                H.contiguous(), H0.contiguous(),
+                V, I,
+                int(tree_set), float(L2), float(lr),
+                int(qgrad_bits), int(max_depth)
+            )
+            return V, I
+
+        # CPU fallback not provided (DES selection is CUDA-optimized).
+        raise NotImplementedError("CPU cut_des not implemented. Use CUDA path.")

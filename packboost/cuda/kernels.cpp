@@ -86,6 +86,30 @@ void advance_and_predict_launcher(
     torch::Tensor V, torch::Tensor I,
     int tree_set);
 
+torch::Tensor h0_des_butterfly(
+    torch::Tensor G,          // [N], int16, CUDA
+    torch::Tensor LE,         // [nfolds, N], (u)int16/32/64, CUDA
+    torch::Tensor era_ends,   // [E], int32, CUDA or CPU (will be moved)
+    int max_depth
+);
+
+torch::Tensor h_des(
+    torch::Tensor XS,        // [nfeatsets, N] uint32/int32
+    torch::Tensor Y,         // [N]            int16
+    torch::Tensor LF,        // [nfeatsets, N] uint16/uint32/uint64
+    torch::Tensor era_ends,  // [E]            int32 (exclusive ends)
+    int max_depth);
+
+void cut_des_cuda_launcher(
+    torch::Tensor F,
+    torch::Tensor FST,
+    torch::Tensor H,
+    torch::Tensor H0,
+    torch::Tensor V,
+    torch::Tensor I,
+    int tree_set,
+    double L2, double lr, int qgrad_bits, int max_depth);
+
 namespace {
 
 torch::Tensor encode_cuts_binding(torch::Tensor X) {
@@ -142,12 +166,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("prep_vars", &prep_vars, "L, Y, P -> LE, G");
     m.def("h0_sm", &h0_sm, "H0 (featureless, unweighted) Murky-parity launcher");
     m.def("h0_sm_butterfly", &h0_sm_butterfly, "H0 butterfly reduce-scatter launcher");
+
+    m.def("h0_des", &h0_des, "H0 butterfly reduce-scatter launcher");
+
     m.def("repack_trees_for_features",
         &repack_trees_for_features_cuda,
         "Repack trees for features (Murky parity, CUDA)");
-
     m.def("h_sm", &h_sm, "PackBoost H (unweighted histogram, Murky parity; returns H)");
+    
+    m.def("h_des", &h_des, "PackBoost H (unweighted histogram, Murky parity; returns H)");
+    
     m.def("cut_cuda", &cut_cuda_launcher, "PackBoost cut_cuda (CUDA)");
+
+    m.def("cut_cuda_des", &cut_cuda_des_launcher, "PackBoost cut_cuda (CUDA)");
+    
     m.def("advance_and_predict", &advance_and_predict_launcher,
         "PackBoost advance_and_predict (CUDA)");
 
