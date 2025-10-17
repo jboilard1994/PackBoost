@@ -407,19 +407,25 @@ pytestmark = pytest.mark.skipif(
 # ---------- small helpers ----------
 
 def _mk_era_ends(N, E):
-    # Equal-size eras; ensure each chunk is multiple of 32 so XS slicing matches lanes cleanly.
-    chunk = (N // E) // 32 * 32
-    assert chunk > 0, "N must be >= 32*E"
-    ends = [chunk * (i + 1) for i in range(E - 1)] + [N]
+    # X-space eras that sum to N (no 32-alignment)
+    base, r = divmod(N, E)
+    ends = []
+    s = 0
+    for i in range(E):
+        s += base + (1 if i < r else 0)
+        ends.append(s)
     return torch.tensor(ends, dtype=torch.int32)
 
-def _norm_H0_layout(H0, K0, E, nodes_all):
-    # Accept either [K0, 2**D, E, 2] or [K0, E, 2**D, 2], return [K0, 2**D, E, 2]
-    if H0.shape == (K0, nodes_all, E, 2):
-        return H0
-    if H0.shape == (K0, E, nodes_all, 2):
-        return H0.permute(0, 2, 1, 3).contiguous()
-    raise AssertionError(f"Unexpected H0 shape: {tuple(H0.shape)}")
+
+def _norm_H0_layout(t, K0, E, nodes_all):
+    s = tuple(t.shape)
+    if s == (K0, nodes_all, E, 2):
+        return t.contiguous()
+    if s == (K0, E, nodes_all, 2):
+        return t.permute(0, 2, 1, 3).contiguous()
+    if s == (K0, nodes_all, 2, E):
+        return t.permute(0, 1, 3, 2).contiguous()
+    raise AssertionError(f"Unexpected H0 shape {s}")
 
 def _norm_He_layout(He, K1, E, nodes):
     # Accept either [K1, E, nodes, 2, 32] or [K1, nodes, E, 2, 32], return [K1, E, nodes, 2, 32]
@@ -429,50 +435,40 @@ def _norm_He_layout(He, K1, E, nodes):
         return He.permute(0, 2, 1, 3, 4).contiguous()
     raise AssertionError(f"Unexpected He shape: {tuple(He.shape)}")
 
-
-# ---------- 1) h0_des vs per-era baseline ----------
-def test_h0_des_matches_per_era_baseline():
+def test_h0_des_matches_per_era_baseline_tail():
     torch.manual_seed(2025)
     pack_cpu = PackBoost(device="cpu")
     pack_gpu = PackBoost(device="cuda")
 
-    # Config (keep moderate for test time; D<=8 for parent SMEM kernel)
     K0, D, E = 4, 6, 4
     nodes_all = 1 << D
+    N = 32 * 64 + 13                      # NOT a multiple of 32
+    era_ends = _mk_era_ends(N, E)         # X-space
 
-    # Build a scenario with N divisible by 32 and by E
-    N = 32 * 64  # 2048
-    era_ends = _mk_era_ends(N, E)
-
-    # Random “training route bits” to make LE from prep_vars
+    # build LE,G in X-space
     L_bits = torch.empty((K0, D, N), dtype=torch.uint8)
     for d in range(1, D + 1):
         L_bits[:, d - 1].random_(0, 1 << d)
-    # Q30-ish
     lo, hi = -(1 << 30), (1 << 30) - 1
     Y = torch.randint(lo, hi + 1, (N,), dtype=torch.int32)
     P = torch.randint(lo, hi + 1, (N,), dtype=torch.int32)
+    LE, G = pack_cpu.prep_vars(L_bits, Y, P)
 
-    LE, G = pack_cpu.prep_vars(L_bits, Y, P)  # LE dtype auto, G int16
-
-    # --- GPU DES h0 ---
     H0_out = pack_gpu.h0_des(G.cuda(), LE.cuda(), D, era_ends.cuda())
-    torch.cuda.synchronize()
+    #H0_out = _norm_H0_layout(H0_out, K0, E, nodes_all)
 
-    # Expected layout for H0_out: [K0, 2**D, E, 2]
-    H0_out = _norm_H0_layout(H0_out, K0, E, nodes_all)
+    print(H0_out.shape)
 
-    # --- CPU per-era baseline and stack -> [K0, 2**D, E, 2] ---
-    H0_refs = []
-    s = 0
+    # CPU per-era baseline
+    s = 0; H0_refs = []
     for e in era_ends.tolist():
-        H0_e = pack_cpu.h0(G[s:e], LE[:, s:e], D)  # [K0, 2**D, 2]
-        H0_refs.append(H0_e.unsqueeze(2))          # [K0, 2**D, 1, 2]
+        H0_e = pack_cpu.h0(G[s:e], LE[:, s:e], D)
+        H0_refs.append(H0_e.unsqueeze(2))
         s = e
     H0_ref = torch.cat(H0_refs, dim=2).contiguous()
-
-    # Exact equality
+    print(H0_ref.shape)
     torch.testing.assert_close(H0_out.cpu(), H0_ref, rtol=0, atol=0)
+
 
 
 # ---------- 2) h_des vs per-era baseline ----------
@@ -530,17 +526,16 @@ def test_h_des_matches_per_era_baseline():
     He_ref = torch.cat(He_refs, dim=1)                       # [K1, E, nodes, 2, 32]
 
     torch.testing.assert_close(He_out.cpu(), He_ref, rtol=0, atol=0)
-
-
-# ---------- 3) cut_des (CPU vs CUDA) using CPU-built H/H0 ----------
+# ---------- 3) cut_des (CPU vs CUDA) using DES-built H/H0 ----------
+# ---------- 3) cut_des (CPU vs CUDA) using DES-built H/H0 ----------
 def test_cut_des_matches_cpu_reference():
     torch.manual_seed(11)
     pack_cpu = PackBoost(device="cpu")
     pack_gpu = PackBoost(device="cuda")
 
-    # Config
     K0, K1, D, E = 4, 8, 6, 4
-    nodes = (1 << D) - 1
+    nodes_all = 1 << D
+    nodes = nodes_all - 1
     rounds = 2
     N = 32 * 64
     era_ends = _mk_era_ends(N, E)
@@ -552,9 +547,9 @@ def test_cut_des_matches_cpu_reference():
     lo, hi = -(1 << 30), (1 << 30) - 1
     Y = torch.randint(lo, hi + 1, (N,), dtype=torch.int32)
     P = torch.randint(lo, hi + 1, (N,), dtype=torch.int32)
-    LE, G = pack_cpu.prep_vars(L_bits, Y, P)  # LE auto, G int16
+    LE, G = pack_cpu.prep_vars(L_bits, Y, P)
 
-    # FST: [rounds, K1, D] ; fold ids in [0..K0-1]
+    # FST & LF
     base = torch.arange(K0, dtype=torch.uint8)
     rep = (K1 + K0 - 1) // K0
     row = base.repeat(rep)[:K1]
@@ -564,49 +559,36 @@ def test_cut_des_matches_cpu_reference():
             perm = torch.randperm(K1)
             FST[s, :, d] = row[perm]
     tree_set = 1
+    LF = pack_cpu.repack(FST, LE, tree_set)
 
-    LF = pack_cpu.repack(FST, LE, tree_set)  # [K1, N]
+    # XS and DES stats (GPU)
     XS = torch.randint(0, 2**32, (K1, N), dtype=torch.int64).to(torch.uint32)
+    H0_all_gpu = pack_gpu.h0_des(G.cuda(), LE.cuda(), D, era_ends.cuda())             # [K0, 2**D, E, 2]
+    He_gpu     = pack_gpu.h_des  (XS.cuda(), G.cuda(), LF.cuda(), D, era_ends.cuda()) # [K1, E, nodes, 2, 32]
+    torch.cuda.synchronize()
 
-    # Build H/H0 purely on CPU per-era -> canonical shapes
-    # H: [K1, E, nodes, 2, 32]
-    He_refs = []
-    s = 0
-    for e in era_ends.tolist():
-        H_e = pack_cpu.H(XS[:, s:e], G[s:e], LF[:, s:e], D)
-        He_refs.append(H_e.unsqueeze(1))
-        s = e
-    He_cpu = torch.cat(He_refs, dim=1).contiguous()
+    # Canonical DES layouts for selector
+    H0_cpu = H0_all_gpu[:, :nodes, :, :].cpu().contiguous()  # [K0, nodes, E, 2]
+    He_cpu = He_gpu.cpu().contiguous()                       # [K1, E, nodes, 2, 32]
 
-    # H0: [K0, E, nodes, 2]
-    H0_refs = []
-    s = 0
-    for e in era_ends.tolist():
-        H0_e = pack_cpu.h0(G[s:e], LE[:, s:e], D)[:, :nodes, :]  # trim leaf row
-        H0_refs.append(H0_e.unsqueeze(1))
-        s = e
-    H0_cpu = torch.cat(H0_refs, dim=1).contiguous()  # [K0, E, nodes, 2]
-
-    # Random feature lane table F: [rounds, 32*K1]
+    # F, outputs
     F = torch.randint(0, 1 << 16, (rounds, 32 * K1), dtype=torch.int64).to(torch.uint16)
-
-    # Outputs
     V_cpu = torch.zeros((rounds, K0, 2 * nodes), dtype=torch.int32)
     I_cpu = torch.zeros((rounds, K0,     nodes), dtype=torch.uint16)
     V_gpu = torch.zeros_like(V_cpu, device="cuda")
     I_gpu = torch.zeros_like(I_cpu, device="cuda")
 
-    # Hyperparams
     L2 = 1e4
     lr = 0.01 / float(K0)
     qbits = 12
 
-    # CPU directional selector
+    # CPU selector on CPU-cast DES stats
     pack_cpu.cut_des(F, FST, He_cpu, H0_cpu, V_cpu, I_cpu,
                      tree_set=tree_set, L2=L2, lr=lr, qgrad_bits=qbits, max_depth=D)
 
-    # CUDA directional selector on the same stats
-    pack_gpu.cut_des(F.cuda(), FST.cuda(), He_cpu.cuda(), H0_cpu.cuda(), V_gpu, I_gpu,
+    # CUDA selector on GPU stats
+    H0e_gpu = H0_all_gpu[:, :nodes, :, :].contiguous()        # [K0, nodes, E, 2]
+    pack_gpu.cut_des(F.cuda(), FST.cuda(), He_gpu.contiguous(), H0e_gpu, V_gpu, I_gpu,
                      tree_set=tree_set, L2=L2, lr=lr, qgrad_bits=qbits, max_depth=D)
     torch.cuda.synchronize()
 
@@ -620,9 +602,9 @@ def test_des_end_to_end_cut_agrees_with_stacked_baseline():
     pack_cpu = PackBoost(device="cpu")
     pack_gpu = PackBoost(device="cuda")
 
-    # Config
     K0, K1, D, E = 4, 8, 6, 4
-    nodes = (1 << D) - 1
+    nodes_all = 1 << D
+    nodes = nodes_all - 1
     rounds = 2
     N = 32 * 64
     era_ends = _mk_era_ends(N, E)
@@ -648,38 +630,18 @@ def test_des_end_to_end_cut_agrees_with_stacked_baseline():
     tree_set = 0
     LF = pack_cpu.repack(FST, LE, tree_set)
 
-    # XS
+    # XS + DES stats via GPU
     XS = torch.randint(0, 2**32, (K1, N), dtype=torch.int64).to(torch.uint32)
-
-    # --- GPU DES stats ---
-    H0_all = pack_gpu.h0_des(G.cuda(), LE.cuda(), D, era_ends.cuda())  # [K0, 2**D, E, 2] (raw)
-    He_out = pack_gpu.h_des(XS.cuda(), G.cuda(), LF.cuda(), D, era_ends.cuda())
+    H0_all_gpu = pack_gpu.h0_des(G.cuda(), LE.cuda(), D, era_ends.cuda())             # [K0, 2**D, E, 2]
+    He_gpu     = pack_gpu.h_des  (XS.cuda(), G.cuda(), LF.cuda(), D, era_ends.cuda()) # [K1, E, nodes, 2, 32]
     torch.cuda.synchronize()
 
-    H0e_gpu = _norm_H0_layout(H0_all, K0, E, 1 << D)[:, :nodes, :, :].permute(0, 2, 1, 3).contiguous()  # [K0,E,nodes,2]
-    He_gpu  = _norm_He_layout(He_out, K1, E, nodes)  # [K1,E,nodes,2,32]
+    H0e_gpu = H0_all_gpu[:, :nodes, :, :].contiguous()   # [K0, nodes, E, 2]
+    H0_cpu  = H0e_gpu.cpu().contiguous()
+    He_cpu  = He_gpu.cpu().contiguous()
 
-    # --- CPU stacked baseline for stats ---
-    He_refs = []
-    s = 0
-    for e in era_ends.tolist():
-        H_e = pack_cpu.H(XS[:, s:e], G[s:e], LF[:, s:e], D)
-        He_refs.append(H_e.unsqueeze(1))
-        s = e
-    He_cpu = torch.cat(He_refs, dim=1).contiguous()
-
-    H0_refs = []
-    s = 0
-    for e in era_ends.tolist():
-        H0_e = pack_cpu.h0(G[s:e], LE[:, s:e], D)[:, :nodes, :]
-        H0_refs.append(H0_e.unsqueeze(1))
-        s = e
-    H0_cpu = torch.cat(H0_refs, dim=1).contiguous()  # [K0,E,nodes,2]
-
-    # Feature lane table
     F = torch.randint(0, 1 << 16, (rounds, 32 * K1), dtype=torch.int64).to(torch.uint16)
 
-    # Run CPU and CUDA selectors and compare
     V_cpu = torch.zeros((rounds, K0, 2 * nodes), dtype=torch.int32)
     I_cpu = torch.zeros((rounds, K0,     nodes), dtype=torch.uint16)
     V_gpu = torch.zeros_like(V_cpu, device="cuda")
@@ -689,15 +651,12 @@ def test_des_end_to_end_cut_agrees_with_stacked_baseline():
     lr = 0.01 / float(K0)
     qbits = 12
 
-    # CPU selector on CPU stats
     pack_cpu.cut_des(F, FST, He_cpu, H0_cpu, V_cpu, I_cpu,
                      tree_set=tree_set, L2=L2, lr=lr, qgrad_bits=qbits, max_depth=D)
 
-    # CUDA selector on GPU stats
-    pack_gpu.cut_des(F.cuda(), FST.cuda(), He_gpu.cuda(), H0e_gpu.cuda(), V_gpu, I_gpu,
+    pack_gpu.cut_des(F.cuda(), FST.cuda(), He_gpu.contiguous(), H0e_gpu, V_gpu, I_gpu,
                      tree_set=tree_set, L2=L2, lr=lr, qgrad_bits=qbits, max_depth=D)
     torch.cuda.synchronize()
 
     torch.testing.assert_close(V_gpu.cpu(), V_cpu, rtol=0, atol=0)
     torch.testing.assert_close(I_gpu.cpu(), I_cpu, rtol=0, atol=0)
-

@@ -29,7 +29,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
             era_ids: np.ndarray | None = None):
         assert X.dtype == np.int8 and y.dtype == np.float32
         device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
-        print(device)
         callbacks = [] if callbacks is None else callbacks
 
         # ---------- meta ----------
@@ -45,28 +44,20 @@ class PackBoost(BaseEstimator, RegressorMixin):
         # ---------- eras -> era_ends ----------
         N, F = X.shape
         self.train_N = int(N)
-        # --- eras -> ends-only (int32) ---
-        print('here in preproc?')
         if era_ids is None:
-            ends_np = np.array([N], dtype=np.int32)  # single era, ends-only
+            ends_np = np.array([N], dtype=np.int32)   # single era
             use_des = False
         else:
-            print('here in preproc?2')
-
             e_np = era_ids if isinstance(era_ids, np.ndarray) else np.asarray(era_ids)
             assert e_np.shape[0] == N
             change = np.flatnonzero(e_np[1:] != e_np[:-1]) + 1
             ends_np = np.concatenate((change, [N])).astype(np.int32)
             use_des = True
         era_ends = torch.from_numpy(ends_np).to(device=device, dtype=torch.int32).contiguous()
-        print('here in preproc?3')
-
-
 
         # ---------- encode_cuts(X) ----------
         X_t = torch.from_numpy(X).to(device=device, dtype=torch.int8)
-        XB  = self.encode_cuts(X_t).contiguous()                    # [4F, M] uint32
-        print('here?')
+        XB  = self.encode_cuts(X_t).contiguous()              # [4F, M] uint32
         bF, M = XB.shape
         Np = 32 * M
         del X_t
@@ -92,7 +83,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
         if bF >= (1 << 16):
             raise ValueError(f"encode_cuts produced {bF} bitplanes (4*F). "
                             f"Schedule dtype is uint16; reduce F or extend to uint32.")
-        lanes = 32
         Fsch_cpu = torch.from_numpy(
             rng.randint(0, bF, size=(rounds, lanes * nfeatsets), dtype=np.uint16)
         ).contiguous()
@@ -119,8 +109,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
             Nv = int(Xv.shape[0]); self.val_N = Nv
             Xv_t = torch.from_numpy(Xv).to(device=device, dtype=torch.int8)
             XBv  = self.encode_cuts(Xv_t).contiguous()
-            print('here?')
-            Mv   = XBv.shape[1]
             Pv   = torch.zeros(Nv, dtype=torch.int32, device=device)
             yvq30  = (Yv * (1 << 30)).astype(np.int64)
             Yv_i32 = torch.from_numpy(yvq30[:Nv].astype(np.int32)).to(device=device)
@@ -143,60 +131,41 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
         for t in range(rounds):
             # (a) feature sampling -> XS [nfeatsets, 32*M] uint32
-            print('huh?')
             if XB.is_cuda and torch.cuda.is_available():
                 XS = self.et_sample_1b(XB, self.Fsch, t).contiguous()
             else:
                 XS = self.et_sample_1b(XB, Fsch_cpu, t).to(device)
-            print('here?')
 
             # (b) pack leaves & gradients (length N)
             LE, G = self.prep_vars(L_old, Y_i32, P)  # LE: u16/u32/u64 ; G: int16
-            print('here?')
 
             # (c) repack by feature schedule -> LF [nfeatsets, N]
             LF = self.repack(FST, LE, t).contiguous()
-            print('here?')
 
-            # (d) histograms
+            # (d) histograms & (e) choose cuts
             if use_des:
-                # one canonical era_ends tensor on the right device
-                # ends-only vector; last must equal N
-                print('here?-1')
-                print('here?')
+                # DES path (multi-era aware). Kernel API shapes:
+                #   h0_des -> [K0, 2**D, E, 2]
+                #   h_des  -> [K1, E, (2**D-1), 2, 32]
+                #   cut_des expects H0 in nodes-major: [K0, nodes, E, 2]
                 if int(era_ends[-1].item()) != N:
                     raise ValueError(f"era_ends[-1] must equal N ({N}), got {int(era_ends[-1].item())}")
 
-                # per-era parents (K0, 2**D, E, 2) -> slice + permute -> (K0, E, nodes, 2)
-                # H0: [K0, 2**D, E, 2] -> permute + slice to [K0, E, nodes, 2]
-                print('here?1')
+                H0_all = self.h0_des(G, LE, int(max_depth), era_ends)            # [K0, 2**D, E, 2]
+                H0e    = H0_all[:, :nodes, :, :].contiguous()                    # [K0, nodes, E, 2]  (NO permute)
+                He     = self.h_des(XS, G, LF, int(max_depth), era_ends)         # [K1, E, nodes, 2, 32]
 
-                H0_all = self.h0_des(G, LE, int(max_depth), era_ends)
-                print('here?2')
-
-                H0e = H0_all.permute(0, 2, 1, 3)[:, :, :nodes, :].contiguous()
-                print('here?3')
-
-
-                # He: already [K1, E, nodes, 2, 32]
-                He = self.h_des(XS, G, LF, int(max_depth), era_ends)
-                print('here?4')
-
-
-                # (e) choose best directional cuts
                 self.cut_des(self.Fsch, FST, He, H0e, V, I,
                             tree_set=t, L2=L2, lr=lr_per_fold,
                             qgrad_bits=qgrad_bits, max_depth=D)
-                print('here?5')
-
 
                 del He, H0_all, H0e
             else:
-                # Non-DES path
-                H  = self.H (XS, G, LF, D).contiguous()
-                H0 = self.h0(G, LE, D).contiguous()
-                self.cut(self.Fsch, FST, H, H0[:, : H.size(1), :].contiguous(), V, I,
-                        tree_set=t, L2=L2, lr=lr_per_fold,
+                # Non-DES path (single era)
+                H  = self.H (XS, G, LF, D).contiguous()                          # [K1, nodes, 2, 32]
+                H0 = self.h0(G, LE, D).contiguous()                              # [K0, 2**D, 2]
+                self.cut(self.Fsch, FST, H, H0[:, : H.size(1), :].contiguous(),  # -> [K0, nodes, 2]
+                        V, I, tree_set=t, L2=L2, lr=lr_per_fold,
                         qgrad_bits=qgrad_bits, max_depth=D)
                 del H, H0
 
@@ -940,8 +909,8 @@ class PackBoost(BaseEstimator, RegressorMixin):
     def cut_des(self,
                 F:  torch.Tensor,   # [rounds, 32*K1] uint16
                 FST:torch.Tensor,   # [rounds, K1, D] uint8
-                H:  torch.Tensor,   # [K1, E, nodes, 2, 32] int64
-                H0: torch.Tensor,   # [K0, E, nodes, 2]     int64
+                H:  torch.Tensor,   # [K1, E, nodes, 2, 32] (lane-resolved, ERA-MAJOR)
+                H0: torch.Tensor,   # [K0, nodes, E, 2]     (parent totals per era)
                 V:  torch.Tensor,   # [rounds, K0, 2*nodes] int32
                 I:  torch.Tensor,   # [rounds, K0, nodes]   uint16
                 *,
@@ -950,148 +919,132 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 lr: float,
                 qgrad_bits: int,
                 max_depth: int):
-        """
-        CPU fallback for directional DES selection.
-        Mirrors CUDA logic:
-        - For each leaf and fold, track per-lane best candidate across k
-        - Reduce across lanes with tie rule: (dir, sbits), then highest lane index
-        """
         use_cuda = any(t.is_cuda for t in (F, FST, H, H0, V, I)) and torch.cuda.is_available()
         if use_cuda:
             from packboost.cuda import kernels
             kernels.cut_cuda_des(
                 F.contiguous(), FST.contiguous(),
-                H.contiguous(), H0.contiguous(),
+                H.contiguous(), H0.contiguous(),     # NOTE: no permute; kernel expects [K0,nodes,E,2]
                 V, I,
                 int(tree_set), float(L2), float(lr),
                 int(qgrad_bits), int(max_depth)
             )
             return V, I
 
-        # ---------- CPU path ----------
-        device = H.device
+        # ---------------- CPU fallback (bit-for-bit tie logic with warp emulation) ----------------
         assert H.dtype == torch.int64 and H0.dtype == torch.int64
         K1, E, nodes, two, lanes = H.shape
         K0 = int(H0.shape[0])
         assert two == 2 and lanes == 32, "H must be [K1,E,nodes,2,32]"
-        assert H0.shape == (K0, E, nodes, 2), "H0 must be [K0,E,nodes,2]"
-        assert I.dtype in (torch.uint16, torch.int16)
-        assert V.dtype == torch.int32
+        assert H0.shape == (K0, nodes, E, 2), "H0 must be [K0,nodes,E,2]"
+        assert V.shape == (F.shape[0], K0, 2*nodes)
+        assert I.shape == (F.shape[0], K0, nodes)
 
+        device = H.device
         D = int(FST.shape[2])
         assert nodes == (1 << max_depth) - 1 and D >= max_depth, "depth mismatch"
+
+        # Only the selected tree_set row of F matters here
+        K1x32 = int(F.shape[1]); assert K1x32 == 32 * K1
+        F_row = (F[int(tree_set)].to(torch.int64) & 0xFFFF)  # [32*K1] as unsigned
 
         # depth per leaf
         leaf_ids = torch.arange(nodes, device=device, dtype=torch.long)
         depth = torch.floor(torch.log2(leaf_ids.to(torch.float32) + 1.0)).to(torch.long)  # [nodes]
 
-        # scales per leaf (match CUDA)
-        L2_eff = torch.tensor(L2, dtype=torch.float32, device=device) * torch.pow(
-            torch.tensor(2.0, device=device), 5.0 - depth.to(torch.float32)
-        )  # [nodes]
-        qscale = torch.tensor(lr, dtype=torch.float32, device=device) * float(1 << (31 - int(qgrad_bits))) \
-                * torch.pow(torch.tensor(2.0, device=device), -(float(max_depth) - depth.to(torch.float32)))  # [nodes]
+        # per-leaf scalars
+        L2_eff = (torch.tensor(L2, dtype=torch.float32, device=device)
+                * torch.pow(torch.tensor(2.0, device=device), 5.0 - depth.to(torch.float32)))
+        qscale = (torch.tensor(lr, dtype=torch.float32, device=device) * float(1 << (31 - int(qgrad_bits)))
+                * torch.pow(torch.tensor(2.0, device=device), -(float(max_depth) - depth.to(torch.float32))))
 
-        # fold-routing per (k, leaf) from FST[tree_set, k, depth]
-        tf_all = FST[int(tree_set)].gather(1, depth.unsqueeze(0).expand(K1, nodes)).to(torch.long)  # [K1,nodes]
+        # fold assignment per (k, node): FST[tree_set, k, depth[node]]
+        tf_all = FST[int(tree_set)][:, depth].to(torch.long)  # [K1, nodes]
 
-        # Slices for convenience
-        H_sum = H[:, :, :, 0, :]  # [K1, E, nodes, 32]
-        H_cnt = H[:, :, :, 1, :]  # [K1, E, nodes, 32]
-        H0_sum = H0[:, :, :, 0]   # [K0, E, nodes]
-        H0_cnt = H0[:, :, :, 1]   # [K0, E, nodes]
-
-        # Pre-get F row for this tree_set
-        F_row = (F[int(tree_set)].to(torch.int64) & 0xFFFF)  # [32*K1] as unsigned
-
-        # Iterate leaves
         for n in range(nodes):
-            d = int(depth[n].item())
-            L2n = L2_eff[n]
-            qsn = qscale[n]
+            d  = int(depth[n])
+            L2n= float(L2_eff[n].item())
+            qsn= float(qscale[n].item())
 
-            # For each fold
+            # lane-local best per fold
+            best_dir   = torch.full((32, K0), float('-inf'), dtype=torch.float32, device=device)
+            best_sbits = torch.full((32, K0), torch.iinfo(torch.int32).min, dtype=torch.int32,   device=device)
+            best_vl    = torch.zeros((32, K0), dtype=torch.int32, device=device)
+            best_vr    = torch.zeros((32, K0), dtype=torch.int32, device=device)
+            best_k     = torch.full((32, K0), -1, dtype=torch.int32, device=device)
+
+            for lane in range(32):
+                # IMPORTANT: each lane evaluates ALL k (matches CUDA), not striped k
+                for k in range(K1):
+                    f = int(tf_all[k, n])
+                    if not (0 <= f < K0):
+                        continue
+
+                    # Per-era stats for this lane
+                    G0 = H[k, :, n, 0, lane].to(torch.float32)  # [E]
+                    N0 = H[k, :, n, 1, lane].to(torch.float32)  # [E]
+                    GT = H0[f, n, :, 0].to(torch.float32)       # [E]
+                    HT = H0[f, n, :, 1].to(torch.float32)       # [E]
+
+                    G1 = GT - G0
+                    N1 = HT - N0
+
+                    valid = (N0 > 0.0) & (N1 > 0.0)
+                    eras_used = int(valid.sum().item())
+                    if eras_used > 0:
+                        V0 = G0 / (N0 + L2n)
+                        V1 = G1 / (N1 + L2n)
+                        sum_dir = torch.sign(V1 - V0)[valid].sum().abs().item()
+                        dir_score = float(sum_dir) / float(eras_used)
+                    else:
+                        dir_score = 0.0
+
+                    # classic pooled gain S using lane-local left and parent pooled across eras
+                    G0_tot = G0.sum().item(); N0_tot = N0.sum().item()
+                    GT_tot = GT.sum().item(); HT_tot = HT.sum().item()
+                    G1_tot = GT_tot - G0_tot; N1_tot = HT_tot - N0_tot
+                    V0f = (G0_tot / (N0_tot + L2n)) if N0_tot > 0 else 0.0
+                    V1f = (G1_tot / (N1_tot + L2n)) if N1_tot > 0 else 0.0
+                    S   = (G0_tot * V0f) + (G1_tot * V1f)
+
+                    # float32 bit-pattern tie value
+                    S_bits = torch.tensor([S], dtype=torch.float32, device=device).view(torch.int32)[0].item()
+
+                    if (dir_score > best_dir[lane, f].item()) or \
+                    (dir_score == best_dir[lane, f].item() and S_bits > best_sbits[lane, f].item()):
+                        best_dir  [lane, f] = dir_score
+                        best_sbits[lane, f] = S_bits
+                        best_vl   [lane, f] = int(torch.trunc(torch.tensor(qsn * V0f, device=device)).item())
+                        best_vr   [lane, f] = int(torch.trunc(torch.tensor(qsn * V1f, device=device)).item())
+                        best_k    [lane, f] = k
+
+            # reduce across lanes per fold: max(dir) -> max(S_bits) -> highest lane id
             for f in range(K0):
-                # candidate mask (k) for this fold at this depth
-                kmask = (tf_all[:, n] == f)
-                if not kmask.any():
+                dir_col = best_dir[:, f]
+                if not torch.isfinite(dir_col).any():
                     continue
+                max_dir = torch.nan_to_num(dir_col, nan=-float('inf')).max().item()
+                m_dir = (best_dir[:, f] == max_dir)
 
-                # Track per-lane best across candidates
-                best_dir   = torch.full((32,), float('-inf'), dtype=torch.float32, device=device)
-                best_sbits = torch.full((32,), torch.iinfo(torch.int32).min, dtype=torch.int32, device=device)
-                best_vl    = torch.zeros(32, dtype=torch.int32, device=device)
-                best_vr    = torch.zeros(32, dtype=torch.int32, device=device)
-                best_k     = torch.full((32,), -1, dtype=torch.long, device=device)
-
-                # Parent stats across eras (no lane)
-                GT_fe = H0_sum[f, :, n].to(torch.float32)  # [E]
-                HT_fe = H0_cnt[f, :, n].to(torch.float32)  # [E]
-                GT_tot = GT_fe.sum()
-                HT_tot = HT_fe.sum()
-
-                # Loop candidates k that route to fold f
-                k_idx = kmask.nonzero(as_tuple=False).flatten()
-                for k in k_idx.tolist():
-                    # Per-lane per-era left stats
-                    G0 = H_sum[k, :, n, :].to(torch.float32)  # [E,32]
-                    N0 = H_cnt[k, :, n, :].to(torch.float32)  # [E,32]
-                    # Rights from parents
-                    G1 = GT_fe.view(E, 1) - G0               # [E,32]
-                    N1 = HT_fe.view(E, 1) - N0               # [E,32]
-
-                    valid = (N0 > 0.0) & (N1 > 0.0)          # [E,32]
-                    # Per-era values
-                    V0 = G0 / (N0 + L2n)
-                    V1 = G1 / (N1 + L2n)
-                    dir_sign = torch.sign(V1 - V0)           # [-1,0,1] per era/lane
-                    eras_used = valid.to(torch.int32).sum(dim=0)  # [32]
-                    sum_dir   = (dir_sign * valid.to(torch.float32)).sum(dim=0)  # [32]
-                    dir_score = torch.where(eras_used > 0,
-                                            sum_dir.abs() / eras_used.to(torch.float32),
-                                            torch.zeros_like(sum_dir, dtype=torch.float32))
-
-                    # Classic pooled (per lane for left, parent pooled once)
-                    G0_tot = G0.sum(dim=0)                   # [32]
-                    N0_tot = N0.sum(dim=0)                   # [32]
-                    V0f    = G0_tot / (N0_tot + L2n)
-                    V1f    = (GT_tot - G0_tot) / ((HT_tot - N0_tot) + L2n)
-                    S      = (G0_tot * V0f) + ((GT_tot - G0_tot) * V1f)  # [32]
-
-                    # float32->int32 bitcast for tie parity
-                    S_bits = torch.from_numpy(S.detach().cpu().numpy().view(np.int32)).to(device=device)
-
-                    # Compare lexicographically per lane
-                    better = (dir_score > best_dir) | ((dir_score == best_dir) & (S_bits > best_sbits))
-                    if better.any():
-                        best_dir   = torch.where(better, dir_score, best_dir)
-                        best_sbits = torch.where(better, S_bits,     best_sbits)
-                        best_vl    = torch.where(better, torch.trunc(qsn * V0f).to(torch.int32), best_vl)
-                        best_vr    = torch.where(better, torch.trunc(qsn * V1f).to(torch.int32), best_vr)
-                        best_k     = torch.where(better, torch.full_like(best_k, k),             best_k)
-
-                # Reduce across lanes: pick lanes with max dir, then max sbits, then highest lane index
-                max_dir = best_dir.max()
-                lanes_mask = (best_dir == max_dir)
-                if not lanes_mask.any():
-                    continue
-                # among these, max sbits
-                sb_masked = torch.where(lanes_mask, best_sbits, torch.full_like(best_sbits, torch.iinfo(torch.int32).min))
-                max_sbits = sb_masked.max()
-                winners = lanes_mask & (best_sbits == max_sbits)
+                sbits_masked = torch.where(
+                    m_dir,
+                    best_sbits[:, f],
+                    torch.full_like(best_sbits[:, f], torch.iinfo(torch.int32).min)
+                )
+                max_sbits = sbits_masked.max().item()
+                winners = m_dir & (best_sbits[:, f] == max_sbits)
                 if not winners.any():
                     continue
-                winner_lane = torch.nonzero(winners, as_tuple=False).flatten().max().item()  # highest lane index
-                k_star = int(best_k[winner_lane].item())
+
+                winner_lane = int(torch.nonzero(winners, as_tuple=False).flatten().max().item())
+                k_star = int(best_k[winner_lane, f].item())
                 if k_star < 0:
                     continue
 
-                # Write outputs
-                V[int(tree_set), f, 2*n    ] = best_vl[winner_lane]
-                V[int(tree_set), f, 2*n + 1] = best_vr[winner_lane]
+                V[int(tree_set), f, 2*n    ] = int(best_vl[winner_lane, f].item())
+                V[int(tree_set), f, 2*n + 1] = int(best_vr[winner_lane, f].item())
 
-                feat_pos = k_star * 32 + int(winner_lane)
+                feat_pos = k_star * 32 + winner_lane
                 I[int(tree_set), f, n] = (F_row[feat_pos] & 0xFFFF).to(torch.uint16)
 
         return V, I
-

@@ -1,8 +1,9 @@
-// packboost/cuda/h_des.cu
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+
+// ---------------- Helper Functions ----------------
 
 static __device__ __forceinline__ unsigned long long pack_sc(int sum32, int cnt32) {
   return ( (unsigned long long)(unsigned int)cnt32 << 32 ) |
@@ -17,7 +18,7 @@ static __device__ __forceinline__ unsigned long long add_pack(unsigned long long
 }
 
 // H layout helper: [K1, nE, nodes, 2, 32]
-static inline __device__ unsigned long long* HptrE(
+static __device__ __forceinline__ unsigned long long* HptrE(
     int64_t* H, int nodes, int nE,
     int feat, int era, int node, int chan, int lane)
 {
@@ -26,6 +27,23 @@ static inline __device__ unsigned long long* HptrE(
         + (size_t)chan) * 32u + (size_t)lane);
   return (unsigned long long*)(H + idx);
 }
+
+// REFACTORED HELPER: Flushes register-accumulated packed values to global memory
+static __device__ __forceinline__ void flush_node_reg(
+    int node, unsigned long long P,
+    int64_t* H, int nodes_total, int E,
+    int feat_set, int era, int lane)
+{
+  const long long sum_ll = (long long)(int)(uint32_t)P;
+  const long long cnt_ll = (long long)(int)(uint32_t)(P >> 32);
+  if (sum_ll | cnt_ll) {
+    unsigned long long* ps = HptrE(H, nodes_total, E, feat_set, era, node, 0, lane);
+    unsigned long long* pc = HptrE(H, nodes_total, E, feat_set, era, node, 1, lane);
+    if (sum_ll) atomicAdd(ps, (unsigned long long)sum_ll);
+    if (cnt_ll) atomicAdd(pc, (unsigned long long)cnt_ll);
+  }
+}
+
 
 // ---------------- Kernel (templated on LF dtype) ----------------
 // XS: [K1, cols_32M] (cols_32M = 32*M, padded), each entry is a 32-bit "lane" word
@@ -36,10 +54,10 @@ static inline __device__ unsigned long long* HptrE(
 template <typename LF_T>
 __global__ void _h_des_sm(
     const uint32_t* __restrict__ XS,
-    const int16_t*  __restrict__ Y,
-    const LF_T*     __restrict__ LF,
-    const int32_t*  __restrict__ era_ends,
-    int64_t*        __restrict__ H,
+    const int16_t* __restrict__ Y,
+    const LF_T* __restrict__ LF,
+    const int32_t* __restrict__ era_ends,
+    int64_t* __restrict__ H,
     int K1, int cols_32M, int N, int E, int max_depth,
     int warps_per_block, int stride, int nodes_total)
 {
@@ -125,7 +143,8 @@ __global__ void _h_des_sm(
         sh_high[(r * 2 + 0) * 32 + lane] = 0; // sum
         sh_high[(r * 2 + 1) * 32 + lane] = 0; // cnt
       }
-      __syncwarp();
+      // FIX 1: Use __syncthreads for block-level shared memory.
+      __syncthreads();
 
       // low-depth packed (registers) for this segment
       unsigned long long p0  = 0ull;                   // node 0
@@ -171,29 +190,24 @@ __global__ void _h_des_sm(
           const int node = (int)to + (int)tkd;   // 7..nodes_total-1
           const int idx  = node - 7;
           if (v) {
-            sh_high[(idx * 2 + 0) * 32 + lane] += (int)yk; // sum
-            sh_high[(idx * 2 + 1) * 32 + lane] += 1;       // cnt
+            // FIX 2: Use atomicAdd for safer updates to shared memory.
+            atomicAdd(&sh_high[(idx * 2 + 0) * 32 + lane], (int)yk); // sum
+            atomicAdd(&sh_high[(idx * 2 + 1) * 32 + lane], 1);       // cnt
           }
         }
       } // k
 
       // flush low depths (nodes 0..6) to global for this ERA
-      auto flush_node = [&](int node, unsigned long long P) {
-        const long long sum_ll = (long long)(int)(uint32_t)P;
-        const long long cnt_ll = (long long)(int)(uint32_t)(P >> 32);
-        if (sum_ll | cnt_ll) {
-          unsigned long long* ps = HptrE(H, nodes_total, E, feat_set, era, node, 0, lane);
-          unsigned long long* pc = HptrE(H, nodes_total, E, feat_set, era, node, 1, lane);
-          if (sum_ll) atomicAdd(ps, (unsigned long long)sum_ll);
-          if (cnt_ll) atomicAdd(pc, (unsigned long long)cnt_ll);
-        }
-      };
-      flush_node(0, p0);
-      flush_node(1, p10); flush_node(2, p11);
-      flush_node(3, p20); flush_node(4, p21);
-      flush_node(5, p22); flush_node(6, p23);
+      flush_node_reg(0, p0,  H, nodes_total, E, feat_set, era, lane);
+      flush_node_reg(1, p10, H, nodes_total, E, feat_set, era, lane);
+      flush_node_reg(2, p11, H, nodes_total, E, feat_set, era, lane);
+      flush_node_reg(3, p20, H, nodes_total, E, feat_set, era, lane);
+      flush_node_reg(4, p21, H, nodes_total, E, feat_set, era, lane);
+      flush_node_reg(5, p22, H, nodes_total, E, feat_set, era, lane);
+      flush_node_reg(6, p23, H, nodes_total, E, feat_set, era, lane);
 
-      __syncwarp();
+      // FIX 3: Sync all threads in the block before reading from shared memory.
+      __syncthreads();
 
       // drain shared high-depth rows to global for this ERA
       const int rows_per_warp = (n_ge3 + warps_per_block - 1) / warps_per_block;
@@ -210,7 +224,8 @@ __global__ void _h_des_sm(
           }
         }
       }
-      __syncwarp();
+      // FIX 4: Sync after draining to prevent a race on the next segment's zeroing phase.
+      __syncthreads();
     } // segments
   } // tiles
 }
@@ -221,7 +236,6 @@ static inline int ceil_div_int(int a, int b){ return (a + b - 1) / b; }
 static inline int choose_warps_that_fit(size_t smem_high, size_t smem_cap) {
   int wpb = 16;
   while (wpb > 1) {
-    // DES version only uses "high" shared (no low-depth buffer)
     if (smem_high <= smem_cap) break;
     wpb >>= 1;
   }
@@ -266,24 +280,25 @@ torch::Tensor h_des(
   const int cols_32M = (int)XS.size(1);
   const int N        = (int)Y.size(0);
 
-  // Era ends -> device int32
   auto era_i32 = era_ends.to(XS.device(), torch::kInt32, /*non_blocking=*/false, /*copy=*/true)
                          .contiguous();
   TORCH_CHECK(era_i32.dim()==1, "era_ends must be 1-D.");
   const int E = (int)era_i32.size(0);
   TORCH_CHECK(E >= 1, "era_ends must have at least one item (N).");
-  TORCH_CHECK(((int)era_i32.data_ptr<int32_t>()[E-1]) == N,
-              "era_ends[-1] must equal N.");
+
+  // Check on host to avoid device-side assert
+  int last_era_end_host;
+  cudaMemcpy(&last_era_end_host, era_i32.data_ptr<int32_t>() + (E - 1), sizeof(int32_t), cudaMemcpyDeviceToHost);
+  TORCH_CHECK(last_era_end_host == N, "era_ends[-1] must equal N.");
+
 
   const int nodes_total = (1 << max_depth) - 1;
 
-  // Output H: [K1, E, nodes, 2, 32] int64
   auto H = torch::zeros({ (long long)K1, (long long)E,
                           (long long)nodes_total, 2LL, 32LL },
                         XS.options().dtype(torch::kLong)
                            .memory_format(c10::MemoryFormat::Contiguous));
 
-  // Dynamic SHMEM: just high-depth part: (nodes_total - 7, 2, 32) * sizeof(int)
   int n_ge3 = nodes_total - 7; if (n_ge3 < 1) n_ge3 = 1;
   const size_t smem_high = (size_t)n_ge3 * 2 * 32 * sizeof(int);
 

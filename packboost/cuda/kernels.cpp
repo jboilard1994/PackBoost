@@ -101,14 +101,13 @@ torch::Tensor h_des(
     int max_depth);
 
 void cut_des_cuda_launcher(
-    torch::Tensor F,
-    torch::Tensor FST,
-    torch::Tensor H,
-    torch::Tensor H0,
-    torch::Tensor V,
-    torch::Tensor I,
-    int tree_set,
-    double L2, double lr, int qgrad_bits, int max_depth);
+    torch::Tensor F,   // [rounds, 32*K1] uint16
+    torch::Tensor FST, // [rounds, K1, D] uint8
+    torch::Tensor H,   // [K1, E, nodes, 2, 32] int64
+    torch::Tensor H0,  // [K0, nodes, E, 2]     int64
+    torch::Tensor V,   // [rounds, K0, 2*nodes] int32
+    torch::Tensor I,   // [rounds, K0, nodes]   uint16
+    int tree_set, double L2, double lr, int qgrad_bits, int max_depth);
 
 namespace {
 
