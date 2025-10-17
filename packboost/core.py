@@ -14,10 +14,8 @@ class PackBoost(BaseEstimator, RegressorMixin):
         self.nfeatsets = 32
 
     def fit(self,
-            X: np.ndarray,         # int8 [N, F]
-            y: np.ndarray,         # float32 [N]
-            Xv: np.ndarray = None, # int8  [Nv, F]
-            Yv: np.ndarray = None, # float32 [Nv]
+            X: np.ndarray, y: np.ndarray,
+            Xv: np.ndarray = None, Yv: np.ndarray = None,
             nfolds: int = 8,
             rounds: int = 10_000,
             max_depth: int = 7,
@@ -25,20 +23,13 @@ class PackBoost(BaseEstimator, RegressorMixin):
             *,
             lr: float = 0.07,
             L2: float = 100_000.0,
-            nfeatsets: int = 32,     # e.g., 16*2
+            nfeatsets: int = 32,
             qgrad_bits: int = 12,
             seed: int = 42,
-            era_ids: np.ndarray | None = None  # NEW (sorted, contiguous eras)
-            ):
-        """
-        If `era_ids` is provided (sorted, contiguous eras), use DES:
-        - H0 -> per-era parents via h0_des()
-        - H  -> per-era left stats via h_des()
-        - cut -> directional-only DES via cut_des()
-        Otherwise, fall back to the original non-DES route.
-        """
+            era_ids: np.ndarray | None = None):
         assert X.dtype == np.int8 and y.dtype == np.float32
         device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
+        print(device)
         callbacks = [] if callbacks is None else callbacks
 
         # ---------- meta ----------
@@ -51,64 +42,65 @@ class PackBoost(BaseEstimator, RegressorMixin):
         lanes  = 32
         leaf_dtype = (torch.uint8 if D <= 8 else torch.uint16)
 
-        # ---------- 0) eras -> era_bounds (contiguous offsets) ----------
+        # ---------- eras -> era_ends ----------
         N, F = X.shape
         self.train_N = int(N)
+        # --- eras -> ends-only (int32) ---
+        print('here in preproc?')
         if era_ids is None:
-            era_bounds = torch.tensor([0, N], device=device, dtype=torch.int64)
-            self.era_bounds_ = era_bounds
+            ends_np = np.array([N], dtype=np.int32)  # single era, ends-only
             use_des = False
         else:
-            # accept numpy/torch; assume already sorted by era and contiguous
-            e_np = era_ids if isinstance(era_ids, np.ndarray) else np.asarray(era_ids)
-            assert e_np.shape[0] == N, "era_ids must be length N"
-            # boundaries where era changes
-            change = np.flatnonzero(e_np[1:] != e_np[:-1]) + 1
-            bounds_np = np.concatenate(([0], change, [N])).astype(np.int64)
-            era_bounds = torch.from_numpy(bounds_np).to(device=device)
-            self.era_bounds_ = era_bounds
-            use_des = True
+            print('here in preproc?2')
 
-        # ---------- 1) encode_cuts(X) ----------
+            e_np = era_ids if isinstance(era_ids, np.ndarray) else np.asarray(era_ids)
+            assert e_np.shape[0] == N
+            change = np.flatnonzero(e_np[1:] != e_np[:-1]) + 1
+            ends_np = np.concatenate((change, [N])).astype(np.int32)
+            use_des = True
+        era_ends = torch.from_numpy(ends_np).to(device=device, dtype=torch.int32).contiguous()
+        print('here in preproc?3')
+
+
+
+        # ---------- encode_cuts(X) ----------
         X_t = torch.from_numpy(X).to(device=device, dtype=torch.int8)
         XB  = self.encode_cuts(X_t).contiguous()                    # [4F, M] uint32
+        print('here?')
         bF, M = XB.shape
-        Np = 32 * M                                                 # padded length for XS/XB only
+        Np = 32 * M
         del X_t
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-        # Q30 labels (length **N**, not Np) and preds buffer
+        # labels/preds (length N, unpadded)
         yq30  = (y * (1 << 30)).astype(np.int64)
         Y_i32 = torch.from_numpy(yq30[:N].astype(np.int32)).to(device=device)
         P     = torch.zeros(N, dtype=torch.int32, device=device)
 
-        # stash for callbacks / parity dumps
         self.Y_i32 = Y_i32
         self.P_    = P
-        self.dY    = Y_i32  # legacy
+        self.dY    = Y_i32
         self.dP    = P
 
-        # leaf buffers (length **N**)
+        # leaves (length N)
         L_old = torch.zeros((nfolds, Dm, N), dtype=leaf_dtype, device=device)
         L_new = torch.zeros_like(L_old)
 
-        # ---------- 2) schedules ----------
+        # ---------- schedules ----------
         rng = np.random.RandomState(seed)
-
-        # Fsch: [rounds, 32*nfeatsets] uint16 indices into XB rows (0..bF-1)
         if bF >= (1 << 16):
             raise ValueError(f"encode_cuts produced {bF} bitplanes (4*F). "
                             f"Schedule dtype is uint16; reduce F or extend to uint32.")
-        Fsch_cpu = torch.from_numpy(  # keep a CPU copy in case you run CPU path
+        lanes = 32
+        Fsch_cpu = torch.from_numpy(
             rng.randint(0, bF, size=(rounds, lanes * nfeatsets), dtype=np.uint16)
         ).contiguous()
-        self.Fsch = Fsch_cpu.to(device=device, dtype=torch.uint16).contiguous()  # uint16 on device
+        self.Fsch = Fsch_cpu.to(device=device, dtype=torch.uint16).contiguous()
 
-        # FST: [rounds, nfeatsets, D] uint8; depth-wise shuffled tiling of [0..nfolds-1]
         base = torch.arange(nfolds, dtype=torch.uint8, device=device)
         rep  = (nfeatsets + nfolds - 1) // nfolds
-        row  = base.repeat(rep)[:nfeatsets]                                     # [nfeatsets]
+        row  = base.repeat(rep)[:nfeatsets]
         FST  = torch.empty((rounds, nfeatsets, D), dtype=torch.uint8, device=device)
         for s in range(rounds):
             for d in range(D):
@@ -116,22 +108,21 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 FST[s, :, d] = row[perm]
         FST = FST.contiguous()
 
-        # ---------- 3) outputs ----------
+        # ---------- outputs ----------
         V = torch.zeros((rounds, nfolds, 2 * nodes), dtype=torch.int32,  device=device)
-        I = torch.zeros((rounds, nfolds,     nodes), dtype=torch.uint16, device=device)  # <- uint16
+        I = torch.zeros((rounds, nfolds,     nodes), dtype=torch.uint16, device=device)
 
-        # ---------- 4) optional validation ----------
+        # ---------- optional validation ----------
         use_val = (Xv is not None) and (Yv is not None)
         if use_val:
             assert Xv.dtype == np.int8 and Yv.dtype == np.float32
-            Nv = int(Xv.shape[0])
-            self.val_N = Nv
-
+            Nv = int(Xv.shape[0]); self.val_N = Nv
             Xv_t = torch.from_numpy(Xv).to(device=device, dtype=torch.int8)
-            XBv  = self.encode_cuts(Xv_t).contiguous()                           # [4F, Mv]
-            Mv   = XBv.shape[1]                                                  # no need to pad Pv/Yv to 32*Mv
+            XBv  = self.encode_cuts(Xv_t).contiguous()
+            print('here?')
+            Mv   = XBv.shape[1]
             Pv   = torch.zeros(Nv, dtype=torch.int32, device=device)
-            yvq30 = (Yv * (1 << 30)).astype(np.int64)
+            yvq30  = (Yv * (1 << 30)).astype(np.int64)
             Yv_i32 = torch.from_numpy(yvq30[:Nv].astype(np.int32)).to(device=device)
 
             self.Pv_    = Pv
@@ -140,57 +131,80 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
             Lv  = torch.zeros((nfolds, Dm, Nv), dtype=leaf_dtype, device=device)
             Lvn = torch.zeros_like(Lv)
-
             del Xv_t
             if device.type == "cuda":
                 torch.cuda.empty_cache()
         else:
             XBv = Pv = Yv_i32 = Lv = Lvn = None
 
-        # ---------- 5) boosting loop ----------
+        # ---------- boosting loop ----------
         lr_per_fold = lr / float(nfolds)
         self.tree_set = 0
 
         for t in range(rounds):
-            # (a) sample features -> XS [nfeatsets, 32*M] uint32 (device)
+            # (a) feature sampling -> XS [nfeatsets, 32*M] uint32
+            print('huh?')
             if XB.is_cuda and torch.cuda.is_available():
                 XS = self.et_sample_1b(XB, self.Fsch, t).contiguous()
             else:
-                XS = self.et_sample_1b(XB, Fsch_cpu, t).to(device)  # CPU fallback then to device
+                XS = self.et_sample_1b(XB, Fsch_cpu, t).to(device)
+            print('here?')
 
-            # (b) packed leaves + quantized gradients (length **N**)
-            LE, G = self.prep_vars(L_old, Y_i32, P)                 # LE: u16/u32/u64 ; G: int16
+            # (b) pack leaves & gradients (length N)
+            LE, G = self.prep_vars(L_old, Y_i32, P)  # LE: u16/u32/u64 ; G: int16
+            print('here?')
 
-            # (c) repack by feature schedule (device), output length **N**
-            LF = self.repack(FST, LE, t).contiguous()               # [nfeatsets, N]
+            # (c) repack by feature schedule -> LF [nfeatsets, N]
+            LF = self.repack(FST, LE, t).contiguous()
+            print('here?')
 
             # (d) histograms
             if use_des:
-                # DES path: per-era H (left) and per-era H0 (parents)
-                He  = self.h_des(XS, G, LF, D, era_bounds=self.era_bounds_).contiguous()   # [K1, nE, nodes, 2, 32]
-                H0e = self.h0_des(G, LE, D, era_bounds=self.era_bounds_).contiguous()      # [K0, nE, 2**D, 2]
-                # trim parents to `nodes` for cut kernel (same as non-DES slice)
-                H0e = H0e[:, :, :He.size(2), :].contiguous()                                # [K0, nE, nodes, 2]
-                # (e) choose best cuts (DES directional-only)
+                # one canonical era_ends tensor on the right device
+                # ends-only vector; last must equal N
+                print('here?-1')
+                print('here?')
+                if int(era_ends[-1].item()) != N:
+                    raise ValueError(f"era_ends[-1] must equal N ({N}), got {int(era_ends[-1].item())}")
+
+                # per-era parents (K0, 2**D, E, 2) -> slice + permute -> (K0, E, nodes, 2)
+                # H0: [K0, 2**D, E, 2] -> permute + slice to [K0, E, nodes, 2]
+                print('here?1')
+
+                H0_all = self.h0_des(G, LE, int(max_depth), era_ends)
+                print('here?2')
+
+                H0e = H0_all.permute(0, 2, 1, 3)[:, :, :nodes, :].contiguous()
+                print('here?3')
+
+
+                # He: already [K1, E, nodes, 2, 32]
+                He = self.h_des(XS, G, LF, int(max_depth), era_ends)
+                print('here?4')
+
+
+                # (e) choose best directional cuts
                 self.cut_des(self.Fsch, FST, He, H0e, V, I,
                             tree_set=t, L2=L2, lr=lr_per_fold,
                             qgrad_bits=qgrad_bits, max_depth=D)
-                # free DES temps early
-                del He, H0e
+                print('here?5')
+
+
+                del He, H0_all, H0e
             else:
-                # Non-DES path (original)
-                H  = self.H (XS, G, LF, D).contiguous()                                     # [K1, nodes, 2, 32]
-                H0 = self.h0(G, LE, D).contiguous()                                         # [K0, 2**D, 2]
+                # Non-DES path
+                H  = self.H (XS, G, LF, D).contiguous()
+                H0 = self.h0(G, LE, D).contiguous()
                 self.cut(self.Fsch, FST, H, H0[:, : H.size(1), :].contiguous(), V, I,
                         tree_set=t, L2=L2, lr=lr_per_fold,
                         qgrad_bits=qgrad_bits, max_depth=D)
                 del H, H0
 
-            # (f) advance + predict (length **N**)
+            # (f) advance + predict
             self.advance_and_predict(P, XB, L_old, L_new, V, I, tree_set=t)
-            L_old, L_new = L_new, L_old   # ping-pong
+            L_old, L_new = L_new, L_old
 
-            # (g) validation forward (optional, length **Nv**)
+            # (g) validation (optional)
             if use_val:
                 self.advance_and_predict(Pv, XBv, Lv, Lvn, V, I, tree_set=t)
                 Lv, Lvn = Lvn, Lv
@@ -209,13 +223,13 @@ class PackBoost(BaseEstimator, RegressorMixin):
             if device.type == "cuda" and (t % 256 == 255):
                 torch.cuda.empty_cache()
 
-        # ---------- 6) stash artifacts for inference ----------
-        self.FST  = FST                         # uint8, device
-        self.V    = V                           # int32, device
-        self.I    = I                           # uint16, device
-        self.X_packed_ = XB                     # keep packed train X if you want quick train scoring
-
+        # ---------- stash for inference ----------
+        self.FST  = FST
+        self.V    = V
+        self.I    = I
+        self.X_packed_ = XB
         return self
+
 
 
 
@@ -729,80 +743,207 @@ class PackBoost(BaseEstimator, RegressorMixin):
     
         # -------- DES: H0 per-era (parents) --------
     def h0_des(self,
-               G:  torch.Tensor,   # [N] int16
-               LE: torch.Tensor,   # [nfolds, N] (u16/u32/u64)
-               max_depth: int,
-               era_bounds: torch.Tensor | None = None  # [nE+1] int32/int64 (device-matched)
-               ) -> torch.Tensor:
+            G:  torch.Tensor,   # [N] int16
+            LE: torch.Tensor,   # [nfolds, N] (u16/u32/u64)
+            max_depth: int,
+            era_bounds: torch.Tensor | None = None  # [E] int32 (exclusive ends; last==N)
+            ) -> torch.Tensor:
         """
-        Returns H0e: [nfolds, nE, 2**D, 2] int64
-        (sum,count) per fold, per era, per parent node.
+        Returns H0e: [nfolds, 2**D, E, 2] int64  (parent stats per fold & era).
+        NOTE: This raw layout matches your CUDA launcher. In fit() you permute/slice to [nfolds, E, nodes, 2].
         """
         nfolds, N = int(LE.size(0)), int(LE.size(1))
+
+        # normalize era_ends: ends-only, dtype=int32, on LE.device
         if era_bounds is None:
-            era_bounds = torch.tensor([0, N], device=LE.device, dtype=torch.int64)
+            era_ends = torch.tensor([N], device=LE.device, dtype=torch.int32)
         else:
-            era_bounds = era_bounds.to(device=LE.device, dtype=torch.int64).contiguous()
-        nE = int(era_bounds.numel() - 1)
+            era_ends = era_bounds.to(device=LE.device, dtype=torch.int32, copy=False).contiguous()
 
-        # ---- GPU path ----
-        use_cuda = (G.is_cuda or LE.is_cuda or era_bounds.is_cuda) and torch.cuda.is_available()
+        if int(era_ends[-1].item()) != N:
+            raise ValueError(f"era_ends[-1] must equal N ({N}), got {int(era_ends[-1].item())}")
+
+        use_cuda = (G.is_cuda or LE.is_cuda or era_ends.is_cuda) and torch.cuda.is_available()
         if use_cuda:
-            return kernels.h0_des(
-                G.contiguous(), LE.contiguous(), era_bounds.contiguous(), int(max_depth)
-            ).contiguous()
+            return kernels.h0_des(G.contiguous(), LE.contiguous(), era_ends.contiguous(), int(max_depth)).contiguous()
 
-        # ---- CPU fallback ----
-        # Support nE==1 cheaply by reusing existing CPU h0() and adding era dim.
-        if nE == 1:
-            H0 = self.h0(G, LE, max_depth)  # [nfolds, 2**D, 2]
-            return H0.unsqueeze(1).contiguous()  # [nfolds, 1, 2**D, 2]
-        raise NotImplementedError("CPU multi-era H0 (DES) not implemented; pass era_bounds with nE==1 or use CUDA.")
+        # -------- CPU parity (multi-era) --------
+        E = int(era_ends.numel())
+        nodes_with_last = (1 << max_depth)  # your CPU h0 returns 2**D nodes (includes last row)
+        H0e = torch.zeros((nfolds, nodes_with_last, E, 2),
+                        dtype=torch.int64, device=LE.device)
+
+        # era starts from [0] + era_ends[:-1]
+        era_starts = torch.empty_like(era_ends)
+        if E > 0:
+            era_starts[0] = 0
+            if E > 1:
+                era_starts[1:] = era_ends[:-1]
+
+        for ei in range(E):
+            e0 = int(era_starts[ei].item())
+            e1 = int(era_ends[ei].item())
+            if e1 <= e0:
+                continue  # empty era segment; leave zeros
+
+            # Slice to this era and reuse your CPU h0()
+            G_e  = G[e0:e1].to(device=LE.device, dtype=G.dtype, copy=False).contiguous()
+            LE_e = LE[:, e0:e1].to(device=LE.device, dtype=LE.dtype, copy=False).contiguous()
+            H0_slice = self.h0(G_e, LE_e, max_depth)  # [nfolds, 2**D, 2] (int64)
+
+            # Place into era dimension
+            H0e[:, :, ei, :] = H0_slice
+
+        return H0e.contiguous()
 
 
-    # -------- DES: H per-era (left child stats per candidate) --------
     def h_des(self,
-              XS: torch.Tensor,   # [K1(=nfeatsets), 32*M] uint32/int32
-              Y:  torch.Tensor,   # [N] int16
-              LF: torch.Tensor,   # [K1, N] (u16/u32/u64)
-              max_depth: int,
-              era_bounds: torch.Tensor | None = None  # [nE+1] (contiguous eras)
-              ) -> torch.Tensor:
+            XS: torch.Tensor,   # [K1, 32*M] uint32/int32  (padded to Np=32*M)
+            Y:  torch.Tensor,   # [N] int16
+            LF: torch.Tensor,   # [K1, N] (u16/u32/u64)
+            max_depth: int,
+            era_bounds: torch.Tensor | None = None  # [E] int32 (exclusive ends; last==N)
+            ) -> torch.Tensor:
         """
-        Returns He: [K1, nE, (2**D)-1, 2, 32] int64
-        channel 0=sum(y*v), 1=count(v); last dim is lane (0..31).
+        Returns He: [K1, E, (2**D)-1, 2, 32] int64  (left stats per era).
+        CPU parity masks XS per-era with 32-bit word masks and reuses your H() math.
         """
         K1, cols_32M = int(XS.size(0)), int(XS.size(1))
         N = int(Y.size(0))
         if era_bounds is None:
-            era_bounds = torch.tensor([0, N], device=XS.device, dtype=torch.int64)
+            era_ends = torch.tensor([N], device=XS.device, dtype=torch.int32)
         else:
-            era_bounds = era_bounds.to(device=XS.device, dtype=torch.int64).contiguous()
+            era_ends = era_bounds.to(device=XS.device, dtype=torch.int32, copy=False).contiguous()
 
-        # ---- GPU path ----
-        use_cuda = (XS.is_cuda or Y.is_cuda or LF.is_cuda or era_bounds.is_cuda) and torch.cuda.is_available()
+        if int(era_ends[-1].item()) != N:
+            raise ValueError(f"era_ends[-1] must equal N ({N}), got {int(era_ends[-1].item())}")
+
+        use_cuda = (XS.is_cuda or Y.is_cuda or LF.is_cuda or era_ends.is_cuda) and torch.cuda.is_available()
         if use_cuda:
             return kernels.h_des(
                 XS.contiguous(), Y.contiguous(), LF.contiguous(),
-                era_bounds.contiguous(), int(max_depth)
+                era_ends.contiguous(), int(max_depth)
             ).contiguous()
 
-        # ---- CPU fallback ----
-        # Single-era: reuse existing CPU H() and add era dim.
-        if int(era_bounds.numel()) == 2:
-            H_all = self.H(XS, Y, LF, max_depth)  # [K1, nodes, 2, 32]
-            return H_all.unsqueeze(1).contiguous()  # [K1, 1, nodes, 2, 32]
-        raise NotImplementedError("CPU multi-era H (DES) not implemented; pass single-era bounds or use CUDA.")
+        # -------- CPU parity (multi-era) --------
+        # Shapes & constants
+        TORCH_INT64 = torch.int64
+        TORCH_INT32 = torch.int32
+        nodes = (1 << max_depth) - 1
+        M = (cols_32M + 31) // 32  # padded blocks
+        assert 32 * M == cols_32M, "XS second dim must be a multiple of 32"
 
+        # Prepare base casted views (no copy if already correct)
+        XS64 = XS.to(TORCH_INT64, copy=False).view(K1, M, 32)  # [K1, M, 32]
+        Y64  = Y.to(TORCH_INT64,  copy=False)                  # [N]
+        LF64 = LF.to(TORCH_INT64, copy=False)                  # [K1, N]
 
-    # -------- DES: directional cut (tie-break by classic score), per spec --------
+        # era starts from [0] + era_ends[:-1]
+        E = int(era_ends.numel())
+        era_starts = torch.empty_like(era_ends)
+        if E > 0:
+            era_starts[0] = 0
+            if E > 1:
+                era_starts[1:] = era_ends[:-1]
+
+        # Output: [K1, E, nodes, 2, 32]
+        He = torch.zeros((K1, E, nodes, 2, 32), dtype=TORCH_INT64, device=XS.device)
+
+        # Common lane-bit constants for unpack
+        bit_ids = torch.arange(32, dtype=TORCH_INT64, device=XS.device)
+        bit_masks = (1 << bit_ids).view(1, 1, 1, 32)  # broadcast over [K1,M,32,32]
+
+        # Precompute block starts (s_b = 32*b)
+        b_idx = torch.arange(M, dtype=TORCH_INT64, device=XS.device)
+        block_start = (b_idx * 32)  # [M]
+
+        for ei in range(E):
+            e0 = int(era_starts[ei].item())
+            e1 = int(era_ends[ei].item())
+            if e1 <= e0:
+                continue  # empty era
+
+            # ----- build per-block 32-bit masks for this era -----
+            # k0 = clamp(e0 - s_b, 0, 32); k1 = clamp(e1 - s_b, 0, 32); len = clamp(k1-k0, 0, 32)
+            k0 = torch.clamp(e0 - block_start, min=0, max=32).to(TORCH_INT64)
+            k1 = torch.clamp(e1 - block_start, min=0, max=32).to(TORCH_INT64)
+            span = torch.clamp(k1 - k0,       min=0, max=32).to(TORCH_INT64)
+            # mask_b = ((1 << span) - 1) << k0
+            ones = torch.ones_like(span, dtype=TORCH_INT64)
+            mask_base = torch.bitwise_left_shift(ones, span) - 1  # (2^span - 1)
+            mask_words = torch.bitwise_left_shift(mask_base, k0).view(1, M, 1)  # [1,M,1], int64
+
+            # ----- apply mask to XS words and compute V (same as H() CPU path) -----
+            XS_masked = (XS64 & mask_words)                        # [K1, M, 32]
+            V_bits    = ((XS_masked[..., None] & bit_masks) != 0).to(TORCH_INT64)  # [K1,M,32,32]
+            V         = V_bits.permute(0, 2, 1, 3).reshape(K1, 32, 32 * M)         # [K1,32,Np]
+            if V.size(2) > N:   # trim padded tail
+                V = V[:, :, :N].contiguous()                      # [K1,32,N]
+
+            # Broadcasts
+            Y_b  = Y64.view(1, 1, N)                      # [1,1,N]
+            onesN = torch.ones((1, 1, N), dtype=TORCH_INT64, device=XS.device)
+
+            # Allocate per-era accumulators (match H() layout then assign into He[:, ei])
+            H_sum = torch.zeros((K1, nodes, 32), dtype=TORCH_INT64, device=XS.device)
+            H_cnt = torch.zeros_like(H_sum)
+
+            # depth 0
+            H_sum[:, 0, :] = (V * Y_b).sum(dim=2)
+            H_cnt[:, 0, :] = V.sum(dim=2)
+
+            # depth 1
+            tk1 = (LF64 & 1)                             # [K1, N]
+            m0  = (tk1 == 0).to(TORCH_INT64).unsqueeze(1)  # [K1,1,N]
+            m1  = 1 - m0
+            H_sum[:, 1, :] = (V * (Y_b * m0)).sum(dim=2)
+            H_cnt[:, 1, :] = (V * m0).sum(dim=2)
+            H_sum[:, 2, :] = (V * (Y_b * m1)).sum(dim=2)
+            H_cnt[:, 2, :] = (V * m1).sum(dim=2)
+
+            # depth 2
+            tk2 = ((LF64 >> 1) & 3).to(torch.long)       # [K1, N]
+            oh2 = torch.nn.functional.one_hot(tk2, num_classes=4).to(TORCH_INT64)  # [K1,N,4]
+            oh2 = oh2.unsqueeze(1)                       # [K1,1,N,4]
+            V4  = V.unsqueeze(-1)                        # [K1,32,N,1]
+            sum2 = (V4 * (Y_b.unsqueeze(-1) * oh2)).sum(dim=2)   # [K1,32,4]
+            cnt2 = (V4 * oh2).sum(dim=2)                 # [K1,32,4]
+            H_sum[:, 3:7, :] = sum2.permute(0, 2, 1).contiguous()  # [K1,4,32]
+            H_cnt[:, 3:7, :] = cnt2.permute(0, 2, 1).contiguous()
+
+            # depths >= 3
+            if max_depth > 3:
+                F32 = K1 * 32
+                V_flat = V.view(F32, N)
+                Y_flat = Y64.view(1, N).expand(F32, N)
+                for d in range(3, max_depth):
+                    s = (d * (d - 1)) // 2
+                    base = (1 << d) - 1
+                    maskd = (1 << d) - 1
+                    idx_fn = (((LF64 >> s) & maskd) + base).to(torch.long)        # [K1, N]
+                    idx_b  = idx_fn.repeat_interleave(32, dim=0)                  # [K1*32, N]
+
+                    out_sum = torch.zeros((F32, nodes), dtype=TORCH_INT64, device=XS.device)
+                    out_cnt = torch.zeros_like(out_sum)
+                    out_sum.scatter_add_(1, idx_b, (V_flat * Y_flat))
+                    out_cnt.scatter_add_(1, idx_b, V_flat)
+
+                    H_sum += out_sum.view(K1, 32, nodes).permute(0, 2, 1)
+                    H_cnt += out_cnt.view(K1, 32, nodes).permute(0, 2, 1)
+
+            # stack into He (add channel dim)
+            He[:, ei, :, 0, :] = H_sum
+            He[:, ei, :, 1, :] = H_cnt
+
+        return He.contiguous()
+
     def cut_des(self,
-                F:  torch.Tensor,   # [rounds, 32*K1] uint16 (feature ids per lane)
-                FST:torch.Tensor,   # [rounds, K1, D] uint8 (fold id per candidate/depth)
-                H:  torch.Tensor,   # [K1, nE, nodes, 2, 32] int64  (left stats per era)
-                H0: torch.Tensor,   # [K0, nE, nodes, 2]     int64  (parent stats per era)
-                V:  torch.Tensor,   # [rounds, K0, 2*nodes]  int32  (OUT)
-                I:  torch.Tensor,   # [rounds, K0, nodes]    uint16 (OUT)
+                F:  torch.Tensor,   # [rounds, 32*K1] uint16
+                FST:torch.Tensor,   # [rounds, K1, D] uint8
+                H:  torch.Tensor,   # [K1, E, nodes, 2, 32] int64
+                H0: torch.Tensor,   # [K0, E, nodes, 2]     int64
+                V:  torch.Tensor,   # [rounds, K0, 2*nodes] int32
+                I:  torch.Tensor,   # [rounds, K0, nodes]   uint16
                 *,
                 tree_set: int,
                 L2: float,
@@ -810,12 +951,14 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 qgrad_bits: int,
                 max_depth: int):
         """
-        Directional-only DES:
-          score = |mean_e sign(v_R - v_L)| over eras with both children non-empty.
-        Tie-break = classic (S0 + S1) as int-bits.
+        CPU fallback for directional DES selection.
+        Mirrors CUDA logic:
+        - For each leaf and fold, track per-lane best candidate across k
+        - Reduce across lanes with tie rule: (dir, sbits), then highest lane index
         """
         use_cuda = any(t.is_cuda for t in (F, FST, H, H0, V, I)) and torch.cuda.is_available()
         if use_cuda:
+            from packboost.cuda import kernels
             kernels.cut_cuda_des(
                 F.contiguous(), FST.contiguous(),
                 H.contiguous(), H0.contiguous(),
@@ -825,5 +968,130 @@ class PackBoost(BaseEstimator, RegressorMixin):
             )
             return V, I
 
-        # CPU fallback not provided (DES selection is CUDA-optimized).
-        raise NotImplementedError("CPU cut_des not implemented. Use CUDA path.")
+        # ---------- CPU path ----------
+        device = H.device
+        assert H.dtype == torch.int64 and H0.dtype == torch.int64
+        K1, E, nodes, two, lanes = H.shape
+        K0 = int(H0.shape[0])
+        assert two == 2 and lanes == 32, "H must be [K1,E,nodes,2,32]"
+        assert H0.shape == (K0, E, nodes, 2), "H0 must be [K0,E,nodes,2]"
+        assert I.dtype in (torch.uint16, torch.int16)
+        assert V.dtype == torch.int32
+
+        D = int(FST.shape[2])
+        assert nodes == (1 << max_depth) - 1 and D >= max_depth, "depth mismatch"
+
+        # depth per leaf
+        leaf_ids = torch.arange(nodes, device=device, dtype=torch.long)
+        depth = torch.floor(torch.log2(leaf_ids.to(torch.float32) + 1.0)).to(torch.long)  # [nodes]
+
+        # scales per leaf (match CUDA)
+        L2_eff = torch.tensor(L2, dtype=torch.float32, device=device) * torch.pow(
+            torch.tensor(2.0, device=device), 5.0 - depth.to(torch.float32)
+        )  # [nodes]
+        qscale = torch.tensor(lr, dtype=torch.float32, device=device) * float(1 << (31 - int(qgrad_bits))) \
+                * torch.pow(torch.tensor(2.0, device=device), -(float(max_depth) - depth.to(torch.float32)))  # [nodes]
+
+        # fold-routing per (k, leaf) from FST[tree_set, k, depth]
+        tf_all = FST[int(tree_set)].gather(1, depth.unsqueeze(0).expand(K1, nodes)).to(torch.long)  # [K1,nodes]
+
+        # Slices for convenience
+        H_sum = H[:, :, :, 0, :]  # [K1, E, nodes, 32]
+        H_cnt = H[:, :, :, 1, :]  # [K1, E, nodes, 32]
+        H0_sum = H0[:, :, :, 0]   # [K0, E, nodes]
+        H0_cnt = H0[:, :, :, 1]   # [K0, E, nodes]
+
+        # Pre-get F row for this tree_set
+        F_row = (F[int(tree_set)].to(torch.int64) & 0xFFFF)  # [32*K1] as unsigned
+
+        # Iterate leaves
+        for n in range(nodes):
+            d = int(depth[n].item())
+            L2n = L2_eff[n]
+            qsn = qscale[n]
+
+            # For each fold
+            for f in range(K0):
+                # candidate mask (k) for this fold at this depth
+                kmask = (tf_all[:, n] == f)
+                if not kmask.any():
+                    continue
+
+                # Track per-lane best across candidates
+                best_dir   = torch.full((32,), float('-inf'), dtype=torch.float32, device=device)
+                best_sbits = torch.full((32,), torch.iinfo(torch.int32).min, dtype=torch.int32, device=device)
+                best_vl    = torch.zeros(32, dtype=torch.int32, device=device)
+                best_vr    = torch.zeros(32, dtype=torch.int32, device=device)
+                best_k     = torch.full((32,), -1, dtype=torch.long, device=device)
+
+                # Parent stats across eras (no lane)
+                GT_fe = H0_sum[f, :, n].to(torch.float32)  # [E]
+                HT_fe = H0_cnt[f, :, n].to(torch.float32)  # [E]
+                GT_tot = GT_fe.sum()
+                HT_tot = HT_fe.sum()
+
+                # Loop candidates k that route to fold f
+                k_idx = kmask.nonzero(as_tuple=False).flatten()
+                for k in k_idx.tolist():
+                    # Per-lane per-era left stats
+                    G0 = H_sum[k, :, n, :].to(torch.float32)  # [E,32]
+                    N0 = H_cnt[k, :, n, :].to(torch.float32)  # [E,32]
+                    # Rights from parents
+                    G1 = GT_fe.view(E, 1) - G0               # [E,32]
+                    N1 = HT_fe.view(E, 1) - N0               # [E,32]
+
+                    valid = (N0 > 0.0) & (N1 > 0.0)          # [E,32]
+                    # Per-era values
+                    V0 = G0 / (N0 + L2n)
+                    V1 = G1 / (N1 + L2n)
+                    dir_sign = torch.sign(V1 - V0)           # [-1,0,1] per era/lane
+                    eras_used = valid.to(torch.int32).sum(dim=0)  # [32]
+                    sum_dir   = (dir_sign * valid.to(torch.float32)).sum(dim=0)  # [32]
+                    dir_score = torch.where(eras_used > 0,
+                                            sum_dir.abs() / eras_used.to(torch.float32),
+                                            torch.zeros_like(sum_dir, dtype=torch.float32))
+
+                    # Classic pooled (per lane for left, parent pooled once)
+                    G0_tot = G0.sum(dim=0)                   # [32]
+                    N0_tot = N0.sum(dim=0)                   # [32]
+                    V0f    = G0_tot / (N0_tot + L2n)
+                    V1f    = (GT_tot - G0_tot) / ((HT_tot - N0_tot) + L2n)
+                    S      = (G0_tot * V0f) + ((GT_tot - G0_tot) * V1f)  # [32]
+
+                    # float32->int32 bitcast for tie parity
+                    S_bits = torch.from_numpy(S.detach().cpu().numpy().view(np.int32)).to(device=device)
+
+                    # Compare lexicographically per lane
+                    better = (dir_score > best_dir) | ((dir_score == best_dir) & (S_bits > best_sbits))
+                    if better.any():
+                        best_dir   = torch.where(better, dir_score, best_dir)
+                        best_sbits = torch.where(better, S_bits,     best_sbits)
+                        best_vl    = torch.where(better, torch.trunc(qsn * V0f).to(torch.int32), best_vl)
+                        best_vr    = torch.where(better, torch.trunc(qsn * V1f).to(torch.int32), best_vr)
+                        best_k     = torch.where(better, torch.full_like(best_k, k),             best_k)
+
+                # Reduce across lanes: pick lanes with max dir, then max sbits, then highest lane index
+                max_dir = best_dir.max()
+                lanes_mask = (best_dir == max_dir)
+                if not lanes_mask.any():
+                    continue
+                # among these, max sbits
+                sb_masked = torch.where(lanes_mask, best_sbits, torch.full_like(best_sbits, torch.iinfo(torch.int32).min))
+                max_sbits = sb_masked.max()
+                winners = lanes_mask & (best_sbits == max_sbits)
+                if not winners.any():
+                    continue
+                winner_lane = torch.nonzero(winners, as_tuple=False).flatten().max().item()  # highest lane index
+                k_star = int(best_k[winner_lane].item())
+                if k_star < 0:
+                    continue
+
+                # Write outputs
+                V[int(tree_set), f, 2*n    ] = best_vl[winner_lane]
+                V[int(tree_set), f, 2*n + 1] = best_vr[winner_lane]
+
+                feat_pos = k_star * 32 + int(winner_lane)
+                I[int(tree_set), f, n] = (F_row[feat_pos] & 0xFFFF).to(torch.uint16)
+
+        return V, I
+

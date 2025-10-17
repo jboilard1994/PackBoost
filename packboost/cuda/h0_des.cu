@@ -2,7 +2,6 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <cstdint>
-#include <limits>
 
 static __device__ __forceinline__ int SH_idx(int node, int ch, int lane) {
     // shared layout: [nodes, 2, 32] as ((node*2 + ch)*32 + lane)
@@ -199,6 +198,7 @@ __global__ void _h0_des_butterfly(
     }
 }
 
+
 torch::Tensor h0_des_butterfly(
     torch::Tensor G,          // [N], int16, CUDA
     torch::Tensor LE,         // [nfolds, N], (u)int16/32/64, CUDA
@@ -210,7 +210,6 @@ torch::Tensor h0_des_butterfly(
     TORCH_CHECK(G.scalar_type() == c10::ScalarType::Short, "G must be int16.");
     TORCH_CHECK(max_depth > 0, "max_depth must be > 0.");
 
-    // We keep the ≤8 shared-mem variant (nodes<=256). Extend with node-tiling if you need D=9.
     const int nodes = 1 << max_depth;
     TORCH_CHECK(nodes <= 256, "h0_des_butterfly supports max_depth ≤ 8 (nodes ≤ 256). Got max_depth=", max_depth);
 
@@ -222,23 +221,45 @@ torch::Tensor h0_des_butterfly(
     const int nfolds = (int)nfolds64;
     const int N      = (int)N64;
 
-    // Era ends → device int32
     TORCH_CHECK(era_ends.dim() == 1, "era_ends must be 1-D [E] of exclusive ends.");
-    auto era_ends_i32 = era_ends.to(LE.device(), /*dtype=*/torch::kInt32, /*non_blocking=*/false, /*copy=*/true).contiguous();
+    // Move to LE.device and int32
+    auto era_ends_i32 = era_ends.to(LE.device(), /*dtype=*/torch::kInt32,
+                                    /*non_blocking=*/false, /*copy=*/true).contiguous();
     const int E = (int)era_ends_i32.size(0);
     TORCH_CHECK(E > 0, "era_ends must have at least one era.");
-    TORCH_CHECK(era_ends_i32.dtype() == torch::kInt32, "era_ends must be int32.");
-    TORCH_CHECK( (int)era_ends_i32.data_ptr<int32_t>()[E-1] == N,
-        "era_ends[-1] must equal N (exclusive).");
 
-    // Murky-like tiling: plenty of work in flight
+    // >>> FIX: never dereference device memory on host
+    int last_exclusive = 0;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    if (era_ends_i32.is_cuda()) {
+        // copy the last element to host
+        TORCH_CHECK(E >= 1, "era_ends must not be empty");
+        cudaError_t cmperr = cudaMemcpyAsync(
+            &last_exclusive,
+            era_ends_i32.data_ptr<int32_t>() + (E - 1),
+            sizeof(int32_t),
+            cudaMemcpyDeviceToHost,
+            stream.stream()
+        );
+        TORCH_CHECK(cmperr == cudaSuccess, "cudaMemcpyAsync failed: ", cudaGetErrorString(cmperr));
+        // ensure the value is ready for the TORCH_CHECK below
+        TORCH_CHECK(cudaSuccess == cudaStreamSynchronize(stream.stream()),
+                    "cudaStreamSynchronize failed");
+    } else {
+        last_exclusive = era_ends_i32.index({E - 1}).item<int>();
+    }
+    TORCH_CHECK(last_exclusive == N,
+        "era_ends[-1] must equal N (exclusive). Got ", last_exclusive, " vs N=", N, ".");
+
+    // --- (rest of your function unchanged) ---
     static constexpr int lanes = 32;
     int SM = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
     int target_blocks_per_SM = 32;
     int min_total_blocks = SM * target_blocks_per_SM;
     int strides = (min_total_blocks + nfolds - 1) / nfolds;
     static constexpr int min_workload_per_thread = 128;
-    int64_t max_strides = (N64 + (lanes * (int64_t)min_workload_per_thread) - 1) / (lanes * (int64_t)min_workload_per_thread);
+    int64_t max_strides = (N64 + (lanes * (int64_t)min_workload_per_thread) - 1)
+                          / (lanes * (int64_t)min_workload_per_thread);
 
     strides = (int)std::min((int64_t)strides, max_strides);
     if (strides < 32) strides = 32;
@@ -249,21 +270,18 @@ torch::Tensor h0_des_butterfly(
     const dim3 block(lanes, 1, 1);
     const dim3 grid (nfolds, strides, 1);
 
-    // Output: [nfolds, 2^D, E, 2] int64 (last row unused)
-    auto H0 = torch::zeros({nfolds64, (int64_t)nodes, (int64_t)E, (int64_t)2},
-                           LE.options().dtype(torch::kLong).memory_format(c10::MemoryFormat::Contiguous));
+    auto H0 = torch::zeros({nfolds64, (int64_t)nodes, (int64_t)E, 2LL},
+                           LE.options().dtype(torch::kLong)
+                           .memory_format(c10::MemoryFormat::Contiguous));
 
-    // Dynamic SMEM: one era plane: [nodes, 2, 32] * sizeof(int)
     const size_t smem_bytes = (size_t)nodes * 2 * 32 * sizeof(int);
 
     auto* prop = at::cuda::getCurrentDeviceProperties();
     size_t smem_cap = prop->sharedMemPerBlockOptin ? (size_t)prop->sharedMemPerBlockOptin
                                                    : (size_t)prop->sharedMemPerBlock;
     TORCH_CHECK(smem_bytes <= smem_cap,
-        "H0-DES requires ", smem_bytes, "B shared memory, device allows ", smem_cap, "B. "
-        "(max_depth too large for this variant)");
+        "H0-DES requires ", smem_bytes, "B shared memory, device allows ", smem_cap, "B.");
 
-    auto stream = at::cuda::getCurrentCUDAStream();
     const auto dt = LE.scalar_type();
 
     if (dt == c10::ScalarType::UInt16) {
