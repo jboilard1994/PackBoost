@@ -11,3 +11,6 @@ dependencies = ["torch", "scikit-learn", "numpy"]
 dev = [
   "pytest",
 ]
+
+[tool.setuptools.package-data]
+"packboost.cuda" = ["*.cpp", "*.cu", "*.h", "*.cuh"]
