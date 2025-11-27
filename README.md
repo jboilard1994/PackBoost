@@ -31,11 +31,9 @@ source .venv/bin/activate
 
 # 2) Install deps (pin your torch/cuda as needed)
 pip install --upgrade pip
-pip install torch numpy scikit-learn ninja pandas
+pip install git+https://github.com/Pranshu-Bahadur/PackBoost.git
+pip install torch --index-url https://download.pytorch.org/whl/cu126 
 
-# 3) Clone the repo (JIT build happens on first import)
-git clone https://github.com/Pranshu-Bahadur/PackBoost.git
-cd PackBoost
 ```
 
 **Notes**
