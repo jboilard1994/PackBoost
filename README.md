@@ -23,6 +23,10 @@
 * **CUDA toolkit** matching your driver (tested on 12.x)
 * **ninja** (recommended for faster builds)
 * NVIDIA GPU (A100 tuned; others work but perf varies)
+* Windows specific requirements
+  * Visual Studio C++ Build Tools (configured by default with default c++ 2022 build tools path)
+  * Other versions need to initialize VCVARS64_BAT_FILEPATH with the filepath to vcvars64.bat
+    * e.g. `VCVARS64_BAT_FILEPATH="C:\Program Files\Microsoft Visual Studio\{20XX}\BuildTools\VC\Auxiliary\Build\vcvars64.bat"` or `"C:\Program Files (x86)\Microsoft Visual Studio\{20XX}\BuildTools\VC\Auxiliary\Build\vcvars64.bat"`
 
 ```bash
 # 1) Create a fresh env
