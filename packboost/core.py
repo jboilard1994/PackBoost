@@ -200,6 +200,9 @@ class PackBoost(BaseEstimator, RegressorMixin):
         return self
 
 
+
+
+
     def predict(self, X):
         """
         Predict with the currently trained model.
@@ -225,8 +228,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
         # guardrails
         assert hasattr(self, "V") and hasattr(self, "I"), "Model not fitted: missing V/I"
         assert hasattr(self, "tree_set") and self.tree_set > 0, "Model has no trees"
-        self.V = self.V.to(device=device, copy=False)
-        self.I = self.I.to(device=device, copy=False)
 
         # --- 1) encode cuts -> packed uint32 words [4F, M] ---
         XB = self.encode_cuts(X_t).contiguous()           # [4F, M] uint32
@@ -704,7 +705,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                     else:
                         raise AssertionError("L_new must be uint8 or uint16")
 
-                add_idx = (2 * lo + x).to(torch.long)
+                add_idx = (2 * lo + 1 + x).to(torch.long)
                 P.add_(V[tree_set, f].gather(0, add_idx))
 
         return P, L_new
