@@ -1,3 +1,4 @@
+.env
 venv
 # Python artifacts
 __pycache__/
