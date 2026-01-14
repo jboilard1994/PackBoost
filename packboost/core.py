@@ -82,10 +82,15 @@ class PackBoost(BaseEstimator, RegressorMixin):
             nfeatsets: int = 32,
             qgrad_bits: int = 12,
             seed: int = 42,
-            era_ids: np.ndarray | None = None):
+            era_ids: np.ndarray | None = None,
+            fold_aggregation_method: str = "mean"):
         assert X.dtype == np.int8 and y.dtype == np.float32
         device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
         callbacks = [] if callbacks is None else callbacks
+        
+        # Validate fold_aggregation_method
+        if fold_aggregation_method != "mean":
+            assert Xv is not None and Yv is not None, "fold_aggregation_method != 'mean' requires validation datasets (Xv, Yv)"
 
         # ---------- meta ----------
         self.feature_name = feature_name
@@ -274,14 +279,15 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
             # (g) average per-fold predictions and update P
             if use_val:
-                #self.W[t, :] = #....
-                #w = ... 
-                self.W[t, :] = 1/nfolds  
+                if fold_aggregation_method == "mean":
+                    self.W[t, :] = 1/nfolds
+                # else: other methods will set self.W[t, :] based on validation performance
                 w = self.W[t, :].view(-1, 1)  # [K0, 1]
                 P.add_(((P_per_fold.to(torch.float32) * w).sum(dim=0) * lr).to(torch.int32))
                 Pv.add_(((Pv_per_fold.to(torch.float32) * w).sum(dim=0) * lr).to(torch.int32))
             else:
-                self.W[t, :] = 1/nfolds 
+                if fold_aggregation_method == "mean":
+                    self.W[t, :] = 1/nfolds
                 w = self.W[t, :].view(-1, 1)  # [K0, 1]
                 P.add_(((P_per_fold.to(torch.float32) * w).sum(dim=0) * lr).to(torch.int32))
 
