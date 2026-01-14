@@ -20,7 +20,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         self.comment = comment
 
     @classmethod
-    def from_params(cls, V, I, device='cuda'):
+    def from_params(cls, V, I, W,  device='cuda'):
         """
         Create a PackBoost instance from pre-trained parameters.
         
@@ -30,6 +30,8 @@ class PackBoost(BaseEstimator, RegressorMixin):
             The tree node values with shape (rounds, nfolds, 2*nodes)
         I : torch.Tensor or np.ndarray
             The tree node split indices with shape (rounds, nfolds, nodes)
+        W : torch.Tensor or np.ndarray
+            The fold weights with shape (rounds, nfolds), applied to predictions
         device : str, optional
             The device to use ('cuda' or 'cpu'), default is 'cuda'
         
@@ -45,11 +47,13 @@ class PackBoost(BaseEstimator, RegressorMixin):
             V = torch.from_numpy(V)
         if isinstance(I, np.ndarray):
             I = torch.from_numpy(I)
-        
+        if isinstance(W, np.ndarray):
+            W = torch.from_numpy(W)
         # Move to specified device
         device_obj = torch.device(device if (device != "cuda" or torch.cuda.is_available()) else "cpu")
         instance.V = V.to(device=device_obj, dtype=torch.int32)
         instance.I = I.to(device=device_obj, dtype=torch.uint16)
+        instance.W = W.to(device=device_obj, dtype=torch.float32)
         
         # Infer metadata from parameter shapes
         if V.ndim == 3 and I.ndim == 3:
@@ -176,6 +180,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         # ---------- outputs ----------
         self.V = torch.zeros((rounds, nfolds, 2 * nodes), dtype=torch.int32,  device=device)
         self.I = torch.zeros((rounds, nfolds,     nodes), dtype=torch.uint16, device=device)
+        self.W = torch.zeros((rounds, nfolds), dtype=torch.float32,device=device)
 
         # ---------- optional validation ----------
         use_val = (Xv is not None) and (Yv is not None)
@@ -269,10 +274,16 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
             # (g) average per-fold predictions and update P
             if use_val:
-                P.add_((P_per_fold.to(torch.float32).mean(dim=0) * lr).to(torch.int32))
-                Pv.add_((Pv_per_fold.to(torch.float32).mean(dim=0) * lr).to(torch.int32))
+                #self.W[t, :] = #....
+                #w = ... 
+                self.W[t, :] = 1/nfolds  
+                w = self.W[t, :].view(-1, 1)  # [K0, 1]
+                P.add_(((P_per_fold.to(torch.float32) * w).sum(dim=0) * lr).to(torch.int32))
+                Pv.add_(((Pv_per_fold.to(torch.float32) * w).sum(dim=0) * lr).to(torch.int32))
             else:
-                P.add_((P_per_fold.to(torch.float32).mean(dim=0) * lr).to(torch.int32))
+                self.W[t, :] = 1/nfolds 
+                w = self.W[t, :].view(-1, 1)  # [K0, 1]
+                P.add_(((P_per_fold.to(torch.float32) * w).sum(dim=0) * lr).to(torch.int32))
 
             self.tree_set = t + 1
 
@@ -351,7 +362,8 @@ class PackBoost(BaseEstimator, RegressorMixin):
         lr = getattr(self, 'lr', 1.0)  # Use training lr, default to 1.0 for legacy models
         for k in range(int(self.tree_set)):
             P_per_fold, Ln = self.advance_and_predict(P, XB, L, Ln, self.V, self.I, tree_set=k, lr=lr)
-            P.add_((P_per_fold.to(torch.float32).mean(dim=0) * lr).to(torch.int32))
+            w = self.W[k, :].view(-1, 1)  # [K0, 1]
+            P.add_(((P_per_fold.to(torch.float32) * w).sum(dim=0) * lr).to(torch.int32))
             L, Ln = Ln, L  # ping-pong
 
         # --- 4) trim padding & return ---
@@ -1270,6 +1282,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         state = {
             "V": self.V.cpu(),
             "I": self.I.cpu(),
+            "W": self.W.cpu(),
             "FST": self.FST.cpu(),
             "tree_set": self.tree_set,
             "max_depth": self.max_depth,
@@ -1296,6 +1309,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         
         self.V         = state["V"]
         self.I         = state["I"]
+        self.W         = state["W"]
         self.FST       = state["FST"]
         self.tree_set  = state["tree_set"]
         self.max_depth = state["max_depth"]
