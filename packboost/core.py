@@ -83,10 +83,15 @@ class PackBoost(BaseEstimator, RegressorMixin):
             qgrad_bits: int = 12,
             seed: int = 42,
             era_ids: np.ndarray | None = None,
-            fold_aggregation_method: str = "mean"):
+            fold_aggregation_method: str = "mean",
+            fold_aggregation_method_args: dict = None):
         assert X.dtype == np.int8 and y.dtype == np.float32
         device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
         callbacks = [] if callbacks is None else callbacks
+        
+        # Set default args if not provided
+        if fold_aggregation_method_args is None:
+            fold_aggregation_method_args = {}
         
         # Validate fold_aggregation_method
         if fold_aggregation_method != "mean":
@@ -280,15 +285,39 @@ class PackBoost(BaseEstimator, RegressorMixin):
             # (g) average per-fold predictions and update P
             if use_val:
                 if fold_aggregation_method == "mean":
-                    self.W[t, :] = 1/nfolds
-                # else: other methods will set self.W[t, :] based on validation performance
-                w = self.W[t, :].view(-1, 1)  # [K0, 1]
+                    w_unnorm = torch.ones(nfolds, device=device, dtype=torch.float32) / nfolds
+                elif fold_aggregation_method == "ridge_regression":
+                    # Use ridge regression to find optimal weights based on validation set
+                    alpha = fold_aggregation_method_args.get('alpha', 1e-4)
+                    w_unnorm = self._compute_ridge_weights(
+                        Pv_per_fold, Yv_i32, Pv, alpha, device
+                    )
+                elif fold_aggregation_method == "lasso_regression":
+                    # Use lasso regression (L1 regularization) to find optimal weights
+                    alpha = fold_aggregation_method_args.get('alpha', 1e-4)
+                    max_iter = fold_aggregation_method_args.get('max_iter', 1000)
+                    tol = fold_aggregation_method_args.get('tol', 1e-3)
+                    w_unnorm = self._compute_lasso_weights(
+                        Pv_per_fold, Yv_i32, Pv, alpha, device, max_iter, tol
+                    )
+                # else: other methods will set w_unnorm based on validation performance
+                
+                # Normalize weights to sum to 1
+                w_normalized = w_unnorm / (w_unnorm.sum() + 1e-10)
+                self.W[t, :] = w_normalized
+                
+                w = w_normalized.view(-1, 1)  # [K0, 1]
                 P.add_(((P_per_fold.to(torch.float32) * w).sum(dim=0) * lr).to(torch.int32))
                 Pv.add_(((Pv_per_fold.to(torch.float32) * w).sum(dim=0) * lr).to(torch.int32))
             else:
                 if fold_aggregation_method == "mean":
-                    self.W[t, :] = 1/nfolds
-                w = self.W[t, :].view(-1, 1)  # [K0, 1]
+                    w_unnorm = torch.ones(nfolds, device=device, dtype=torch.float32) / nfolds
+                
+                # Normalize weights to sum to 1
+                w_normalized = w_unnorm / (w_unnorm.sum() + 1e-10)
+                self.W[t, :] = w_normalized
+                
+                w = w_normalized.view(-1, 1)  # [K0, 1]
                 P.add_(((P_per_fold.to(torch.float32) * w).sum(dim=0) * lr).to(torch.int32))
 
             self.tree_set = t + 1
@@ -811,6 +840,134 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
         return V, I
 
+    def _compute_ridge_weights(self, 
+                               per_fold_preds: torch.Tensor,  # [K0, N]
+                               targets: torch.Tensor,         # [N]
+                               current_preds: torch.Tensor,   # [N]
+                               alpha: float,
+                               device: torch.device) -> torch.Tensor:
+        """
+        Compute optimal fold weights using ridge regression.
+        
+        Parameters
+        ----------
+        per_fold_preds : torch.Tensor [K0, N]
+            Per-fold predictions for current round
+        targets : torch.Tensor [N]
+            Target values (quantized as int32)
+        current_preds : torch.Tensor [N]
+            Current predictions (int32)
+        alpha : float
+            Ridge regularization parameter
+        device : torch.device
+            Device to perform computation on
+            
+        Returns
+        -------
+        torch.Tensor [K0]
+            Normalized weights that sum to 1
+        """
+        K0, N = per_fold_preds.shape
+        
+        # Prepare regression matrices
+        X_reg = per_fold_preds.to(torch.float32).t()  # [N, K0]
+        y_reg = (targets.to(torch.float32) - current_preds.to(torch.float32))  # [N] residuals
+        
+        # Ridge regression closed form using Cholesky: w = (X^T X + alpha*I)^(-1) X^T y
+        XtX = X_reg.t() @ X_reg  # [K0, K0]
+        Xty = X_reg.t() @ y_reg  # [K0]
+        I_reg = torch.eye(K0, device=device, dtype=torch.float32)
+        
+        # Use Cholesky decomposition for efficient solving
+        L = torch.linalg.cholesky(XtX + alpha * I_reg)  # [K0, K0]
+        w_opt = torch.cholesky_solve(Xty.unsqueeze(-1), L).squeeze(-1)  # [K0]
+        
+        # Normalize weights to sum to 1
+        w_opt = w_opt / (w_opt.sum() + 1e-10)
+        
+        return w_opt
+
+    def _compute_lasso_weights(self, 
+                               per_fold_preds: torch.Tensor,  # [K0, N]
+                               targets: torch.Tensor,         # [N]
+                               current_preds: torch.Tensor,   # [N]
+                               alpha: float,
+                               device: torch.device,
+                               max_iter: int = 1000,
+                               tol: float = 1e-4) -> torch.Tensor:
+        """
+        Compute optimal fold weights using lasso regression (L1 regularization).
+        Uses ISTA (Iterative Soft Thresholding Algorithm).
+        
+        Parameters
+        ----------
+        per_fold_preds : torch.Tensor [K0, N]
+            Per-fold predictions for current round
+        targets : torch.Tensor [N]
+            Target values (quantized as int32)
+        current_preds : torch.Tensor [N]
+            Current predictions (int32)
+        alpha : float
+            Lasso regularization parameter
+        device : torch.device
+            Device to perform computation on
+        max_iter : int
+            Maximum number of iterations
+        tol : float
+            Convergence tolerance
+            
+        Returns
+        -------
+        torch.Tensor [K0]
+            Normalized weights that sum to 1
+        """
+        K0, N = per_fold_preds.shape
+        
+        # Prepare regression matrices
+        X_reg = per_fold_preds.to(torch.float32).t()  # [N, K0]
+        y_reg = (targets.to(torch.float32) - current_preds.to(torch.float32))  # [N] residuals
+        
+        # Normalize X for stability
+        X_mean = X_reg.mean(dim=0, keepdim=True)
+        X_std = X_reg.std(dim=0, keepdim=True) + 1e-8
+        X_norm = (X_reg - X_mean) / X_std
+        
+        # ISTA parameters
+        XtX = X_norm.t() @ X_norm
+        Xty = X_norm.t() @ y_reg
+        L = torch.linalg.matrix_norm(XtX, ord=2).item()  # Lipschitz constant
+        step_size = 1.0 / (L + 1e-8)
+        
+        # Initialize weights
+        w = torch.zeros(K0, device=device, dtype=torch.float32)
+        
+        # Soft thresholding function
+        def soft_threshold(x, lambda_val):
+            return torch.sign(x) * torch.maximum(torch.abs(x) - lambda_val, torch.zeros_like(x))
+        
+        # ISTA iterations
+        for _ in range(max_iter):
+            w_old = w.clone()
+            
+            # Gradient step
+            grad = -Xty + XtX @ w
+            w = w - step_size * grad
+            
+            # Proximal step (soft thresholding)
+            w = soft_threshold(w, alpha * step_size)
+            
+            # Check convergence
+            if torch.norm(w - w_old) / (torch.norm(w_old) + 1e-10) < tol:
+                break
+        
+        # Un-normalize weights
+        w = w / (X_std.squeeze() + 1e-10)
+        
+        # Ensure non-negative and normalize to sum to 1
+        w = torch.maximum(w, torch.zeros_like(w))
+        w = w / (w.sum() + 1e-10)
+        
+        return w
 
     def advance_and_predict(self,
                             P: torch.Tensor,     # [N], int32 (in/out)
