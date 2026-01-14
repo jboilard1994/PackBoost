@@ -90,6 +90,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         self.max_depth = int(max_depth)
         self.min_child_weight = float(min_child_weight)
         self.min_split_gain   = float(min_split_gain)
+        self.lr        = float(lr)
 
         D   = self.max_depth
         Dm  = max(D - 1, 0)
@@ -200,7 +201,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
             XBv = Pv = Yv_i32 = Lv = Lvn = None
 
         # ---------- boosting loop ----------
-        lr_per_fold = lr / float(nfolds)
         self.tree_set = 0
 
         for t in range(rounds):
@@ -239,7 +239,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
                 self.cut_des(
                     self.Fsch, FST, He, H0e, self.V, self.I,
-                    tree_set=t, L2=L2, lr=lr_per_fold,
+                    tree_set=t, L2=L2,
                     qgrad_bits=qgrad_bits, max_depth=D,
                     min_child_weight=min_child_weight,
                     min_split_gain=min_split_gain,
@@ -253,7 +253,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 self.cut(
                     self.Fsch, FST, H, H0[:, : H.size(1), :].contiguous(),       # -> [K0, nodes, 2]
                     self.V, self.I,
-                    tree_set=t, L2=L2, lr=lr_per_fold,
+                    tree_set=t, L2=L2,
                     qgrad_bits=qgrad_bits, max_depth=D,
                     min_child_weight=min_child_weight,
                     min_split_gain=min_split_gain,
@@ -261,13 +261,18 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 del H, H0
 
             # (f) advance + predict
-            self.advance_and_predict(P, XB, L_old, L_new, self.V, self.I, tree_set=t)
-            L_old, L_new = L_new, L_old
-
-            # (g) validation (optional)
+            P_per_fold, L_new = self.advance_and_predict(P, XB, L_old, L_new, self.V, self.I, tree_set=t, lr=lr)
             if use_val:
-                self.advance_and_predict(Pv, XBv, Lv, Lvn, self.V, self.I, tree_set=t)
-                Lv, Lvn = Lvn, Lv
+                Pv_per_fold, Lvn = self.advance_and_predict(Pv, XBv, Lv, Lvn, self.V, self.I, tree_set=t, lr=lr)
+            L_old, L_new = L_new, L_old
+            Lv, Lvn = Lvn, Lv  
+
+            # (g) average per-fold predictions and update P
+            if use_val:
+                P.add_((P_per_fold.to(torch.float32).mean(dim=0) * lr).to(torch.int32))
+                Pv.add_((Pv_per_fold.to(torch.float32).mean(dim=0) * lr).to(torch.int32))
+            else:
+                P.add_((P_per_fold.to(torch.float32).mean(dim=0) * lr).to(torch.int32))
 
             self.tree_set = t + 1
 
@@ -343,8 +348,10 @@ class PackBoost(BaseEstimator, RegressorMixin):
         torch.cuda.empty_cache()
 
         # --- 3) walk trees round-by-round ---
+        lr = getattr(self, 'lr', 1.0)  # Use training lr, default to 1.0 for legacy models
         for k in range(int(self.tree_set)):
-            self.advance_and_predict(P, XB, L, Ln, self.V, self.I, tree_set=k)
+            P_per_fold, Ln = self.advance_and_predict(P, XB, L, Ln, self.V, self.I, tree_set=k, lr=lr)
+            P.add_((P_per_fold.to(torch.float32).mean(dim=0) * lr).to(torch.int32))
             L, Ln = Ln, L  # ping-pong
 
         # --- 4) trim padding & return ---
@@ -605,7 +612,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
         I:  torch.Tensor,   # [rounds, K0, nodes]    uint16 (OUT; legacy int16 also accepted)
         tree_set: int,
         L2: float,
-        lr: float,
         qgrad_bits: int,
         max_depth: int,
         min_child_weight: float = 20.0,
@@ -621,7 +627,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 F.contiguous(), FST.contiguous(),
                 H.contiguous(), H0.contiguous(),
                 V, I,
-                int(tree_set), float(L2), float(lr),
+                int(tree_set), float(L2), 1.0,
                 int(qgrad_bits), int(max_depth),
                 float(min_child_weight), float(min_split_gain),
             )
@@ -650,7 +656,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             5.0 - depth.float()
         )  # [nodes]
         shift  = 31 - int(qgrad_bits)  # matches CUDA kernel
-        qscale = torch.tensor(lr, dtype=torch.float32, device=device) * float(1 << shift) * torch.pow(
+        qscale = float(1 << shift) * torch.pow(
             torch.tensor(2.0, dtype=torch.float32, device=device),
             -(float(max_depth) - depth.float())
         )  # [nodes]
@@ -788,9 +794,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
         return V, I
 
 
-
-
-
     def advance_and_predict(self,
                             P: torch.Tensor,     # [N], int32 (in/out)
                             X: torch.Tensor,     # [R, M], uint32/int32
@@ -798,7 +801,8 @@ class PackBoost(BaseEstimator, RegressorMixin):
                             L_new: torch.Tensor, # [K0, Dm, N], same dtype
                             V: torch.Tensor,     # [rounds, K0, 2*nodes], int32
                             I: torch.Tensor,     # [rounds, K0, nodes], uint16 (or legacy int16)
-                            tree_set: int):
+                            tree_set: int,
+                            lr: float = 1.0):    
 
         use_cuda = any(t.is_cuda for t in (P, X, L_old, L_new, V, I))
         K0, Dm, N = L_old.shape
@@ -808,12 +812,14 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
         if use_cuda and torch.cuda.is_available():
             from packboost.cuda import kernels
-            kernels.advance_and_predict(
-                P.contiguous(), X.contiguous(),
-                L_old.contiguous(), L_new.contiguous(),
-                V.contiguous(), I.contiguous(), int(tree_set)
-            )
-            return P, L_new
+            raise NotImplementedError("CUDA advance_and_predict kernel needs updating for per-fold predictions and lr support.")
+            
+            #kernels.advance_and_predict(
+            #    P.contiguous(), X.contiguous(),
+            #    L_old.contiguous(), L_new.contiguous(),
+            #    V.contiguous(), I.contiguous(), int(tree_set)
+            #)
+            #return P, L_new 
 
         # -------- CPU vectorized path --------
         assert P.dtype == torch.int32 and X.dtype in (torch.int32, torch.uint32)
@@ -833,9 +839,11 @@ class PackBoost(BaseEstimator, RegressorMixin):
         word_idx = (k >> 5)
         bit_off  = (k & 31).to(torch.int64)
 
-     
-        for depth in range(depths):
-            for f in range(K0):
+        # Per-fold predictions to compute average
+        P_per_fold = torch.zeros((K0, N), dtype=torch.int32, device=device)
+
+        for f in range(K0):
+            for depth in range(depths):
                 if depth == 0:
                     leaf_prev = torch.zeros(N, dtype=torch.int64, device=device)
                 else:
@@ -859,10 +867,10 @@ class PackBoost(BaseEstimator, RegressorMixin):
                         raise AssertionError("L_new must be uint8 or uint16")
 
                 add_idx = (2 * lo + 1 + x).to(torch.long)
-                add_idx=torch.clamp(add_idx, max=max_idx)
-                P.add_(V[tree_set, f].gather(0, add_idx))
+                add_idx = torch.clamp(add_idx, max=max_idx)
+                P_per_fold[f].add_(V[tree_set, f].gather(0, add_idx))
 
-        return P, L_new
+        return P_per_fold, L_new
     
         # -------- DES: H0 per-era (parents) --------
     def h0_des(self,
@@ -1071,7 +1079,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
         *,
         tree_set: int,
         L2: float,
-        lr: float,
         qgrad_bits: int,
         max_depth: int,
         min_child_weight: float = 20.0,
@@ -1084,7 +1091,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 F.contiguous(), FST.contiguous(),
                 H.contiguous(), H0.contiguous(),     # NOTE: no permute; kernel expects [K0,nodes,E,2]
                 V, I,
-                int(tree_set), float(L2), float(lr),
+                int(tree_set), float(L2), 1.0,
                 int(qgrad_bits), int(max_depth),
                 float(min_child_weight), float(min_split_gain),
             )
@@ -1123,8 +1130,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             * torch.pow(torch.tensor(2.0, device=device), 5.0 - depth.to(torch.float32))
         )
         qscale = (
-            torch.tensor(lr, dtype=torch.float32, device=device)
-            * float(1 << (31 - int(qgrad_bits)))
+            float(1 << (31 - int(qgrad_bits)))
             * torch.pow(
                 torch.tensor(2.0, device=device),
                 -(float(max_depth) - depth.to(torch.float32)),
@@ -1273,6 +1279,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             "feature_name" : self.feature_name,
             "comment" : self.comment,
             "train_N": getattr(self, 'train_N', None),
+            "lr": self.lr,
         }
         
         torch.save(state, path, _use_new_zipfile_serialization=True)
@@ -1298,6 +1305,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         self.feature_name  = state.get("feature_name",None)
         self.comment = state.get("comment","")
         self.train_N   = state.get("train_N", None)
+        self.lr        = state["lr"]
         
         file_size_mb = os.path.getsize(path) / (1024 * 1024)
         print(f"Loaded PackBoost model from {path} ({file_size_mb:.2f} MB)")
