@@ -1,0 +1,10 @@
+--index-url https://pypi.org/simple
+--extra-index-url https://download.pytorch.org/whl/cu126
+numpy
+pandas
+pytest
+ipykernel
+ninja 
+torch
+torchvision
+scikit-learn
