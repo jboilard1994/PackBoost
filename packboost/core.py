@@ -920,6 +920,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         nodes = I.shape[2]
         depths = min(tree_set + 1, Dm + 1)
         max_idx= V.shape[2]-1
+        device = P.device
         P_per_fold = torch.zeros((K0, N), dtype=torch.int32, device=device)
 
         if use_cuda and torch.cuda.is_available():
@@ -935,8 +936,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
         assert P.dtype == torch.int32 and X.dtype in (torch.int32, torch.uint32)
         assert V.dtype == torch.int32
         assert I.dtype in (torch.uint16, torch.int16), "I must be uint16 or int16"
-
-        device = P.device
 
         # Use int64 proxy for bit ops on X
         X_ix = X.to(torch.int64) if (X.device.type == "cpu" and X.dtype == torch.uint32) else X.to(torch.int64, copy=False)

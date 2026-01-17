@@ -322,7 +322,7 @@ def test_cut_matches_cpu_reference():
         lr_eff = base_lr / float(K)
 
         pack_cpu.cut(F, FST, H_ref, H0_ref, V_cpu, I_cpu,
-                     tree_set=tree_set, L2=base_L2, lr=lr_eff,
+                     tree_set=tree_set, L2=base_L2,
                      qgrad_bits=qgrad_bits, max_depth=D)
 
         # GPU
@@ -334,7 +334,7 @@ def test_cut_matches_cpu_reference():
         I_gpu   = torch.zeros_like(I_cpu, device="cuda")
 
         pack_gpu.cut(F_gpu, FST_gpu, H_gpu, H0_gpu, V_gpu, I_gpu,
-                     tree_set=tree_set, L2=base_L2, lr=lr_eff,
+                     tree_set=tree_set, L2=base_L2,
                      qgrad_bits=qgrad_bits, max_depth=D)
         torch.cuda.synchronize()
 
@@ -584,12 +584,12 @@ def test_cut_des_matches_cpu_reference():
 
     # CPU selector on CPU-cast DES stats
     pack_cpu.cut_des(F, FST, He_cpu, H0_cpu, V_cpu, I_cpu,
-                     tree_set=tree_set, L2=L2, lr=lr, qgrad_bits=qbits, max_depth=D)
+                     tree_set=tree_set, L2=L2, qgrad_bits=qbits, max_depth=D)
 
     # CUDA selector on GPU stats
     H0e_gpu = H0_all_gpu[:, :nodes, :, :].contiguous()        # [K0, nodes, E, 2]
     pack_gpu.cut_des(F.cuda(), FST.cuda(), He_gpu.contiguous(), H0e_gpu, V_gpu, I_gpu,
-                     tree_set=tree_set, L2=L2, lr=lr, qgrad_bits=qbits, max_depth=D)
+                     tree_set=tree_set, L2=L2, qgrad_bits=qbits, max_depth=D)
     torch.cuda.synchronize()
 
     torch.testing.assert_close(V_gpu.cpu(), V_cpu, rtol=0, atol=0)
@@ -652,10 +652,10 @@ def test_des_end_to_end_cut_agrees_with_stacked_baseline():
     qbits = 12
 
     pack_cpu.cut_des(F, FST, He_cpu, H0_cpu, V_cpu, I_cpu,
-                     tree_set=tree_set, L2=L2, lr=lr, qgrad_bits=qbits, max_depth=D)
+                     tree_set=tree_set, L2=L2, qgrad_bits=qbits, max_depth=D)
 
     pack_gpu.cut_des(F.cuda(), FST.cuda(), He_gpu.contiguous(), H0e_gpu, V_gpu, I_gpu,
-                     tree_set=tree_set, L2=L2, lr=lr, qgrad_bits=qbits, max_depth=D)
+                     tree_set=tree_set, L2=L2, qgrad_bits=qbits, max_depth=D)
     torch.cuda.synchronize()
 
     torch.testing.assert_close(V_gpu.cpu(), V_cpu, rtol=0, atol=0)
