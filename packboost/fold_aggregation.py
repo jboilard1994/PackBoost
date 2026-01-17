@@ -1,0 +1,521 @@
+"""
+Fold aggregation methods for PackBoost.
+
+This module contains various methods for computing fold weights
+based on validation performance.
+"""
+
+import torch
+from typing import Optional, Dict, Any
+
+
+def compute_ridge_weights(per_fold_preds: torch.Tensor,
+                         targets: torch.Tensor,
+                         current_preds: torch.Tensor,
+                         alpha: float,
+                         device: torch.device) -> torch.Tensor:
+    """
+    Compute optimal fold weights using ridge regression.
+    
+    Parameters
+    ----------
+    per_fold_preds : torch.Tensor [K0, N]
+        Per-fold predictions for current round
+    targets : torch.Tensor [N]
+        Target values (quantized as int32)
+    current_preds : torch.Tensor [N]
+        Current predictions (int32)
+    alpha : float
+        Ridge regularization parameter
+    device : torch.device
+        Device to perform computation on
+        
+    Returns
+    -------
+    torch.Tensor [K0]
+        Normalized weights that sum to 1
+    """
+    K0, N = per_fold_preds.shape
+    
+    # Prepare regression matrices
+    X_reg = per_fold_preds.to(torch.float32).t()  # [N, K0]
+    y_reg = (targets.to(torch.float32) - current_preds.to(torch.float32))  # [N] residuals
+    
+    # Ridge regression closed form using Cholesky: w = (X^T X + alpha*I)^(-1) X^T y
+    XtX = X_reg.t() @ X_reg  # [K0, K0]
+    Xty = X_reg.t() @ y_reg  # [K0]
+    I_reg = torch.eye(K0, device=device, dtype=torch.float32)
+    
+    # Use Cholesky decomposition for efficient solving
+    L = torch.linalg.cholesky(XtX + alpha * I_reg)  # [K0, K0]
+    w_opt = torch.cholesky_solve(Xty.unsqueeze(-1), L).squeeze(-1)  # [K0]
+    
+    # Normalize weights so absolute values sum to 1
+    w_opt = w_opt / (torch.abs(w_opt).sum() + 1e-10)
+    
+    return w_opt
+
+
+def compute_lasso_weights(per_fold_preds: torch.Tensor,
+                         targets: torch.Tensor,
+                         current_preds: torch.Tensor,
+                         alpha: float,
+                         device: torch.device,
+                         max_iter: int = 1000,
+                         tol: float = 1e-4) -> torch.Tensor:
+    """
+    Compute optimal fold weights using lasso regression (L1 regularization).
+    Uses ISTA (Iterative Soft Thresholding Algorithm).
+    
+    Parameters
+    ----------
+    per_fold_preds : torch.Tensor [K0, N]
+        Per-fold predictions for current round
+    targets : torch.Tensor [N]
+        Target values (quantized as int32)
+    current_preds : torch.Tensor [N]
+        Current predictions (int32)
+    alpha : float
+        Lasso regularization parameter
+    device : torch.device
+        Device to perform computation on
+    max_iter : int
+        Maximum number of iterations
+    tol : float
+        Convergence tolerance
+        
+    Returns
+    -------
+    torch.Tensor [K0]
+        Normalized weights that sum to 1
+    """
+    K0, N = per_fold_preds.shape
+    
+    # Prepare regression matrices
+    X_reg = per_fold_preds.to(torch.float32).t()  # [N, K0]
+    y_reg = (targets.to(torch.float32) - current_preds.to(torch.float32))  # [N] residuals
+    
+    # Normalize X for stability
+    X_mean = X_reg.mean(dim=0, keepdim=True)
+    X_std = X_reg.std(dim=0, keepdim=True) + 1e-8
+    X_norm = (X_reg - X_mean) / X_std
+    
+    # ISTA parameters
+    XtX = X_norm.t() @ X_norm
+    Xty = X_norm.t() @ y_reg
+    L = torch.linalg.matrix_norm(XtX, ord=2).item()  # Lipschitz constant
+    step_size = 1.0 / (L + 1e-8)
+    
+    # Initialize weights
+    w = torch.zeros(K0, device=device, dtype=torch.float32)
+    
+    # Soft thresholding function
+    def soft_threshold(x, lambda_val):
+        return torch.sign(x) * torch.maximum(torch.abs(x) - lambda_val, torch.zeros_like(x))
+    
+    # ISTA iterations
+    for _ in range(max_iter):
+        w_old = w.clone()
+        
+        # Gradient step
+        grad = -Xty + XtX @ w
+        w = w - step_size * grad
+        
+        # Proximal step (soft thresholding)
+        w = soft_threshold(w, alpha * step_size)
+        
+        # Check convergence
+        if torch.norm(w - w_old) / (torch.norm(w_old) + 1e-10) < tol:
+            break
+    
+    # Un-normalize weights
+    w = w / (X_std.squeeze() + 1e-10)
+    
+    # Normalize so absolute values sum to 1 (allow negative weights)
+    w = w / (torch.abs(w).sum() + 1e-10)
+    
+    return w
+
+
+def compute_validation_performance_weights(per_fold_preds: torch.Tensor,
+                                          targets: torch.Tensor,
+                                          era_ids_val: torch.Tensor,
+                                          alpha: float,
+                                          device: torch.device) -> torch.Tensor:
+    """
+    Compute optimal fold weights based on per-era correlation performance.
+    
+    For each fold k:
+    - u_k = mean era correlation
+    - c_k = ratio of eras where correlation is positive
+    - o_k = standard deviation of era correlation
+    - s_k = (u_k * c_k) / (o_k + epsilon)
+    - w_k = (max(0, s_k)^alpha) / sum(max(0, s_k)^alpha)
+    
+    Parameters
+    ----------
+    per_fold_preds : torch.Tensor [K0, N]
+        Per-fold predictions for current round
+    targets : torch.Tensor [N]
+        Target values (quantized as int32)
+    era_ids_val : torch.Tensor [N]
+        Era IDs for validation samples (int32 tensor)
+    alpha : float
+        Exponent for weight computation (higher = more aggressive selection)
+    device : torch.device
+        Device to perform computation on
+        
+    Returns
+    -------
+    torch.Tensor [K0]
+        Weights normalized so absolute values sum to 1
+    """
+    K0, N = per_fold_preds.shape
+    
+    # Convert to float for correlation computation
+    preds_float = per_fold_preds.to(torch.float32)
+    targets_float = targets.to(torch.float32)
+    
+    # Identify unique eras and create mapping
+    unique_eras = torch.unique(era_ids_val, sorted=True)
+    n_eras = len(unique_eras)
+    
+    # Create era index mapping: [N] -> era index (0 to n_eras-1)
+    era_indices = torch.zeros_like(era_ids_val)
+    for i, era_id in enumerate(unique_eras):
+        era_indices[era_ids_val == era_id] = i
+    
+    # Count samples per era and find max era size
+    era_counts = torch.bincount(era_indices, minlength=n_eras)
+    max_era_size = era_counts.max().item()
+    
+    # Create padded tensors for vectorized computation
+    # Shape: [n_eras, max_era_size]
+    padded_targets = torch.zeros((n_eras, max_era_size), dtype=torch.float32, device=device)
+    # Shape: [K0, n_eras, max_era_size]
+    padded_preds = torch.zeros((K0, n_eras, max_era_size), dtype=torch.float32, device=device)
+    # Mask for valid samples
+    valid_mask = torch.zeros((n_eras, max_era_size), dtype=torch.bool, device=device)
+    
+    # Vectorized filling using sorting and advanced indexing
+    # Sort samples by era index
+    sorted_indices = torch.argsort(era_indices)
+    sorted_era_indices = era_indices[sorted_indices]
+    sorted_targets = targets_float[sorted_indices]
+    sorted_preds = preds_float[:, sorted_indices]
+    
+    # Create position indices within each era (0, 1, 2, ..., 0, 1, 2, ...)
+    era_positions = torch.zeros(N, dtype=torch.long, device=device)
+    cumsum = torch.cumsum(era_counts, dim=0)
+    era_starts = torch.cat([torch.zeros(1, dtype=torch.long, device=device), cumsum[:-1]])
+    for i in range(n_eras):
+        start_idx = era_starts[i]
+        end_idx = cumsum[i]
+        era_positions[start_idx:end_idx] = torch.arange(end_idx - start_idx, device=device)
+    
+    # Fill padded tensors using advanced indexing
+    padded_targets[sorted_era_indices, era_positions] = sorted_targets
+    padded_preds[:, sorted_era_indices, era_positions] = sorted_preds
+    valid_mask[sorted_era_indices, era_positions] = True
+    
+    # Vectorized correlation computation across all eras
+    # Compute means (only over valid samples)
+    target_sums = (padded_targets * valid_mask).sum(dim=1)  # [n_eras]
+    target_means = target_sums / era_counts.float()  # [n_eras]
+    
+    pred_sums = (padded_preds * valid_mask.unsqueeze(0)).sum(dim=2)  # [K0, n_eras]
+    pred_means = pred_sums / era_counts.unsqueeze(0).float()  # [K0, n_eras]
+    
+    # Center the data
+    target_centered = padded_targets - target_means.unsqueeze(1)  # [n_eras, max_era_size]
+    pred_centered = padded_preds - pred_means.unsqueeze(2)  # [K0, n_eras, max_era_size]
+    
+    # Apply mask to centered data
+    target_centered = target_centered * valid_mask  # [n_eras, max_era_size]
+    pred_centered = pred_centered * valid_mask.unsqueeze(0)  # [K0, n_eras, max_era_size]
+    
+    # Compute correlations
+    numerator = (pred_centered * target_centered.unsqueeze(0)).sum(dim=2)  # [K0, n_eras]
+    pred_var = (pred_centered ** 2).sum(dim=2)  # [K0, n_eras]
+    target_var = (target_centered ** 2).sum(dim=1)  # [n_eras]
+    
+    denominator = torch.sqrt(pred_var * target_var.unsqueeze(0))  # [K0, n_eras]
+    
+    # Compute correlations, handling division by zero
+    era_correlations = torch.where(
+        (denominator > 1e-10) & (era_counts.unsqueeze(0) > 1),
+        numerator / denominator,
+        torch.zeros_like(numerator)
+    )  # [K0, n_eras]
+    
+    # Transpose to [K0, n_eras] (already in correct shape)
+    # Compute statistics for each fold
+    u_k = era_correlations.mean(dim=1)  # Mean era correlation [K0]
+    c_k = (era_correlations > 0).float().mean(dim=1)  # Ratio of positive correlations [K0]
+    o_k = era_correlations.std(dim=1)  # Std of era correlations [K0]
+    
+    # Compute scores: s_k = (u_k * c_k) / (o_k + epsilon)
+    epsilon = 1e-6
+    s_k = (u_k * c_k) / (o_k + epsilon)
+    
+    # Compute weights: w_k = (max(0, s_k)^alpha) / sum(max(0, s_k)^alpha)
+    s_k_pos = torch.maximum(s_k, torch.zeros_like(s_k))
+    w_unnorm = s_k_pos ** alpha
+    
+    # Normalize so absolute values sum to 1
+    w = w_unnorm / (torch.abs(w_unnorm).sum() + 1e-10)
+    
+    return w
+
+
+def compute_pairwise_correlation_penalty_weights(per_fold_preds: torch.Tensor,
+                                                 gamma: float,
+                                                 alpha: float,
+                                                 device: torch.device) -> torch.Tensor:
+    """
+    Compute fold weights using pairwise correlation penalty.
+    Penalizes folds that are highly correlated with other folds, promoting diversity.
+    
+    Algorithm:
+    - For each fold k, compute average pairwise correlation with all other folds:
+      ρ̄_k = (1/(K-1)) * Σ_{j≠k} corr(p_k, p_j)
+    - Compute scores: s_k = (1 - ρ̄_k)^γ
+    - Compute weights: w_k = s_k^α / Σ_j s_j^α
+    
+    Parameters
+    ----------
+    per_fold_preds : torch.Tensor [K0, N]
+        Per-fold predictions for current round
+    gamma : float
+        Exponent for diversity score (higher = more aggressive diversity penalty)
+    alpha : float
+        Exponent for weight normalization (higher = more aggressive selection)
+    device : torch.device
+        Device to perform computation on
+        
+    Returns
+    -------
+    torch.Tensor [K0]
+        Weights normalized so absolute values sum to 1
+    """
+    K0, N = per_fold_preds.shape
+    
+    if K0 == 1:
+        # Only one fold, return weight of 1
+        return torch.ones(1, dtype=torch.float32, device=device)
+    
+    # Convert to float for correlation computation
+    preds_float = per_fold_preds.to(torch.float32)
+    
+    # Compute all pairwise correlations efficiently using correlation matrix
+    # Standardize predictions: [K0, N]
+    pred_mean = preds_float.mean(dim=1, keepdim=True)  # [K0, 1]
+    pred_centered = preds_float - pred_mean  # [K0, N]
+    pred_std = pred_centered.std(dim=1, keepdim=True) + 1e-10  # [K0, 1]
+    pred_standardized = pred_centered / pred_std  # [K0, N]
+    
+    # Correlation matrix: [K0, K0]
+    # corr[i,j] = corr(pred_i, pred_j)
+    corr_matrix = (pred_standardized @ pred_standardized.t()) / N  # [K0, K0]
+    
+    # For each fold k, compute average correlation with all other folds
+    # ρ̄_k = (1/(K-1)) * Σ_{j≠k} corr(p_k, p_j)
+    # This is equivalent to: (sum of row k - diagonal element k) / (K-1)
+    corr_sum_per_fold = corr_matrix.sum(dim=1)  # [K0]
+    corr_self = torch.diagonal(corr_matrix)  # [K0]
+    avg_corr = (corr_sum_per_fold - corr_self) / (K0 - 1)  # [K0]
+    
+    # Compute diversity scores: s_k = (1 - ρ̄_k)^γ
+    # Higher score means lower average correlation (more diverse)
+    diversity_score = (1.0 - avg_corr) ** gamma  # [K0]
+    
+    # Clip to ensure non-negative
+    diversity_score = torch.maximum(diversity_score, torch.zeros_like(diversity_score))
+    
+    # Apply temperature softmax: w_i = s_i^(1/T) / Σ_j s_j^(1/T)
+    # Stabilize scores first
+    eps = 1e-8
+    diversity_score_stable = torch.maximum(diversity_score, torch.tensor(eps, device=device))
+    
+    # Temperature softmax: w = s^(1/T) / sum(s^(1/T))
+    # When T=1: standard normalization, T<1: sharper, T>1: flatter
+    temperature = alpha  # Use alpha as temperature parameter
+    w_unnorm = diversity_score_stable ** (1.0 / temperature)
+    
+    # Normalize so absolute values sum to 1
+    w = w_unnorm / (torch.abs(w_unnorm).sum() + 1e-10)
+    
+    return w
+
+
+def compute_orthogonality_weights(per_fold_preds: torch.Tensor,
+                                  temperature: float,
+                                  device: torch.device) -> torch.Tensor:
+    """
+    Compute fold weights using orthogonality scores with temperature softmax.
+    
+    For each fold i, computes how much of its predictions cannot be explained
+    by the span of all other folds' predictions, then applies temperature softmax.
+    
+    Algorithm:
+    - For each fold i: compute projection of e_i onto space spanned by E_{-i}
+    - Orthogonality score: ||e_i - projection|| / ||e_i|| ∈ [0, 1]
+    - Apply temperature softmax: w_i = s_i^(1/T) / Σ_j s_j^(1/T)
+    
+    Parameters
+    ----------
+    per_fold_preds : torch.Tensor [K0, N]
+        Per-fold predictions for current round
+    temperature : float
+        Temperature for softmax (T=1: baseline, T<1: sharper, T>1: flatter)
+    device : torch.device
+        Device to perform computation on
+        
+    Returns
+    -------
+    torch.Tensor [K0]
+        Weights normalized so absolute values sum to 1
+    """
+    K0, N = per_fold_preds.shape
+    
+    if K0 == 1:
+        # Only one fold, return weight of 1
+        return torch.ones(1, dtype=torch.float32, device=device)
+    
+    preds_float = per_fold_preds.float()
+    
+    # Pre-compute the Gram matrix: E^T @ E where E is [N, K0]
+    gram_matrix = preds_float @ preds_float.t()  # [K0, K0]
+    
+    # Compute orthogonality scores for all folds
+    orth_scores = torch.zeros(K0, device=device)
+    
+    for i in range(K0):
+        # Remove row and column i from Gram matrix to get E_{-i}^T @ E_{-i}
+        indices = torch.cat([torch.arange(i, device=device), 
+                            torch.arange(i+1, K0, device=device)])
+        
+        gram_minus_i = gram_matrix[indices][:, indices]  # [K0-1, K0-1]
+        
+        # Add regularization for numerical stability
+        gram_minus_i.diagonal().add_(1e-6)
+        
+        # E_{-i}^T @ e_i is the i-th column without the i-th element
+        Ete = gram_matrix[indices, i]  # [K0-1]
+        
+        # Solve: (E_{-i}^T E_{-i})^{-1} (E_{-i}^T e_i)
+        coeffs = torch.linalg.solve(gram_minus_i, Ete)  # [K0-1]
+        
+        # Compute ||ê_i||^2 = coeffs^T @ E_{-i}^T @ E_{-i} @ coeffs
+        norm_proj_sq = coeffs @ gram_minus_i @ coeffs - 1e-6 * (coeffs @ coeffs)
+        
+        # ||e_i||^2
+        norm_ei_sq = gram_matrix[i, i]
+        
+        # Orthogonality score: sqrt(||e_i||^2 - ||ê_i||^2) / ||e_i||
+        orth_scores[i] = torch.sqrt(torch.clamp(norm_ei_sq - norm_proj_sq, min=0.0)) / (torch.sqrt(norm_ei_sq) + 1e-10)
+    
+    # Apply temperature softmax: w_i = s_i^(1/T) / Σ_j s_j^(1/T)
+    # Stabilize scores first
+    eps = 1e-8
+    orth_scores_stable = torch.maximum(orth_scores, torch.tensor(eps, device=device))
+    
+    # Temperature softmax
+    w_unnorm = orth_scores_stable ** (1.0 / temperature)
+    
+    # Normalize so absolute values sum to 1
+    w = w_unnorm / (torch.abs(w_unnorm).sum() + 1e-10)
+    
+    return w
+
+
+# Wrapper functions that handle argument extraction from fold_aggregation_method_args
+
+def aggregate_mean(per_fold_preds: torch.Tensor,
+                   targets: Optional[torch.Tensor],
+                   current_preds: Optional[torch.Tensor],
+                   era_ids_val: Optional[torch.Tensor],
+                   device: torch.device,
+                   args: Optional[Dict[str, Any]]) -> torch.Tensor:
+    """Mean aggregation - equal weights for all folds."""
+    K0 = per_fold_preds.shape[0]
+    return torch.ones(K0, device=device, dtype=torch.float32) / K0
+
+
+def aggregate_ridge_regression(per_fold_preds: torch.Tensor,
+                                targets: Optional[torch.Tensor],
+                                current_preds: Optional[torch.Tensor],
+                                era_ids_val: Optional[torch.Tensor],
+                                device: torch.device,
+                                args: Optional[Dict[str, Any]]) -> torch.Tensor:
+    """Ridge regression aggregation."""
+    if args is None:
+        args = {}
+    alpha = args.get('alpha', 1e-4)
+    return compute_ridge_weights(per_fold_preds, targets, current_preds, alpha, device)
+
+
+def aggregate_lasso_regression(per_fold_preds: torch.Tensor,
+                                targets: Optional[torch.Tensor],
+                                current_preds: Optional[torch.Tensor],
+                                era_ids_val: Optional[torch.Tensor],
+                                device: torch.device,
+                                args: Optional[Dict[str, Any]]) -> torch.Tensor:
+    """Lasso regression aggregation."""
+    if args is None:
+        args = {}
+    alpha = args.get('alpha', 1e-4)
+    max_iter = args.get('max_iter', 1000)
+    tol = args.get('tol', 1e-4)
+    return compute_lasso_weights(per_fold_preds, targets, current_preds, alpha, device, max_iter, tol)
+
+
+def aggregate_validation_performance_weighting(per_fold_preds: torch.Tensor,
+                                                targets: Optional[torch.Tensor],
+                                                current_preds: Optional[torch.Tensor],
+                                                era_ids_val: Optional[torch.Tensor],
+                                                device: torch.device,
+                                                args: Optional[Dict[str, Any]]) -> torch.Tensor:
+    """Validation performance weighting based on per-era correlations."""
+    if args is None:
+        args = {}
+    alpha = args.get('alpha', 2.0)
+    return compute_validation_performance_weights(per_fold_preds, targets, era_ids_val, alpha, device)
+
+
+def aggregate_pairwise_correlation_penalty(per_fold_preds: torch.Tensor,
+                                           targets: Optional[torch.Tensor],
+                                           current_preds: Optional[torch.Tensor],
+                                           era_ids_val: Optional[torch.Tensor],
+                                           device: torch.device,
+                                           args: Optional[Dict[str, Any]]) -> torch.Tensor:
+    """Pairwise correlation penalty aggregation - promotes diversity."""
+    if args is None:
+        args = {}
+    gamma = args.get('gamma', 1.0)
+    alpha = args.get('alpha', 2.0)
+    return compute_pairwise_correlation_penalty_weights(per_fold_preds, gamma, alpha, device)
+
+
+def aggregate_orthogonality_weighting(per_fold_preds: torch.Tensor,
+                                      targets: Optional[torch.Tensor],
+                                      current_preds: Optional[torch.Tensor],
+                                      era_ids_val: Optional[torch.Tensor],
+                                      device: torch.device,
+                                      args: Optional[Dict[str, Any]]) -> torch.Tensor:
+    """Orthogonality weighting with temperature softmax - weights by unique contribution."""
+    if args is None:
+        args = {}
+    temperature = args.get('temperature', 1.0)
+    return compute_orthogonality_weights(per_fold_preds, temperature, device)
+
+
+# Dictionary mapping method names to aggregation functions
+AGGREGATION_METHODS = {
+    'mean': aggregate_mean,
+    'ridge_regression': aggregate_ridge_regression,
+    'lasso_regression': aggregate_lasso_regression,
+    'validation_performance_weighting': aggregate_validation_performance_weighting,
+    'pairwise_correlation_penalty': aggregate_pairwise_correlation_penalty,
+    'orthogonality_weighting': aggregate_orthogonality_weighting,
+}

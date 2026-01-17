@@ -9,7 +9,7 @@ constexpr int WARP_SIZE = 32;
 
 template <typename LeafT>
 __global__ void advance_and_predict_kernel(
-    int32_t* __restrict__ P,            // [N]
+    int32_t* __restrict__ P_per_fold,   // [K0, N]
     const uint32_t* __restrict__ X,     // [R, M]
     const LeafT*  __restrict__ L_old,   // [K0, Dm, N]
     LeafT*        __restrict__ L_new,   // [K0, Dm, N]
@@ -51,17 +51,15 @@ __global__ void advance_and_predict_kernel(
       L_new[off_new] = (LeafT)leaf_new;
     }
 
-    size_t idx = (size_t)(2 * lo + 1 + (int)bit);
-    if (idx >= (size_t)(2 * nodes)) {
-      idx = (size_t)(2 * nodes) - 1;
-    }
+    const size_t idx = (size_t)(2 * lo + (1 - (int)bit));
     const int add = V[Vbase + idx];
-    atomicAdd(&P[k], add);
+    // Accumulate to per-fold predictions: P_per_fold[tree_fold, k]
+    atomicAdd(&P_per_fold[(size_t)tree_fold * (size_t)N + (size_t)k], add);
   }
 }
 
 static void launch_advpred(
-    torch::Tensor P,  // int32 [N]
+    torch::Tensor P_per_fold,  // int32 [K0, N]
     torch::Tensor X,  // int32 (bitwise uint32) [R, M]
     torch::Tensor L_old,
     torch::Tensor L_new,
@@ -70,12 +68,12 @@ static void launch_advpred(
     int tree_set)
 {
 
-  const int N      = (int)P.size(0);
+  const int K0     = (int)P_per_fold.size(0);
+  const int N      = (int)P_per_fold.size(1);
   const int R      = (int)X.size(0);
   const int M      = (int)X.size(1);
 
   const int rounds = (int)V.size(0);
-  const int K0     = (int)V.size(1);
   const int nodes2 = (int)V.size(2);
   const int nodes  = nodes2 / 2;
   const int Dm = (int)L_old.size(1);
@@ -94,7 +92,7 @@ static void launch_advpred(
 
   if (L_old.scalar_type() == at::kByte && L_new.scalar_type() == at::kByte) {
     advance_and_predict_kernel<uint8_t><<<grid, block, 0, stream.stream()>>>(
-        P.data_ptr<int32_t>(),
+        P_per_fold.data_ptr<int32_t>(),
         reinterpret_cast<const uint32_t*>(X.data_ptr()),
         L_old.data_ptr<uint8_t>(),
         L_new.data_ptr<uint8_t>(),
@@ -103,7 +101,7 @@ static void launch_advpred(
         N, R, M, K0, Dm, nodes, rounds, tree_set, stride);
   } else if (L_old.scalar_type() == at::kShort && L_new.scalar_type() == at::kShort) {
     advance_and_predict_kernel<uint16_t><<<grid, block, 0, stream.stream()>>>(
-        P.data_ptr<int32_t>(),
+        P_per_fold.data_ptr<int32_t>(),
         reinterpret_cast<const uint32_t*>(X.data_ptr()),
         L_old.data_ptr<uint16_t>(),
         L_new.data_ptr<uint16_t>(),
@@ -116,9 +114,9 @@ static void launch_advpred(
 }
 
 void advance_and_predict_launcher(
-    torch::Tensor P, torch::Tensor X, torch::Tensor L_old, torch::Tensor L_new,
+    torch::Tensor P_per_fold, torch::Tensor X, torch::Tensor L_old, torch::Tensor L_new,
     torch::Tensor V, torch::Tensor I, int tree_set)
 {
-  launch_advpred(P.contiguous(), X.contiguous(), L_old.contiguous(), L_new.contiguous(),
+  launch_advpred(P_per_fold.contiguous(), X.contiguous(), L_old.contiguous(), L_new.contiguous(),
                  V.contiguous(), I.contiguous(), tree_set);
 }

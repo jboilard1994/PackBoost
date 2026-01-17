@@ -9,6 +9,7 @@ print('Installing kernels...')
 from packboost.cuda import kernels
 print('kernels successfully Installed!')
 from packboost.callback import EarlyStoppingCallback
+from packboost.fold_aggregation import AGGREGATION_METHODS
 
 
 class PackBoost(BaseEstimator, RegressorMixin):
@@ -83,19 +84,23 @@ class PackBoost(BaseEstimator, RegressorMixin):
             qgrad_bits: int = 12,
             seed: int = 42,
             era_ids: np.ndarray | None = None,
+            era_ids_val: np.ndarray | None = None,
             fold_aggregation_method: str = "mean",
             fold_aggregation_method_args: dict = None):
-        assert X.dtype == np.int8 and y.dtype == np.float32
+        
+        assert X.dtype == np.int8 and y.dtype == np.float32 
+        assert not nfeatsets < nfolds, "⚠️ nfeatsets ({nfeatsets}) < nfolds ({nfolds}) "
+        # Validate fold_aggregation_method
+        if fold_aggregation_method != "mean":
+            assert Xv is not None and Yv is not None, "fold_aggregation_method != 'mean' requires validation datasets (Xv, Yv)"
+            assert era_ids_val is not None, "fold_aggregation_method != 'mean' requires validation era_ids (era_ids_val)"
+
         device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
         callbacks = [] if callbacks is None else callbacks
         
         # Set default args if not provided
         if fold_aggregation_method_args is None:
             fold_aggregation_method_args = {}
-        
-        # Validate fold_aggregation_method
-        if fold_aggregation_method != "mean":
-            assert Xv is not None and Yv is not None, "fold_aggregation_method != 'mean' requires validation datasets (Xv, Yv)"
 
         # ---------- meta ----------
         self.feature_name = feature_name
@@ -151,18 +156,13 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
         # ---------- schedules ----------
         rng = np.random.RandomState(seed)
+        torch.manual_seed(seed) 
         if bF >= (1 << 16):
             raise ValueError(
                 f"encode_cuts produced {bF} bitplanes (4*F). "
                 f"Schedule dtype is uint16; reduce F or extend to uint32."
             )
         
-        '''
-        Fsch_cpu = torch.from_numpy(
-            rng.randint(0, bF, size=(rounds, lanes * nfeatsets), dtype=np.uint16)
-        ).contiguous()
-        self.Fsch = Fsch_cpu.to(device=device, dtype=torch.uint16).contiguous()
-        '''
         K1 = lanes * nfeatsets
 
         if bF < K1:
@@ -186,7 +186,8 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 perm = torch.randperm(nfeatsets, device=device)
                 FST[s, :, d] = row[perm]
         FST = FST.contiguous()
-
+    
+   
         # ---------- outputs ----------
         self.V = torch.zeros((rounds, nfolds, 2 * nodes), dtype=torch.int32,  device=device)
         self.I = torch.zeros((rounds, nfolds,     nodes), dtype=torch.uint16, device=device)
@@ -206,6 +207,12 @@ class PackBoost(BaseEstimator, RegressorMixin):
             self.Pv_    = Pv
             self.Yv_i32 = Yv_i32
             self.Yv     = torch.from_numpy(Yv).to(device=device)
+            
+            # Pre-convert era_ids_val to tensor for efficiency
+            if era_ids_val is not None:
+                era_ids_val_t = torch.from_numpy(era_ids_val if isinstance(era_ids_val, np.ndarray) else np.asarray(era_ids_val)).to(device=device, dtype=torch.int32)
+            else:
+                era_ids_val_t = None
 
             Lv  = torch.zeros((nfolds, Dm, Nv), dtype=leaf_dtype, device=device)
             Lvn = torch.zeros_like(Lv)
@@ -214,6 +221,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 torch.cuda.empty_cache()
         else:
             XBv = Pv = Yv_i32 = Lv = Lvn = None
+            era_ids_val_t = None
 
         # ---------- boosting loop ----------
         self.tree_set = 0
@@ -282,43 +290,23 @@ class PackBoost(BaseEstimator, RegressorMixin):
             L_old, L_new = L_new, L_old
             Lv, Lvn = Lvn, Lv  
 
+
             # (g) average per-fold predictions and update P
-            if use_val:
-                if fold_aggregation_method == "mean":
-                    w_unnorm = torch.ones(nfolds, device=device, dtype=torch.float32) / nfolds
-                elif fold_aggregation_method == "ridge_regression":
-                    # Use ridge regression to find optimal weights based on validation set
-                    alpha = fold_aggregation_method_args.get('alpha', 1e-4)
-                    w_unnorm = self._compute_ridge_weights(
-                        Pv_per_fold, Yv_i32, Pv, alpha, device
-                    )
-                elif fold_aggregation_method == "lasso_regression":
-                    # Use lasso regression (L1 regularization) to find optimal weights
-                    alpha = fold_aggregation_method_args.get('alpha', 1e-4)
-                    max_iter = fold_aggregation_method_args.get('max_iter', 1000)
-                    tol = fold_aggregation_method_args.get('tol', 1e-3)
-                    w_unnorm = self._compute_lasso_weights(
-                        Pv_per_fold, Yv_i32, Pv, alpha, device, max_iter, tol
-                    )
-                # else: other methods will set w_unnorm based on validation performance
-                
-                # Normalize weights to sum to 1
-                w_normalized = w_unnorm / (w_unnorm.sum() + 1e-10)
-                self.W[t, :] = w_normalized
-                
-                w = w_normalized.view(-1, 1)  # [K0, 1]
-                P.add_(((P_per_fold.to(torch.float32) * w).sum(dim=0) * lr).to(torch.int32))
-                Pv.add_(((Pv_per_fold.to(torch.float32) * w).sum(dim=0) * lr).to(torch.int32))
-            else:
-                if fold_aggregation_method == "mean":
-                    w_unnorm = torch.ones(nfolds, device=device, dtype=torch.float32) / nfolds
-                
-                # Normalize weights to sum to 1
-                w_normalized = w_unnorm / (w_unnorm.sum() + 1e-10)
-                self.W[t, :] = w_normalized
-                
-                w = w_normalized.view(-1, 1)  # [K0, 1]
-                P.add_(((P_per_fold.to(torch.float32) * w).sum(dim=0) * lr).to(torch.int32))
+            self._compute_fold_weights_and_update(
+                t=t,
+                P=P,
+                P_per_fold=P_per_fold,
+                Pv=Pv,
+                Pv_per_fold=Pv_per_fold,
+                Yv_i32=Yv_i32,
+                era_ids_val=era_ids_val_t,
+                lr=lr,
+                nfolds=nfolds,
+                device=device,
+                use_val=use_val,
+                fold_aggregation_method=fold_aggregation_method,
+                fold_aggregation_method_args=fold_aggregation_method_args
+            )
 
             self.tree_set = t + 1
 
@@ -345,10 +333,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
         self.FST  = FST
         self.X_packed_ = XB
         return self
-
-
-
-
 
 
     def predict(self, X):
@@ -840,134 +824,86 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
         return V, I
 
-    def _compute_ridge_weights(self, 
-                               per_fold_preds: torch.Tensor,  # [K0, N]
-                               targets: torch.Tensor,         # [N]
-                               current_preds: torch.Tensor,   # [N]
-                               alpha: float,
-                               device: torch.device) -> torch.Tensor:
+    def _compute_fold_weights_and_update(self,
+                                         t: int,
+                                         P: torch.Tensor,
+                                         P_per_fold: torch.Tensor,
+                                         Pv: torch.Tensor,
+                                         Pv_per_fold: torch.Tensor,
+                                         Yv_i32: torch.Tensor,
+                                         era_ids_val: torch.Tensor,
+                                         lr: float,
+                                         nfolds: int,
+                                         device: torch.device,
+                                         use_val: bool,
+                                         fold_aggregation_method: str,
+                                         fold_aggregation_method_args: dict):
         """
-        Compute optimal fold weights using ridge regression.
+        Compute fold weights and update predictions (section g).
         
         Parameters
         ----------
-        per_fold_preds : torch.Tensor [K0, N]
-            Per-fold predictions for current round
-        targets : torch.Tensor [N]
-            Target values (quantized as int32)
-        current_preds : torch.Tensor [N]
-            Current predictions (int32)
-        alpha : float
-            Ridge regularization parameter
+        t : int
+            Current round index
+        P : torch.Tensor [N]
+            Training predictions (int32, in-place modified)
+        P_per_fold : torch.Tensor [nfolds, N]
+            Per-fold training predictions for current round
+        Pv : torch.Tensor [Nv]
+            Validation predictions (int32, in-place modified if use_val)
+        Pv_per_fold : torch.Tensor [nfolds, Nv]
+            Per-fold validation predictions (used if use_val)
+        Yv_i32 : torch.Tensor [Nv]
+            Validation targets (int32, used if use_val)
+        era_ids_val : torch.Tensor [Nv]
+            Era IDs for validation set (int32, used for era-based aggregation)
+        lr : float
+            Learning rate
+        nfolds : int
+            Number of folds
         device : torch.device
-            Device to perform computation on
-            
-        Returns
-        -------
-        torch.Tensor [K0]
-            Normalized weights that sum to 1
+            Device for computation
+        use_val : bool
+            Whether validation set is available
+        fold_aggregation_method : str
+            Method for aggregating fold predictions
+        fold_aggregation_method_args : dict
+            Arguments for fold aggregation method
         """
-        K0, N = per_fold_preds.shape
-        
-        # Prepare regression matrices
-        X_reg = per_fold_preds.to(torch.float32).t()  # [N, K0]
-        y_reg = (targets.to(torch.float32) - current_preds.to(torch.float32))  # [N] residuals
-        
-        # Ridge regression closed form using Cholesky: w = (X^T X + alpha*I)^(-1) X^T y
-        XtX = X_reg.t() @ X_reg  # [K0, K0]
-        Xty = X_reg.t() @ y_reg  # [K0]
-        I_reg = torch.eye(K0, device=device, dtype=torch.float32)
-        
-        # Use Cholesky decomposition for efficient solving
-        L = torch.linalg.cholesky(XtX + alpha * I_reg)  # [K0, K0]
-        w_opt = torch.cholesky_solve(Xty.unsqueeze(-1), L).squeeze(-1)  # [K0]
-        
-        # Normalize weights to sum to 1
-        w_opt = w_opt / (w_opt.sum() + 1e-10)
-        
-        return w_opt
+        if use_val:
+            # Look up aggregation function from dictionary
+            if fold_aggregation_method not in AGGREGATION_METHODS:
+                raise ValueError(f"Unknown fold aggregation method: {fold_aggregation_method}. "
+                                f"Available methods: {list(AGGREGATION_METHODS.keys())}")
+            
+            aggregation_func = AGGREGATION_METHODS[fold_aggregation_method]
+            
+            # Call aggregation function with all needed parameters
+            w = aggregation_func(
+                per_fold_preds=Pv_per_fold,
+                targets=Yv_i32,
+                current_preds=Pv,
+                era_ids_val=era_ids_val,
+                device=device,
+                args=fold_aggregation_method_args
+            )
+                  
+            self.W[t, :] = w
+            w = w.view(-1, 1)  # [K0, 1]
+            P.add_(((P_per_fold.to(torch.float32) * w).sum(dim=0) * lr).to(torch.int32))
+            Pv.add_(((Pv_per_fold.to(torch.float32) * w).sum(dim=0) * lr).to(torch.int32))
+        else:
+            # Without validation, default to mean
+            w_unnorm = torch.ones(nfolds, device=device, dtype=torch.float32) / nfolds
+            
+            # Normalize weights to sum to 1
+            w_normalized = w_unnorm / (w_unnorm.sum() + 1e-10)
+            self.W[t, :] = w_normalized
+            
+            w = w_normalized.view(-1, 1)  # [K0, 1]
+            P.add_(((P_per_fold.to(torch.float32) * w).sum(dim=0) * lr).to(torch.int32))
 
-    def _compute_lasso_weights(self, 
-                               per_fold_preds: torch.Tensor,  # [K0, N]
-                               targets: torch.Tensor,         # [N]
-                               current_preds: torch.Tensor,   # [N]
-                               alpha: float,
-                               device: torch.device,
-                               max_iter: int = 1000,
-                               tol: float = 1e-4) -> torch.Tensor:
-        """
-        Compute optimal fold weights using lasso regression (L1 regularization).
-        Uses ISTA (Iterative Soft Thresholding Algorithm).
-        
-        Parameters
-        ----------
-        per_fold_preds : torch.Tensor [K0, N]
-            Per-fold predictions for current round
-        targets : torch.Tensor [N]
-            Target values (quantized as int32)
-        current_preds : torch.Tensor [N]
-            Current predictions (int32)
-        alpha : float
-            Lasso regularization parameter
-        device : torch.device
-            Device to perform computation on
-        max_iter : int
-            Maximum number of iterations
-        tol : float
-            Convergence tolerance
-            
-        Returns
-        -------
-        torch.Tensor [K0]
-            Normalized weights that sum to 1
-        """
-        K0, N = per_fold_preds.shape
-        
-        # Prepare regression matrices
-        X_reg = per_fold_preds.to(torch.float32).t()  # [N, K0]
-        y_reg = (targets.to(torch.float32) - current_preds.to(torch.float32))  # [N] residuals
-        
-        # Normalize X for stability
-        X_mean = X_reg.mean(dim=0, keepdim=True)
-        X_std = X_reg.std(dim=0, keepdim=True) + 1e-8
-        X_norm = (X_reg - X_mean) / X_std
-        
-        # ISTA parameters
-        XtX = X_norm.t() @ X_norm
-        Xty = X_norm.t() @ y_reg
-        L = torch.linalg.matrix_norm(XtX, ord=2).item()  # Lipschitz constant
-        step_size = 1.0 / (L + 1e-8)
-        
-        # Initialize weights
-        w = torch.zeros(K0, device=device, dtype=torch.float32)
-        
-        # Soft thresholding function
-        def soft_threshold(x, lambda_val):
-            return torch.sign(x) * torch.maximum(torch.abs(x) - lambda_val, torch.zeros_like(x))
-        
-        # ISTA iterations
-        for _ in range(max_iter):
-            w_old = w.clone()
-            
-            # Gradient step
-            grad = -Xty + XtX @ w
-            w = w - step_size * grad
-            
-            # Proximal step (soft thresholding)
-            w = soft_threshold(w, alpha * step_size)
-            
-            # Check convergence
-            if torch.norm(w - w_old) / (torch.norm(w_old) + 1e-10) < tol:
-                break
-        
-        # Un-normalize weights
-        w = w / (X_std.squeeze() + 1e-10)
-        
-        # Ensure non-negative and normalize to sum to 1
-        w = torch.maximum(w, torch.zeros_like(w))
-        w = w / (w.sum() + 1e-10)
-        
-        return w
+
 
     def advance_and_predict(self,
                             P: torch.Tensor,     # [N], int32 (in/out)
@@ -984,17 +920,16 @@ class PackBoost(BaseEstimator, RegressorMixin):
         nodes = I.shape[2]
         depths = min(tree_set + 1, Dm + 1)
         max_idx= V.shape[2]-1
+        P_per_fold = torch.zeros((K0, N), dtype=torch.int32, device=device)
 
         if use_cuda and torch.cuda.is_available():
             from packboost.cuda import kernels
-            raise NotImplementedError("CUDA advance_and_predict kernel needs updating for per-fold predictions and lr support.")
-            
-            #kernels.advance_and_predict(
-            #    P.contiguous(), X.contiguous(),
-            #    L_old.contiguous(), L_new.contiguous(),
-            #    V.contiguous(), I.contiguous(), int(tree_set)
-            #)
-            #return P, L_new 
+            kernels.advance_and_predict(
+                P_per_fold.contiguous(), X.contiguous(),
+                L_old.contiguous(), L_new.contiguous(),
+                V.contiguous(), I.contiguous(), int(tree_set)
+            )
+            return P_per_fold, L_new 
 
         # -------- CPU vectorized path --------
         assert P.dtype == torch.int32 and X.dtype in (torch.int32, torch.uint32)
@@ -1013,9 +948,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
         k = torch.arange(N, device=device, dtype=torch.long)
         word_idx = (k >> 5)
         bit_off  = (k & 31).to(torch.int64)
-
-        # Per-fold predictions to compute average
-        P_per_fold = torch.zeros((K0, N), dtype=torch.int32, device=device)
 
         for f in range(K0):
             for depth in range(depths):
@@ -1041,8 +973,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                     else:
                         raise AssertionError("L_new must be uint8 or uint16")
 
-                add_idx = (2 * lo + 1 + x).to(torch.long)
-                add_idx = torch.clamp(add_idx, max=max_idx)
+                add_idx = (2 * lo + (1 - x)).to(torch.long)
                 P_per_fold[f].add_(V[tree_set, f].gather(0, add_idx))
 
         return P_per_fold, L_new
