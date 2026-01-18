@@ -84,7 +84,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             qgrad_bits: int = 12,
             seed: int = 42,
             era_ids: np.ndarray | None = None,
-            era_ids_val: np.ndarray | None = None,
+            era_ids_agg: np.ndarray | None = None,
             fold_aggregation_method: str = "mean",
             fold_aggregation_method_args: dict = None):
         
@@ -92,8 +92,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         assert not nfeatsets < nfolds, "⚠️ nfeatsets ({nfeatsets}) < nfolds ({nfolds}) "
         # Validate fold_aggregation_method
         if fold_aggregation_method != "mean":
-            assert Xv is not None and Yv is not None, "fold_aggregation_method != 'mean' requires validation datasets (Xv, Yv)"
-            assert era_ids_val is not None, "fold_aggregation_method != 'mean' requires validation era_ids (era_ids_val)"
+            assert era_ids_agg is not None, "fold_aggregation_method != 'mean' requires training era_ids for aggregation (era_ids_agg)"
 
         device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
         callbacks = [] if callbacks is None else callbacks
@@ -149,6 +148,12 @@ class PackBoost(BaseEstimator, RegressorMixin):
         self.P_    = P
         self.dY    = Y_i32
         self.dP    = P
+        
+        # Pre-convert era_ids_agg to tensor for fold aggregation
+        if era_ids_agg is not None:
+            era_ids_agg_t = torch.from_numpy(era_ids_agg if isinstance(era_ids_agg, np.ndarray) else np.asarray(era_ids_agg)).to(device=device, dtype=torch.int32)
+        else:
+            era_ids_agg_t = None
 
         # leaves (length N)
         L_old = torch.zeros((nfolds, Dm, N), dtype=leaf_dtype, device=device)
@@ -207,12 +212,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
             self.Pv_    = Pv
             self.Yv_i32 = Yv_i32
             self.Yv     = torch.from_numpy(Yv).to(device=device)
-            
-            # Pre-convert era_ids_val to tensor for efficiency
-            if era_ids_val is not None:
-                era_ids_val_t = torch.from_numpy(era_ids_val if isinstance(era_ids_val, np.ndarray) else np.asarray(era_ids_val)).to(device=device, dtype=torch.int32)
-            else:
-                era_ids_val_t = None
 
             Lv  = torch.zeros((nfolds, Dm, Nv), dtype=leaf_dtype, device=device)
             Lvn = torch.zeros_like(Lv)
@@ -221,7 +220,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 torch.cuda.empty_cache()
         else:
             XBv = Pv = Yv_i32 = Lv = Lvn = None
-            era_ids_val_t = None
 
         # ---------- boosting loop ----------
         self.tree_set = 0
@@ -296,10 +294,10 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 t=t,
                 P=P,
                 P_per_fold=P_per_fold,
+                Y_i32=Y_i32,
+                era_ids_agg=era_ids_agg_t,
                 Pv=Pv,
                 Pv_per_fold=Pv_per_fold,
-                Yv_i32=Yv_i32,
-                era_ids_val=era_ids_val_t,
                 lr=lr,
                 nfolds=nfolds,
                 device=device,
@@ -828,10 +826,10 @@ class PackBoost(BaseEstimator, RegressorMixin):
                                          t: int,
                                          P: torch.Tensor,
                                          P_per_fold: torch.Tensor,
+                                         Y_i32: torch.Tensor,
+                                         era_ids_agg: torch.Tensor,
                                          Pv: torch.Tensor,
                                          Pv_per_fold: torch.Tensor,
-                                         Yv_i32: torch.Tensor,
-                                         era_ids_val: torch.Tensor,
                                          lr: float,
                                          nfolds: int,
                                          device: torch.device,
@@ -849,14 +847,14 @@ class PackBoost(BaseEstimator, RegressorMixin):
             Training predictions (int32, in-place modified)
         P_per_fold : torch.Tensor [nfolds, N]
             Per-fold training predictions for current round
+        Y_i32 : torch.Tensor [N]
+            Training targets (int32, used for fold aggregation)
+        era_ids_agg : torch.Tensor [N]
+            Era IDs for training set (int32, used for era-based aggregation)
         Pv : torch.Tensor [Nv]
             Validation predictions (int32, in-place modified if use_val)
         Pv_per_fold : torch.Tensor [nfolds, Nv]
             Per-fold validation predictions (used if use_val)
-        Yv_i32 : torch.Tensor [Nv]
-            Validation targets (int32, used if use_val)
-        era_ids_val : torch.Tensor [Nv]
-            Era IDs for validation set (int32, used for era-based aggregation)
         lr : float
             Learning rate
         nfolds : int
@@ -870,38 +868,28 @@ class PackBoost(BaseEstimator, RegressorMixin):
         fold_aggregation_method_args : dict
             Arguments for fold aggregation method
         """
+        # Look up aggregation function from dictionary
+        if fold_aggregation_method not in AGGREGATION_METHODS:
+            raise ValueError(f"Unknown fold aggregation method: {fold_aggregation_method}. "
+                            f"Available methods: {list(AGGREGATION_METHODS.keys())}")
+        
+        aggregation_func = AGGREGATION_METHODS[fold_aggregation_method]
+        
+        # Call aggregation function with training data
+        w = aggregation_func(
+            per_fold_preds=P_per_fold,
+            targets=Y_i32,
+            current_preds=P,
+            era_ids=era_ids_agg,
+            device=device,
+            args=fold_aggregation_method_args
+        )
+              
+        self.W[t, :] = w
+        w = w.view(-1, 1)  # [K0, 1]
+        P.add_(((P_per_fold.to(torch.float32) * w).sum(dim=0) * lr).to(torch.int32))
         if use_val:
-            # Look up aggregation function from dictionary
-            if fold_aggregation_method not in AGGREGATION_METHODS:
-                raise ValueError(f"Unknown fold aggregation method: {fold_aggregation_method}. "
-                                f"Available methods: {list(AGGREGATION_METHODS.keys())}")
-            
-            aggregation_func = AGGREGATION_METHODS[fold_aggregation_method]
-            
-            # Call aggregation function with all needed parameters
-            w = aggregation_func(
-                per_fold_preds=Pv_per_fold,
-                targets=Yv_i32,
-                current_preds=Pv,
-                era_ids_val=era_ids_val,
-                device=device,
-                args=fold_aggregation_method_args
-            )
-                  
-            self.W[t, :] = w
-            w = w.view(-1, 1)  # [K0, 1]
-            P.add_(((P_per_fold.to(torch.float32) * w).sum(dim=0) * lr).to(torch.int32))
             Pv.add_(((Pv_per_fold.to(torch.float32) * w).sum(dim=0) * lr).to(torch.int32))
-        else:
-            # Without validation, default to mean
-            w_unnorm = torch.ones(nfolds, device=device, dtype=torch.float32) / nfolds
-            
-            # Normalize weights to sum to 1
-            w_normalized = w_unnorm / (w_unnorm.sum() + 1e-10)
-            self.W[t, :] = w_normalized
-            
-            w = w_normalized.view(-1, 1)  # [K0, 1]
-            P.add_(((P_per_fold.to(torch.float32) * w).sum(dim=0) * lr).to(torch.int32))
 
 
 

@@ -139,7 +139,7 @@ def compute_lasso_weights(per_fold_preds: torch.Tensor,
 
 def compute_validation_performance_weights(per_fold_preds: torch.Tensor,
                                           targets: torch.Tensor,
-                                          era_ids_val: torch.Tensor,
+                                          era_ids: torch.Tensor,
                                           alpha: float,
                                           device: torch.device) -> torch.Tensor:
     """
@@ -158,8 +158,8 @@ def compute_validation_performance_weights(per_fold_preds: torch.Tensor,
         Per-fold predictions for current round
     targets : torch.Tensor [N]
         Target values (quantized as int32)
-    era_ids_val : torch.Tensor [N]
-        Era IDs for validation samples (int32 tensor)
+    era_ids : torch.Tensor [N]
+        Era IDs for samples (int32 tensor)
     alpha : float
         Exponent for weight computation (higher = more aggressive selection)
     device : torch.device
@@ -177,13 +177,13 @@ def compute_validation_performance_weights(per_fold_preds: torch.Tensor,
     targets_float = targets.to(torch.float32)
     
     # Identify unique eras and create mapping
-    unique_eras = torch.unique(era_ids_val, sorted=True)
+    unique_eras = torch.unique(era_ids, sorted=True)
     n_eras = len(unique_eras)
     
     # Create era index mapping: [N] -> era index (0 to n_eras-1)
-    era_indices = torch.zeros_like(era_ids_val)
+    era_indices = torch.zeros_like(era_ids)
     for i, era_id in enumerate(unique_eras):
-        era_indices[era_ids_val == era_id] = i
+        era_indices[era_ids == era_id] = i
     
     # Count samples per era and find max era size
     era_counts = torch.bincount(era_indices, minlength=n_eras)
@@ -384,46 +384,58 @@ def compute_orthogonality_weights(per_fold_preds: torch.Tensor,
     
     preds_float = per_fold_preds.float()
     
-    # Pre-compute the Gram matrix: E^T @ E where E is [N, K0]
+    # ========== Step 1: Compute Gram matrix ==========
+    # Gram matrix G = E^T @ E where E is [N, K0]
+    # This is the expensive O(K0² × N) operation, fully GPU-accelerated
     gram_matrix = preds_float @ preds_float.t()  # [K0, K0]
     
-    # Compute orthogonality scores for all folds
-    orth_scores = torch.zeros(K0, device=device)
+    # ========== Step 2: Extract submatrices for each fold ==========
+    # For each fold i, we need:
+    # - gram_minus[i]: Gram matrix with row i and column i removed [K0-1, K0-1]
+    # - Ete[i]: Cross products E_{-i}^T @ e_i [K0-1]
     
-    for i in range(K0):
-        # Remove row and column i from Gram matrix to get E_{-i}^T @ E_{-i}
-        indices = torch.cat([torch.arange(i, device=device), 
-                            torch.arange(i+1, K0, device=device)])
-        
-        gram_minus_i = gram_matrix[indices][:, indices]  # [K0-1, K0-1]
-        
-        # Add regularization for numerical stability
-        gram_minus_i.diagonal().add_(1e-6)
-        
-        # E_{-i}^T @ e_i is the i-th column without the i-th element
-        Ete = gram_matrix[indices, i]  # [K0-1]
-        
-        # Solve: (E_{-i}^T E_{-i})^{-1} (E_{-i}^T e_i)
-        coeffs = torch.linalg.solve(gram_minus_i, Ete)  # [K0-1]
-        
-        # Compute ||ê_i||^2 = coeffs^T @ E_{-i}^T @ E_{-i} @ coeffs
-        norm_proj_sq = coeffs @ gram_minus_i @ coeffs - 1e-6 * (coeffs @ coeffs)
-        
-        # ||e_i||^2
-        norm_ei_sq = gram_matrix[i, i]
-        
-        # Orthogonality score: sqrt(||e_i||^2 - ||ê_i||^2) / ||e_i||
-        orth_scores[i] = torch.sqrt(torch.clamp(norm_ei_sq - norm_proj_sq, min=0.0)) / (torch.sqrt(norm_ei_sq) + 1e-10)
+    # Create index matrix: indices_per_fold[i] contains all indices except i
+    idx = torch.arange(K0, device=gram_matrix.device).unsqueeze(0).expand(K0, K0)
+    mask = ~torch.eye(K0, dtype=torch.bool, device=gram_matrix.device)
+    indices_per_fold = idx[mask].reshape(K0, K0-1)  # [K0, K0-1]
     
-    # Apply temperature softmax: w_i = s_i^(1/T) / Σ_j s_j^(1/T)
-    # Stabilize scores first
+    # Extract all K0 submatrices in one operation using advanced indexing
+    gram_minus_batched = gram_matrix[indices_per_fold.unsqueeze(1), indices_per_fold.unsqueeze(2)]  # [K0, K0-1, K0-1]
+    
+    # Extract cross-product vectors for all folds
+    fold_indices = torch.arange(K0, device=gram_matrix.device).unsqueeze(1)
+    Ete_batched = gram_matrix[indices_per_fold, fold_indices]  # [K0, K0-1]
+    
+    # ========== Step 3: Solve linear systems ==========
+    # For each fold i, solve: (E_{-i}^T E_{-i}) @ coeffs = E_{-i}^T @ e_i
+    # Add regularization for numerical stability
+    reg = torch.eye(K0-1, device=gram_matrix.device).unsqueeze(0) * 1e-6
+    gram_minus_batched = gram_minus_batched + reg
+    
+    # Batch solve all K0 systems in parallel
+    coeffs_batched = torch.linalg.solve(gram_minus_batched, Ete_batched.unsqueeze(-1)).squeeze(-1)  # [K0, K0-1]
+    
+    # ========== Step 4: Compute orthogonality scores ==========
+    # For each fold i, compute: ||e_i - projection||² / ||e_i||²
+    
+    # Compute squared norm of projections: ||ê_i||² = coeffs^T @ G @ coeffs
+    norm_proj_sq = torch.bmm(
+        coeffs_batched.unsqueeze(1),  # [K0, 1, K0-1]
+        torch.bmm(gram_minus_batched, coeffs_batched.unsqueeze(-1))  # [K0, K0-1, 1]
+    ).squeeze(-1).squeeze(-1)  # [K0]
+    norm_proj_sq = norm_proj_sq - 1e-6 * (coeffs_batched ** 2).sum(dim=1)  # Remove reg contribution
+    
+    # Get squared norms of original vectors: ||e_i||²
+    norm_ei_sq = torch.diagonal(gram_matrix)  # [K0]
+    
+    # Orthogonality score = ||e_i - ê_i|| / ||e_i||
+    orth_scores = torch.sqrt(torch.clamp(norm_ei_sq - norm_proj_sq, min=0.0)) / (torch.sqrt(norm_ei_sq) + 1e-10)
+    
+    # ========== Step 5: Apply temperature softmax and normalize ==========
+    # w_i = (s_i^(1/T)) / sum_j(s_j^(1/T))
     eps = 1e-8
     orth_scores_stable = torch.maximum(orth_scores, torch.tensor(eps, device=device))
-    
-    # Temperature softmax
     w_unnorm = orth_scores_stable ** (1.0 / temperature)
-    
-    # Normalize so absolute values sum to 1
     w = w_unnorm / (torch.abs(w_unnorm).sum() + 1e-10)
     
     return w
@@ -434,7 +446,7 @@ def compute_orthogonality_weights(per_fold_preds: torch.Tensor,
 def aggregate_mean(per_fold_preds: torch.Tensor,
                    targets: Optional[torch.Tensor],
                    current_preds: Optional[torch.Tensor],
-                   era_ids_val: Optional[torch.Tensor],
+                   era_ids: Optional[torch.Tensor],
                    device: torch.device,
                    args: Optional[Dict[str, Any]]) -> torch.Tensor:
     """Mean aggregation - equal weights for all folds."""
@@ -445,7 +457,7 @@ def aggregate_mean(per_fold_preds: torch.Tensor,
 def aggregate_ridge_regression(per_fold_preds: torch.Tensor,
                                 targets: Optional[torch.Tensor],
                                 current_preds: Optional[torch.Tensor],
-                                era_ids_val: Optional[torch.Tensor],
+                                era_ids: Optional[torch.Tensor],
                                 device: torch.device,
                                 args: Optional[Dict[str, Any]]) -> torch.Tensor:
     """Ridge regression aggregation."""
@@ -458,7 +470,7 @@ def aggregate_ridge_regression(per_fold_preds: torch.Tensor,
 def aggregate_lasso_regression(per_fold_preds: torch.Tensor,
                                 targets: Optional[torch.Tensor],
                                 current_preds: Optional[torch.Tensor],
-                                era_ids_val: Optional[torch.Tensor],
+                                era_ids: Optional[torch.Tensor],
                                 device: torch.device,
                                 args: Optional[Dict[str, Any]]) -> torch.Tensor:
     """Lasso regression aggregation."""
@@ -473,20 +485,20 @@ def aggregate_lasso_regression(per_fold_preds: torch.Tensor,
 def aggregate_validation_performance_weighting(per_fold_preds: torch.Tensor,
                                                 targets: Optional[torch.Tensor],
                                                 current_preds: Optional[torch.Tensor],
-                                                era_ids_val: Optional[torch.Tensor],
+                                                era_ids: Optional[torch.Tensor],
                                                 device: torch.device,
                                                 args: Optional[Dict[str, Any]]) -> torch.Tensor:
     """Validation performance weighting based on per-era correlations."""
     if args is None:
         args = {}
     alpha = args.get('alpha', 2.0)
-    return compute_validation_performance_weights(per_fold_preds, targets, era_ids_val, alpha, device)
+    return compute_validation_performance_weights(per_fold_preds, targets, era_ids, alpha, device)
 
 
 def aggregate_pairwise_correlation_penalty(per_fold_preds: torch.Tensor,
                                            targets: Optional[torch.Tensor],
                                            current_preds: Optional[torch.Tensor],
-                                           era_ids_val: Optional[torch.Tensor],
+                                           era_ids: Optional[torch.Tensor],
                                            device: torch.device,
                                            args: Optional[Dict[str, Any]]) -> torch.Tensor:
     """Pairwise correlation penalty aggregation - promotes diversity."""
@@ -500,7 +512,7 @@ def aggregate_pairwise_correlation_penalty(per_fold_preds: torch.Tensor,
 def aggregate_orthogonality_weighting(per_fold_preds: torch.Tensor,
                                       targets: Optional[torch.Tensor],
                                       current_preds: Optional[torch.Tensor],
-                                      era_ids_val: Optional[torch.Tensor],
+                                      era_ids: Optional[torch.Tensor],
                                       device: torch.device,
                                       args: Optional[Dict[str, Any]]) -> torch.Tensor:
     """Orthogonality weighting with temperature softmax - weights by unique contribution."""
