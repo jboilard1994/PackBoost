@@ -137,137 +137,6 @@ def compute_lasso_weights(per_fold_preds: torch.Tensor,
     return w
 
 
-def compute_validation_performance_weights(per_fold_preds: torch.Tensor,
-                                          targets: torch.Tensor,
-                                          era_ids: torch.Tensor,
-                                          alpha: float,
-                                          device: torch.device) -> torch.Tensor:
-    """
-    Compute optimal fold weights based on per-era correlation performance.
-    
-    For each fold k:
-    - u_k = mean era correlation
-    - c_k = ratio of eras where correlation is positive
-    - o_k = standard deviation of era correlation
-    - s_k = (u_k * c_k) / (o_k + epsilon)
-    - w_k = (max(0, s_k)^alpha) / sum(max(0, s_k)^alpha)
-    
-    Parameters
-    ----------
-    per_fold_preds : torch.Tensor [K0, N]
-        Per-fold predictions for current round
-    targets : torch.Tensor [N]
-        Target values (quantized as int32)
-    era_ids : torch.Tensor [N]
-        Era IDs for samples (int32 tensor)
-    alpha : float
-        Exponent for weight computation (higher = more aggressive selection)
-    device : torch.device
-        Device to perform computation on
-        
-    Returns
-    -------
-    torch.Tensor [K0]
-        Weights normalized so absolute values sum to 1
-    """
-    K0, N = per_fold_preds.shape
-    
-    # Convert to float for correlation computation
-    preds_float = per_fold_preds.to(torch.float32)
-    targets_float = targets.to(torch.float32)
-    
-    # Identify unique eras and create mapping
-    unique_eras = torch.unique(era_ids, sorted=True)
-    n_eras = len(unique_eras)
-    
-    # Create era index mapping: [N] -> era index (0 to n_eras-1)
-    era_indices = torch.zeros_like(era_ids)
-    for i, era_id in enumerate(unique_eras):
-        era_indices[era_ids == era_id] = i
-    
-    # Count samples per era and find max era size
-    era_counts = torch.bincount(era_indices, minlength=n_eras)
-    max_era_size = era_counts.max().item()
-    
-    # Create padded tensors for vectorized computation
-    # Shape: [n_eras, max_era_size]
-    padded_targets = torch.zeros((n_eras, max_era_size), dtype=torch.float32, device=device)
-    # Shape: [K0, n_eras, max_era_size]
-    padded_preds = torch.zeros((K0, n_eras, max_era_size), dtype=torch.float32, device=device)
-    # Mask for valid samples
-    valid_mask = torch.zeros((n_eras, max_era_size), dtype=torch.bool, device=device)
-    
-    # Vectorized filling using sorting and advanced indexing
-    # Sort samples by era index
-    sorted_indices = torch.argsort(era_indices)
-    sorted_era_indices = era_indices[sorted_indices]
-    sorted_targets = targets_float[sorted_indices]
-    sorted_preds = preds_float[:, sorted_indices]
-    
-    # Create position indices within each era (0, 1, 2, ..., 0, 1, 2, ...)
-    era_positions = torch.zeros(N, dtype=torch.long, device=device)
-    cumsum = torch.cumsum(era_counts, dim=0)
-    era_starts = torch.cat([torch.zeros(1, dtype=torch.long, device=device), cumsum[:-1]])
-    for i in range(n_eras):
-        start_idx = era_starts[i]
-        end_idx = cumsum[i]
-        era_positions[start_idx:end_idx] = torch.arange(end_idx - start_idx, device=device)
-    
-    # Fill padded tensors using advanced indexing
-    padded_targets[sorted_era_indices, era_positions] = sorted_targets
-    padded_preds[:, sorted_era_indices, era_positions] = sorted_preds
-    valid_mask[sorted_era_indices, era_positions] = True
-    
-    # Vectorized correlation computation across all eras
-    # Compute means (only over valid samples)
-    target_sums = (padded_targets * valid_mask).sum(dim=1)  # [n_eras]
-    target_means = target_sums / era_counts.float()  # [n_eras]
-    
-    pred_sums = (padded_preds * valid_mask.unsqueeze(0)).sum(dim=2)  # [K0, n_eras]
-    pred_means = pred_sums / era_counts.unsqueeze(0).float()  # [K0, n_eras]
-    
-    # Center the data
-    target_centered = padded_targets - target_means.unsqueeze(1)  # [n_eras, max_era_size]
-    pred_centered = padded_preds - pred_means.unsqueeze(2)  # [K0, n_eras, max_era_size]
-    
-    # Apply mask to centered data
-    target_centered = target_centered * valid_mask  # [n_eras, max_era_size]
-    pred_centered = pred_centered * valid_mask.unsqueeze(0)  # [K0, n_eras, max_era_size]
-    
-    # Compute correlations
-    numerator = (pred_centered * target_centered.unsqueeze(0)).sum(dim=2)  # [K0, n_eras]
-    pred_var = (pred_centered ** 2).sum(dim=2)  # [K0, n_eras]
-    target_var = (target_centered ** 2).sum(dim=1)  # [n_eras]
-    
-    denominator = torch.sqrt(pred_var * target_var.unsqueeze(0))  # [K0, n_eras]
-    
-    # Compute correlations, handling division by zero
-    era_correlations = torch.where(
-        (denominator > 1e-10) & (era_counts.unsqueeze(0) > 1),
-        numerator / denominator,
-        torch.zeros_like(numerator)
-    )  # [K0, n_eras]
-    
-    # Transpose to [K0, n_eras] (already in correct shape)
-    # Compute statistics for each fold
-    u_k = era_correlations.mean(dim=1)  # Mean era correlation [K0]
-    c_k = (era_correlations > 0).float().mean(dim=1)  # Ratio of positive correlations [K0]
-    o_k = era_correlations.std(dim=1)  # Std of era correlations [K0]
-    
-    # Compute scores: s_k = (u_k * c_k) / (o_k + epsilon)
-    epsilon = 1e-6
-    s_k = (u_k * c_k) / (o_k + epsilon)
-    
-    # Compute weights: w_k = (max(0, s_k)^alpha) / sum(max(0, s_k)^alpha)
-    s_k_pos = torch.maximum(s_k, torch.zeros_like(s_k))
-    w_unnorm = s_k_pos ** alpha
-    
-    # Normalize so absolute values sum to 1
-    w = w_unnorm / (torch.abs(w_unnorm).sum() + 1e-10)
-    
-    return w
-
-
 def compute_pairwise_correlation_penalty_weights(per_fold_preds: torch.Tensor,
                                                  gamma: float,
                                                  alpha: float,
@@ -482,19 +351,6 @@ def aggregate_lasso_regression(per_fold_preds: torch.Tensor,
     return compute_lasso_weights(per_fold_preds, targets, current_preds, alpha, device, max_iter, tol)
 
 
-def aggregate_validation_performance_weighting(per_fold_preds: torch.Tensor,
-                                                targets: Optional[torch.Tensor],
-                                                current_preds: Optional[torch.Tensor],
-                                                era_ids: Optional[torch.Tensor],
-                                                device: torch.device,
-                                                args: Optional[Dict[str, Any]]) -> torch.Tensor:
-    """Validation performance weighting based on per-era correlations."""
-    if args is None:
-        args = {}
-    alpha = args.get('alpha', 2.0)
-    return compute_validation_performance_weights(per_fold_preds, targets, era_ids, alpha, device)
-
-
 def aggregate_pairwise_correlation_penalty(per_fold_preds: torch.Tensor,
                                            targets: Optional[torch.Tensor],
                                            current_preds: Optional[torch.Tensor],
@@ -527,7 +383,6 @@ AGGREGATION_METHODS = {
     'mean': aggregate_mean,
     'ridge_regression': aggregate_ridge_regression,
     'lasso_regression': aggregate_lasso_regression,
-    'validation_performance_weighting': aggregate_validation_performance_weighting,
     'pairwise_correlation_penalty': aggregate_pairwise_correlation_penalty,
     'orthogonality_weighting': aggregate_orthogonality_weighting,
 }
