@@ -219,7 +219,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             if device.type == "cuda":
                 torch.cuda.empty_cache()
         else:
-            XBv = Pv = Yv_i32 = Lv = Lvn = None
+            XBv = Pv = Pv_per_fold = Yv_i32 = Lv = Lvn = None
 
         # ---------- boosting loop ----------
         self.tree_set = 0
