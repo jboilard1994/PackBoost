@@ -142,6 +142,7 @@ class EarlyStoppingCallback:
                     self.best_state = {
                         "V": model.V.detach().cpu().clone()[:tree_set],
                         "I": model.I.detach().cpu().clone()[:tree_set],
+                        "W": model.W.detach().cpu().clone()[:tree_set],
                         "tree_set": tree_set,
                     }
 
@@ -184,6 +185,7 @@ class EarlyStoppingCallback:
         # Stored tensors are CPU tensors → just move them back to the model's device
         model.V = self.best_state["V"].to(device)
         model.I = self.best_state["I"].to(device)
+        model.W = self.best_state["W"].to(device)
         model.tree_set = self.best_state["tree_set"]
     
         if self.verbose:
