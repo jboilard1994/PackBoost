@@ -78,9 +78,13 @@ class PackBoost(BaseEstimator, RegressorMixin):
             nfeatsets: int = 32,
             qgrad_bits: int = 12,
             seed: int = 42,
+            encode_cut_device: str = "cpu",
             era_ids: np.ndarray | None = None):
         assert X.dtype == np.int8 and y.dtype == np.float32
         device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
+        encode_device = torch.device(
+            encode_cut_device if (encode_cut_device != "cuda" or torch.cuda.is_available()) else "cpu"
+        )
         callbacks = [] if callbacks is None else callbacks
 
         # ---------- meta ----------
@@ -112,8 +116,8 @@ class PackBoost(BaseEstimator, RegressorMixin):
         era_ends = torch.from_numpy(ends_np).to(device=device, dtype=torch.int32).contiguous()
 
         # ---------- encode_cuts(X) ----------
-        X_t = torch.from_numpy(X).to(device=device, dtype=torch.int8)
-        XB  = self.encode_cuts(X_t).contiguous()              # [4F, M] uint32
+        X_t = torch.from_numpy(X).to(device=encode_device, dtype=torch.int8)
+        XB  = self.encode_cuts(X_t).contiguous().to(device=device)              # [4F, M] uint32
         bF, M = XB.shape
         Np = 32 * M
         del X_t
@@ -181,7 +185,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         if use_val:
             assert Xv.dtype == np.int8 and Yv.dtype == np.float32
             Nv = int(Xv.shape[0]); self.val_N = Nv
-            Xv_t = torch.from_numpy(Xv).to(device=device, dtype=torch.int8)
+            Xv_t = torch.from_numpy(Xv).to(device=encode_device, dtype=torch.int8)
             XBv  = self.encode_cuts(Xv_t).contiguous()
             Pv   = torch.zeros(Nv, dtype=torch.int32, device=device)
             yvq30  = (Yv * (1 << 30)).astype(np.int64)
