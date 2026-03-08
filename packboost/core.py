@@ -78,7 +78,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             nfeatsets: int = 32,
             qgrad_bits: int = 12,
             seed: int = 42,
-            encode_cut_device: str = "cpu",
+            encode_cut_device: str = "cuda",
             era_ids: np.ndarray | None = None):
         assert X.dtype == np.int8 and y.dtype == np.float32
         device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
