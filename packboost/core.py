@@ -186,7 +186,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             assert Xv.dtype == np.int8 and Yv.dtype == np.float32
             Nv = int(Xv.shape[0]); self.val_N = Nv
             Xv_t = torch.from_numpy(Xv).to(device=encode_device, dtype=torch.int8)
-            XBv  = self.encode_cuts(Xv_t).contiguous()
+            XBv  = self.encode_cuts(Xv_t).contiguous().to(device=device)
             Pv   = torch.zeros(Nv, dtype=torch.int32, device=device)
             yvq30  = (Yv * (1 << 30)).astype(np.int64)
             Yv_i32 = torch.from_numpy(yvq30[:Nv].astype(np.int32)).to(device=device)
