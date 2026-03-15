@@ -99,7 +99,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         Dm  = max(D - 1, 0)
         nodes  = (1 << D) - 1
         lanes  = 32
-        leaf_dtype = (torch.uint8 if D <= 8 else torch.uint16)
+        leaf_dtype = torch.uint8  # Always uint8 for branch bits
 
         # ---------- eras -> era_ends ----------
         N, F = X.shape
@@ -220,11 +220,11 @@ class PackBoost(BaseEstimator, RegressorMixin):
             else:
                 XS = self.et_sample_1b(XB, Fsch_cpu, t).to(device)
 
-            # (b) pack leaves & gradients (length N)
-            LE, G = self.prep_vars(L_old, Y_i32, P)  # LE: u16/u32/u64 ; G: int16
+            # (b) compute gradients (no triangular packing)
+            G = self.prep_vars(Y_i32, P)  # G: int16
 
-            # (c) repack by feature schedule -> LF [nfeatsets, N]
-            LF = self.repack(FST, LE, t).contiguous()
+            # (c) repack by feature schedule -> LF [nfeatsets, Dm, N]
+            LF = self.repack(FST, L_old, t).contiguous()
 
             # (d) histograms & (e) choose cuts
             if use_des:
@@ -237,7 +237,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                         f"era_ends[-1] must equal N ({N}), got {int(era_ends[-1].item())}"
                     )
 
-                H0_all = self.h0_des(G, LE, int(max_depth), era_ends)            # [K0, 2**D, E, 2]
+                H0_all = self.h0_des(G, L_old, int(max_depth), era_ends)         # [K0, 2**D, E, 2]
                 H0e    = H0_all[:, :nodes, :, :].contiguous()                    # [K0, nodes, E, 2]
                 He     = self.h_des(XS, G, LF, int(max_depth), era_ends)         # [K1, E, nodes, 2, 32]
 
@@ -253,7 +253,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             else:
                 # Non-DES path (single era)
                 H  = self.H (XS, G, LF, D).contiguous()                          # [K1, nodes, 2, 32]
-                H0 = self.h0(G, LE, D).contiguous()                              # [K0, 2**D, 2]
+                H0 = self.h0(G, L_old, D).contiguous()                           # [K0, 2**D, 2]
                 self.cut(
                     self.Fsch, FST, H, H0[:, : H.size(1), :].contiguous(),       # -> [K0, nodes, 2]
                     self.V, self.I,
@@ -283,7 +283,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                     pass
 
             # free big temporaries ASAP
-            del XS, LE, G, LF
+            del XS, G, LF
             if device.type == "cuda" and (t % 256 == 255):
                 torch.cuda.empty_cache()
 
@@ -311,7 +311,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         X : np.ndarray[int8] or torch.Tensor[int8] of shape [N, F]
             Raw discrete features (0..4 expected per your pipeline).
         Returns:
-            np.ndarray[int32] if X is numpy, else torch.Tensor[int32] (length N).
+            np.ndarray[float32] / torch.Tensor[float32], on the same scale as y.
         """
         # --- device & inputs ---
         device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
@@ -339,7 +339,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         P  = torch.zeros(Np, dtype=torch.int32, device=device)
         D  = int(self.max_depth)
         Dm = max(D - 1, 0)
-        leaf_dtype = (torch.uint8 if D <= 8 else torch.int16)
+        leaf_dtype = torch.uint8  # Always uint8 for branch bits
         L  = torch.zeros((self.nfolds, Dm, Np), dtype=leaf_dtype, device=device)
         Ln = torch.zeros_like(L)
 
@@ -352,7 +352,8 @@ class PackBoost(BaseEstimator, RegressorMixin):
             L, Ln = Ln, L  # ping-pong
 
         # --- 4) trim padding & return ---
-        out = P[:N]
+        out = P[:N].to(torch.float32) * (1.0 / float(1 << 30))
+
         if return_numpy:
             return out.detach().cpu().numpy()
         return out
@@ -395,125 +396,119 @@ class PackBoost(BaseEstimator, RegressorMixin):
         Fs = Fsch[round].view(nfeatsets, 32).to(dtype=torch.long, device=X.device)
         return X.to(torch.int32)[Fs, :].transpose(1, 2).contiguous().view(nfeatsets, M*32).to(torch.uint32)
 
-    def prep_vars(self, L: torch.Tensor, Y: torch.Tensor, P: torch.Tensor):
-        if L.is_cuda and torch.cuda.is_available():
-            return kernels.prep_vars(L.contiguous(), Y.contiguous(), P.contiguous())
+    def prep_vars(self, Y: torch.Tensor, P: torch.Tensor):
+        """Compute quantized gradients only (no triangular packing)."""
+        if Y.is_cuda and torch.cuda.is_available():
+            return kernels.prep_vars(Y.contiguous(), P.contiguous())
 
-        K, Dm, N = L.shape
-        max_depth = Dm + 1
-        LE = torch.zeros((K, N), dtype=torch.int64, device=L.device)
+        # Compute quantized residuals (use int64 to avoid int32 overflow on Q30 diff)
+        g = (Y.to(torch.int64) - P.to(torch.int64)) >> 20
+        G = g.clamp_(-(1 << 15), (1 << 15) - 1).to(torch.int16)
 
-        for d in range(1, max_depth):
-            off = (d*(d-1)) // 2
-            field = (L[:, d-1].to(torch.int64) & ((1 << d) - 1))
-            LE |= (field << off)
-
-        out_dtype = torch.uint64 if Dm>8 else (torch.uint32 if Dm>6 else torch.uint16)
-        LE = LE.to(out_dtype)
-
-        g = (Y.to(torch.int32) - P.to(torch.int32)) >> 20
-        G = g.clamp_(-32767, 32767).to(torch.int16)
-
-        return LE.contiguous(), G.contiguous()
+        return G.contiguous()
 
 
-    def h0(self, G: torch.Tensor, LE: torch.Tensor, max_depth: int) -> torch.Tensor:
-        nfolds, N = LE.shape
+    def h0(self, G: torch.Tensor, L_old: torch.Tensor, max_depth: int) -> torch.Tensor:
+        """
+        Build parent histograms from branch bits stored in L_old.
+        L_old: [nfolds, Dm, N], uint8 branch bits
+        Returns: H0 [nfolds, 2**max_depth, 2] int64
+        """
+        nfolds, Dm, N = L_old.shape
         nodes = 1 << max_depth
-        if (G.is_cuda or LE.is_cuda) and torch.cuda.is_available():
-            return kernels.h0_sm_butterfly(G.contiguous(), LE.contiguous(), int(max_depth))
+        if (G.is_cuda or L_old.is_cuda) and torch.cuda.is_available():
+            return kernels.h0_sm_butterfly(G.contiguous(), L_old.contiguous(), int(max_depth))
 
         # --- CPU vectorized fallback ---
-        H0 = torch.zeros((nfolds, nodes, 2), dtype=torch.int64, device=LE.device)
+        device = L_old.device
+        H0 = torch.zeros((nfolds, nodes, 2), dtype=torch.int64, device=device)
         H0_sum = H0[..., 0]  # [nfolds, nodes]
         H0_cnt = H0[..., 1]  # [nfolds, nodes]
 
-        le64 = LE.to(torch.int64, copy=False).contiguous()   # [nfolds, N]
-        g64  = G.to(torch.int64,  copy=False).contiguous()   # [N]
-        SRC  = g64.unsqueeze(0).expand(nfolds, N).contiguous()
+        g64 = G.to(torch.int64, copy=False).contiguous()  # [N]
+        SRC = g64.unsqueeze(0).expand(nfolds, N).contiguous()
         ONES = torch.ones_like(SRC, dtype=torch.int64)
 
+        # Build node prefix incrementally from branch bits
+        node_prefix = torch.zeros((nfolds, N), dtype=torch.int64, device=device)
+
         for d in range(max_depth):
+            # Compute node index at this depth
             if d == 0:
-                idx = torch.zeros((nfolds, N), dtype=torch.long, device=LE.device)
+                idx = torch.zeros((nfolds, N), dtype=torch.long, device=device)
             else:
-                s = (d * (d - 1)) // 2
                 base = (1 << d) - 1
-                mask = (1 << d) - 1
-                idx = (((le64 >> s) & mask) + base).to(torch.long)
+                idx = (node_prefix + base).to(torch.long)
+
+            # Accumulate histograms
             H0_sum.scatter_add_(1, idx, SRC)
             H0_cnt.scatter_add_(1, idx, ONES)
 
+            # Update node_prefix for next depth using branch bit
+            if d < Dm:
+                branch_bit = L_old[:, d, :].to(torch.int64)  # [nfolds, N]
+                node_prefix = (node_prefix << 1) | branch_bit
+
         return H0
 
-    def repack(self, 
+    def repack(self,
             FST: torch.Tensor,     # [nsets, nfeatsets, max_depth], uint8
-            LE:  torch.Tensor,     # [nfolds, N], packed (same dtype used in prep_vars)
+            L_old: torch.Tensor,   # [nfolds, Dm, N], uint8 branch bits
             tree_set: int) -> torch.Tensor:
         """
-        Returns LF: [nfeatsets, N] with Murky-parity bit packing:
-        LF[fs, j] = OR_{d=1..max_depth-1} ( LE[ FST[tree_set, fs, d], j ] & mask(d) )
-        where mask(d) = ((1<<d)-1) << ((d*(d-1))//2)
+        Returns LF: [nfeatsets, Dm, N] with explicit branch bits.
+        LF[fs, d, :] = L_old[FST[tree_set, fs, d+1], d, :] for d in 0..Dm-1
         """
         # --- Fast path: GPU kernel ---
-        if FST.is_cuda and LE.is_cuda and torch.cuda.is_available():
-            nfeatsets, N = FST.shape[1], LE.shape[1]
-            LF = torch.empty((nfeatsets, N), dtype=LE.dtype, device=LE.device)
-            # Uses your compiled CUDA kernel; expects contiguous inputs.
+        if FST.is_cuda and L_old.is_cuda and torch.cuda.is_available():
+            nfeatsets = FST.shape[1]
+            Dm, N = L_old.shape[1], L_old.shape[2]
+            LF = torch.empty((nfeatsets, Dm, N), dtype=L_old.dtype, device=L_old.device)
             kernels.repack_trees_for_features(
-                FST.contiguous(), LE.contiguous(), LF, int(tree_set)
+                FST.contiguous(), L_old.contiguous(), LF, int(tree_set)
             )
             return LF.contiguous()
 
         # --- CPU vectorized path ---
-        # Shapes
         assert FST.dim() == 3, "FST must be [nsets, nfeatsets, max_depth]"
-        assert LE.dim()  == 2, "LE must be [nfolds, N]"
+        assert L_old.dim() == 3, "L_old must be [nfolds, Dm, N]"
+
         nsets, nfeatsets, max_depth = FST.shape
-        nfolds, N = LE.shape
-        device = LE.device
-        out_dtype = LE.dtype  # keep parity with packed dtype used upstream
+        nfolds, Dm, N = L_old.shape
+        device = L_old.device
 
-        # Depths d = 1..max_depth-1
-        Dm = max_depth - 1
-        # Indices: which[fs, d1] in [0..nfolds-1], with d1 = d-1
-        which_2d = FST[tree_set, :, 1:].to(torch.long)            # [nfeatsets, Dm]
-        idx_flat = which_2d.reshape(-1)                           # [nfeatsets*Dm]
-        
-        d64 = torch.arange(1, max_depth, device=device, dtype=torch.int64)  # [Dm]
-        offsets64 = (d64 * (d64 - 1)) // 2                                  # [Dm]
-        # blocks64 = ((1<<d) - 1) << offsets
-        blocks64 = ((torch.ones_like(d64) << d64) - 1) << offsets64          # [Dm]
-        masks = blocks64.to(dtype=out_dtype)                                 # cast down (wraps as needed)
+        # LF[fs, d, :] = L_old[FST[tree_set, fs, d+1], d, :]
+        # For each feature-set fs and depth d, gather from the appropriate fold
+        LF = torch.empty((nfeatsets, Dm, N), dtype=L_old.dtype, device=device)
 
-        
-        # Gather LE rows in one shot and reshape -> [nfeatsets, Dm, N]
-        LE_sel = LE.index_select(0, idx_flat).view(nfeatsets, Dm, N)
+        for d in range(Dm):
+            # which_fold[fs] = FST[tree_set, fs, d+1]
+            which_fold = FST[tree_set, :, d + 1].to(torch.long)  # [nfeatsets]
+            # Gather: LF[fs, d, :] = L_old[which_fold[fs], d, :]
+            for fs in range(nfeatsets):
+                fold = which_fold[fs].item()
+                LF[fs, d, :] = L_old[fold, d, :]
 
-
-        # Apply masks and reduce across depth.
-        # Masks touch disjoint bit ranges, so OR == sum of masked parts.
-        LF = (LE_sel & masks.view(1, Dm, 1)).sum(dim=1).to(dtype=out_dtype)  # [nfeatsets, N]
         return LF.contiguous()
     
 
     def H(self, XS: torch.Tensor, Y: torch.Tensor, LF: torch.Tensor, max_depth: int) -> torch.Tensor:
         """
         XS : [nfeatsets, 32*M] (uint32/int32), packed features
-        Y  : [N]               (int32/int64), target/gradient
-        LF : [nfeatsets, N]    (uint16/uint32/uint64), path codes (Murky parity)
-        max_depth: int (<= 7 for the SMEM variant on GPU)
+        Y  : [N]               (int16), gradient
+        LF : [nfeatsets, Dm, N] (uint8), explicit branch bits per depth
+        max_depth: int
         Returns:
         H: [nfeatsets, (1<<max_depth)-1, 2, 32] int64
             last dim = lane (0..31); channel 0=sum(y*v), 1=count(v)
         """
         nfeatsets, cols_32M = XS.shape
+        Dm = LF.shape[1]
         N = int(Y.shape[0])
         nodes_tot = (1 << max_depth) - 1
 
         # --- GPU fast path ---
         if (XS.is_cuda or Y.is_cuda or LF.is_cuda) and torch.cuda.is_available():
-            # Expect your compiled extension to expose kernels.h_sm .to(torch.int32)
             return kernels.h_sm(XS.contiguous(), Y.contiguous(), LF.contiguous(), int(max_depth))
 
         # --- CPU vectorized fallback ---
@@ -528,74 +523,51 @@ class PackBoost(BaseEstimator, RegressorMixin):
         H_sum = torch.zeros((nfeatsets, nodes_tot, 32), dtype=TORCH_INT64, device=dev)
         H_cnt = torch.zeros_like(H_sum)
 
-        # Casts (no copies if already correct)
-        Y64  = Y.to(TORCH_INT64,  copy=False).contiguous()                     # [N]
-        LF64 = LF.to(TORCH_INT64, copy=False).contiguous()                     # [F, N]
-        XS64 = XS.to(TORCH_INT64, copy=False).contiguous().view(nfeatsets, M, 32)  # [F, M, 32]
+        # Casts
+        Y64  = Y.to(TORCH_INT64, copy=False).contiguous()  # [N]
+        LF64 = LF.to(TORCH_INT64, copy=False).contiguous()  # [nfeatsets, Dm, N]
+        XS64 = XS.to(TORCH_INT64, copy=False).contiguous().view(nfeatsets, M, 32)
 
-        # Build V = bit-unpacked features per lane:
-        # V[f, l, s] = ((XS[f, b, l] >> k) & 1) where s = 32*b + k
-        # Vectorized unpack: [F,M,32(lane),32(k)]
+        # Build V = bit-unpacked features per lane
         bit_ids = torch.arange(32, dtype=TORCH_INT64, device=dev)
-        masks   = (1 << bit_ids)                                              # [32]
-        V_bits  = ((XS64[..., None] & masks) != 0).to(TORCH_INT64)            # [F, M, 32, 32]
-        V       = V_bits.permute(0, 2, 1, 3).reshape(nfeatsets, 32, 32 * M)   # [F, 32, 32*M]
-        if V.size(2) > N:                                                     # trim to N
-            V = V[:, :, :N].contiguous()                                      # [F, 32, N]
+        masks = (1 << bit_ids)
+        V_bits = ((XS64[..., None] & masks) != 0).to(TORCH_INT64)  # [F, M, 32, 32]
+        V = V_bits.permute(0, 2, 1, 3).reshape(nfeatsets, 32, 32 * M)  # [F, 32, 32*M]
+        if V.size(2) > N:
+            V = V[:, :, :N].contiguous()  # [F, 32, N]
 
         # Common broadcasts
-        Y_b  = Y64.view(1, 1, N)                      # [1,1,N]
+        Y_b = Y64.view(1, 1, N)
         ones = torch.ones((1, 1, N), dtype=TORCH_INT64, device=dev)
 
-        # -------- depth = 0 (node 0) --------
-        H_sum[:, 0, :] = (V * Y_b).sum(dim=2)         # [F, 32]
-        H_cnt[:, 0, :] = V.sum(dim=2)                 # [F, 32]
+        # Build node prefix incrementally from branch bits
+        node_prefix = torch.zeros((nfeatsets, N), dtype=TORCH_INT64, device=dev)
 
-        # -------- depth = 1 (nodes 1,2) --------
-        tk1 = (LF64 & 1)                               # [F, N]
-        m0  = (tk1 == 0).to(TORCH_INT64).unsqueeze(1)  # [F,1,N]
-        m1  = 1 - m0                                   # [F,1,N]
+        for d in range(max_depth):
+            # Compute node index at this depth
+            if d == 0:
+                idx = torch.zeros((nfeatsets, N), dtype=torch.long, device=dev)
+            else:
+                base = (1 << d) - 1
+                idx = (node_prefix + base).to(torch.long)  # [F, N]
 
-        H_sum[:, 1, :] = (V * (Y_b * m0)).sum(dim=2)   # -> node 1
-        H_cnt[:, 1, :] = (V * m0).sum(dim=2)
-        H_sum[:, 2, :] = (V * (Y_b * m1)).sum(dim=2)   # -> node 2
-        H_cnt[:, 2, :] = (V * m1).sum(dim=2)
+            # Accumulate histograms for each lane
+            # We need to scatter per feature-set and per lane
+            # idx: [F, N], V: [F, 32, N], Y_b: [1, 1, N]
+            for fs in range(nfeatsets):
+                idx_fs = idx[fs, :]  # [N]
+                V_fs = V[fs, :, :]   # [32, N]
+                for lane in range(32):
+                    V_lane = V_fs[lane, :]  # [N]
+                    H_sum[fs, :, lane].scatter_add_(0, idx_fs, V_lane * Y64)
+                    H_cnt[fs, :, lane].scatter_add_(0, idx_fs, V_lane)
 
-        # -------- depth = 2 (nodes 3..6) via one-hot --------
-        tk2 = ((LF64 >> 1) & 3).to(torch.long)         # [F, N]
-        oh2 = Fn.one_hot(tk2, num_classes=4).to(TORCH_INT64)  # [F, N, 4]
-        oh2 = oh2.unsqueeze(1)                         # [F,1,N,4]
-        V4  = V.unsqueeze(-1)                          # [F,32,N,1]
-        sum2 = (V4 * (Y_b.unsqueeze(-1) * oh2)).sum(dim=2)   # [F,32,4]
-        cnt2 = (V4 * oh2).sum(dim=2)                   # [F,32,4]
-        H_sum[:, 3:7, :] = sum2.permute(0, 2, 1).contiguous()  # [F,4,32]
-        H_cnt[:, 3:7, :] = cnt2.permute(0, 2, 1).contiguous()
+            # Update node_prefix for next depth
+            if d < Dm:
+                branch_bit = LF64[:, d, :]  # [F, N]
+                node_prefix = (node_prefix << 1) | branch_bit
 
-        # -------- depths >= 3 (nodes 7..(2^D-2)) via scatter_add --------
-        if max_depth > 3:
-            F32 = nfeatsets * 32
-            V_flat  = V.view(F32, N)                               # [F*32, N]
-            Y_flat  = Y64.view(1, N).expand(F32, N)               # [F*32, N]
-
-            for d in range(3, max_depth):
-                s     = (d * (d - 1)) // 2
-                base  = (1 << d) - 1
-                maskd = (1 << d) - 1
-
-                idx_fn = (((LF64 >> s) & maskd) + base).to(torch.long).contiguous()  # [F,N]
-                idx_b  = idx_fn.repeat_interleave(32, dim=0)                          # [F*32, N]
-
-                out_sum = torch.zeros((F32, nodes_tot), dtype=TORCH_INT64, device=dev)
-                out_cnt = torch.zeros_like(out_sum)
-
-                out_sum.scatter_add_(1, idx_b, (V_flat * Y_flat))
-                out_cnt.scatter_add_(1, idx_b, V_flat)
-
-                # reshape back to [F, 32, nodes] -> [F, nodes, 32]
-                H_sum[:, :, :] += out_sum.view(nfeatsets, 32, nodes_tot).permute(0, 2, 1)
-                H_cnt[:, :, :] += out_cnt.view(nfeatsets, 32, nodes_tot).permute(0, 2, 1)
-
-        # stack channels: [F, nodes, 2, 32]
+        # Stack channels: [F, nodes, 2, 32]
         H = torch.stack([H_sum, H_cnt], dim=2).contiguous()
         return H
 
@@ -798,8 +770,8 @@ class PackBoost(BaseEstimator, RegressorMixin):
     def advance_and_predict(self,
                             P: torch.Tensor,     # [N], int32 (in/out)
                             X: torch.Tensor,     # [R, M], uint32/int32
-                            L_old: torch.Tensor, # [K0, Dm, N], uint8/uint16
-                            L_new: torch.Tensor, # [K0, Dm, N], same dtype
+                            L_old: torch.Tensor, # [K0, Dm, N], uint8 branch bits
+                            L_new: torch.Tensor, # [K0, Dm, N], uint8 branch bits
                             V: torch.Tensor,     # [rounds, K0, 2*nodes], int32
                             I: torch.Tensor,     # [rounds, K0, nodes], uint16 (or legacy int16)
                             tree_set: int):
@@ -820,58 +792,59 @@ class PackBoost(BaseEstimator, RegressorMixin):
             return P, L_new
 
         # -------- CPU vectorized path --------
+        # L_old and L_new now store branch bits (0 or 1), not node indices
         assert P.dtype == torch.int32 and X.dtype in (torch.int32, torch.uint32)
         assert V.dtype == torch.int32
         assert I.dtype in (torch.uint16, torch.int16), "I must be uint16 or int16"
+        assert L_old.dtype == torch.uint8 and L_new.dtype == torch.uint8, "L must be uint8 for branch bits"
 
         device = P.device
 
         # Use int64 proxy for bit ops on X
         X_ix = X.to(torch.int64) if (X.device.type == "cpu" and X.dtype == torch.uint32) else X.to(torch.int64, copy=False)
 
-        # >>> NEW: make an int64 view of I row(s) to allow gather on CPU, keep unsigned semantics
-        # One-time cast (copy) is fine for CPU test path.
-        I_ix = I.to(torch.int64) & 0xFFFF  # shape [rounds, K0, nodes], values treated as unsigned 16-bit
+        # int64 view of I for gather
+        I_ix = I.to(torch.int64) & 0xFFFF
 
         k = torch.arange(N, device=device, dtype=torch.long)
         word_idx = (k >> 5)
         bit_off  = (k & 31).to(torch.int64)
 
-     
         for depth in range(depths):
             for f in range(K0):
+                # Reconstruct node prefix from branch bits
                 if depth == 0:
                     leaf_prev = torch.zeros(N, dtype=torch.int64, device=device)
                 else:
-                    leaf_prev = L_old[f, depth - 1].to(torch.int64)
+                    # Build node from stored branch bits: sum 2^i * bit[i]
+                    leaf_prev = torch.zeros(N, dtype=torch.int64, device=device)
+                    for i in range(depth):
+                        leaf_prev |= (L_old[f, i].to(torch.int64) << i)
 
                 lo = leaf_prev + ((1 << depth) - 1)
 
-                # >>> CHANGED: gather from I_ix (int64), not I (uint16), to avoid unsupported gather
-                li = I_ix[tree_set, f].gather(0, lo.to(torch.long))  # int64
+                # Gather feature index
+                li = I_ix[tree_set, f].gather(0, lo.to(torch.long))
 
-                words = X_ix[li, word_idx]                      # int64
+                # Extract branch decision
+                words = X_ix[li, word_idx]
                 x     = ((words >> bit_off) & 1).to(torch.int64)
 
-                leaf_new = (leaf_prev << 1) | x
+                # Store branch bit (not node index)
                 if depth < Dm:
-                    if L_new.dtype == torch.uint8:
-                        L_new[f, depth] = leaf_new.to(torch.uint8)
-                    elif L_new.dtype == torch.uint16:
-                        L_new[f, depth] = leaf_new.to(torch.uint16)
-                    else:
-                        raise AssertionError("L_new must be uint8 or uint16")
+                    L_new[f, depth] = x.to(torch.uint8)
 
+                # Update prediction
                 add_idx = (2 * lo + 1 + x).to(torch.long)
-                add_idx=torch.clamp(add_idx, max=max_idx)
+                add_idx = torch.clamp(add_idx, max=max_idx)
                 P.add_(V[tree_set, f].gather(0, add_idx))
 
         return P, L_new
     
         # -------- DES: H0 per-era (parents) --------
     def h0_des(self,
-            G:  torch.Tensor,   # [N] int16
-            LE: torch.Tensor,   # [nfolds, N] (u16/u32/u64)
+            G:  torch.Tensor,      # [N] int16
+            L_old: torch.Tensor,   # [nfolds, Dm, N] uint8 branch bits
             max_depth: int,
             era_bounds: torch.Tensor | None = None  # [E] int32 (exclusive ends; last==N)
             ) -> torch.Tensor:
@@ -879,26 +852,26 @@ class PackBoost(BaseEstimator, RegressorMixin):
         Returns H0e: [nfolds, 2**D, E, 2] int64  (parent stats per fold & era).
         NOTE: This raw layout matches your CUDA launcher. In fit() you permute/slice to [nfolds, E, nodes, 2].
         """
-        nfolds, N = int(LE.size(0)), int(LE.size(1))
+        nfolds, Dm, N = L_old.shape
 
-        # normalize era_ends: ends-only, dtype=int32, on LE.device
+        # normalize era_ends: ends-only, dtype=int32, on L_old.device
         if era_bounds is None:
-            era_ends = torch.tensor([N], device=LE.device, dtype=torch.int32)
+            era_ends = torch.tensor([N], device=L_old.device, dtype=torch.int32)
         else:
-            era_ends = era_bounds.to(device=LE.device, dtype=torch.int32, copy=False).contiguous()
+            era_ends = era_bounds.to(device=L_old.device, dtype=torch.int32, copy=False).contiguous()
 
         if int(era_ends[-1].item()) != N:
             raise ValueError(f"era_ends[-1] must equal N ({N}), got {int(era_ends[-1].item())}")
 
-        use_cuda = (G.is_cuda or LE.is_cuda or era_ends.is_cuda) and torch.cuda.is_available()
+        use_cuda = (G.is_cuda or L_old.is_cuda or era_ends.is_cuda) and torch.cuda.is_available()
         if use_cuda:
-            return kernels.h0_des(G.contiguous(), LE.contiguous(), era_ends.contiguous(), int(max_depth)).contiguous()
+            return kernels.h0_des(G.contiguous(), L_old.contiguous(), era_ends.contiguous(), int(max_depth)).contiguous()
 
         # -------- CPU parity (multi-era) --------
         E = int(era_ends.numel())
-        nodes_with_last = (1 << max_depth)  # your CPU h0 returns 2**D nodes (includes last row)
+        nodes_with_last = (1 << max_depth)
         H0e = torch.zeros((nfolds, nodes_with_last, E, 2),
-                        dtype=torch.int64, device=LE.device)
+                        dtype=torch.int64, device=L_old.device)
 
         # era starts from [0] + era_ends[:-1]
         era_starts = torch.empty_like(era_ends)
@@ -913,10 +886,10 @@ class PackBoost(BaseEstimator, RegressorMixin):
             if e1 <= e0:
                 continue  # empty era segment; leave zeros
 
-            # Slice to this era and reuse your CPU h0()
-            G_e  = G[e0:e1].to(device=LE.device, dtype=G.dtype, copy=False).contiguous()
-            LE_e = LE[:, e0:e1].to(device=LE.device, dtype=LE.dtype, copy=False).contiguous()
-            H0_slice = self.h0(G_e, LE_e, max_depth)  # [nfolds, 2**D, 2] (int64)
+            # Slice to this era and reuse CPU h0()
+            G_e = G[e0:e1].to(device=L_old.device, dtype=G.dtype, copy=False).contiguous()
+            L_e = L_old[:, :, e0:e1].to(device=L_old.device, dtype=L_old.dtype, copy=False).contiguous()
+            H0_slice = self.h0(G_e, L_e, max_depth)  # [nfolds, 2**D, 2] (int64)
 
             # Place into era dimension
             H0e[:, :, ei, :] = H0_slice
@@ -927,15 +900,16 @@ class PackBoost(BaseEstimator, RegressorMixin):
     def h_des(self,
             XS: torch.Tensor,   # [K1, 32*M] uint32/int32  (padded to Np=32*M)
             Y:  torch.Tensor,   # [N] int16
-            LF: torch.Tensor,   # [K1, N] (u16/u32/u64)
+            LF: torch.Tensor,   # [K1, Dm, N] uint8 branch bits
             max_depth: int,
             era_bounds: torch.Tensor | None = None  # [E] int32 (exclusive ends; last==N)
             ) -> torch.Tensor:
         """
         Returns He: [K1, E, (2**D)-1, 2, 32] int64  (left stats per era).
-        CPU parity masks XS per-era with 32-bit word masks and reuses your H() math.
+        CPU parity masks XS per-era with 32-bit word masks and uses branch-bit traversal.
         """
         K1, cols_32M = int(XS.size(0)), int(XS.size(1))
+        Dm = LF.shape[1]
         N = int(Y.size(0))
         if era_bounds is None:
             era_ends = torch.tensor([N], device=XS.device, dtype=torch.int32)
@@ -953,17 +927,15 @@ class PackBoost(BaseEstimator, RegressorMixin):
             ).contiguous()
 
         # -------- CPU parity (multi-era) --------
-        # Shapes & constants
         TORCH_INT64 = torch.int64
-        TORCH_INT32 = torch.int32
         nodes = (1 << max_depth) - 1
-        M = (cols_32M + 31) // 32  # padded blocks
+        M = (cols_32M + 31) // 32
         assert 32 * M == cols_32M, "XS second dim must be a multiple of 32"
 
-        # Prepare base casted views (no copy if already correct)
+        # Prepare base casted views
         XS64 = XS.to(TORCH_INT64, copy=False).view(K1, M, 32)  # [K1, M, 32]
         Y64  = Y.to(TORCH_INT64,  copy=False)                  # [N]
-        LF64 = LF.to(TORCH_INT64, copy=False)                  # [K1, N]
+        LF64 = LF.to(TORCH_INT64, copy=False)                  # [K1, Dm, N]
 
         # era starts from [0] + era_ends[:-1]
         E = int(era_ends.numel())
@@ -978,9 +950,9 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
         # Common lane-bit constants for unpack
         bit_ids = torch.arange(32, dtype=TORCH_INT64, device=XS.device)
-        bit_masks = (1 << bit_ids).view(1, 1, 1, 32)  # broadcast over [K1,M,32,32]
+        bit_masks = (1 << bit_ids).view(1, 1, 1, 32)
 
-        # Precompute block starts (s_b = 32*b)
+        # Precompute block starts
         b_idx = torch.arange(M, dtype=TORCH_INT64, device=XS.device)
         block_start = (b_idx * 32)  # [M]
 
@@ -990,75 +962,54 @@ class PackBoost(BaseEstimator, RegressorMixin):
             if e1 <= e0:
                 continue  # empty era
 
-            # ----- build per-block 32-bit masks for this era -----
-            # k0 = clamp(e0 - s_b, 0, 32); k1 = clamp(e1 - s_b, 0, 32); len = clamp(k1-k0, 0, 32)
+            # Build per-block 32-bit masks for this era
             k0 = torch.clamp(e0 - block_start, min=0, max=32).to(TORCH_INT64)
             k1 = torch.clamp(e1 - block_start, min=0, max=32).to(TORCH_INT64)
-            span = torch.clamp(k1 - k0,       min=0, max=32).to(TORCH_INT64)
-            # mask_b = ((1 << span) - 1) << k0
+            span = torch.clamp(k1 - k0, min=0, max=32).to(TORCH_INT64)
             ones = torch.ones_like(span, dtype=TORCH_INT64)
-            mask_base = torch.bitwise_left_shift(ones, span) - 1  # (2^span - 1)
-            mask_words = torch.bitwise_left_shift(mask_base, k0).view(1, M, 1)  # [1,M,1], int64
+            mask_base = torch.bitwise_left_shift(ones, span) - 1
+            mask_words = torch.bitwise_left_shift(mask_base, k0).view(1, M, 1)
 
-            # ----- apply mask to XS words and compute V (same as H() CPU path) -----
+            # Apply mask to XS words and compute V
             XS_masked = (XS64 & mask_words)                        # [K1, M, 32]
-            V_bits    = ((XS_masked[..., None] & bit_masks) != 0).to(TORCH_INT64)  # [K1,M,32,32]
-            V         = V_bits.permute(0, 2, 1, 3).reshape(K1, 32, 32 * M)         # [K1,32,Np]
-            if V.size(2) > N:   # trim padded tail
-                V = V[:, :, :N].contiguous()                      # [K1,32,N]
+            V_bits    = ((XS_masked[..., None] & bit_masks) != 0).to(TORCH_INT64)
+            V         = V_bits.permute(0, 2, 1, 3).reshape(K1, 32, 32 * M)
+            if V.size(2) > N:
+                V = V[:, :, :N].contiguous()
 
             # Broadcasts
-            Y_b  = Y64.view(1, 1, N)                      # [1,1,N]
-            onesN = torch.ones((1, 1, N), dtype=TORCH_INT64, device=XS.device)
+            Y_b = Y64.view(1, 1, N)
 
-            # Allocate per-era accumulators (match H() layout then assign into He[:, ei])
+            # Allocate per-era accumulators
             H_sum = torch.zeros((K1, nodes, 32), dtype=TORCH_INT64, device=XS.device)
             H_cnt = torch.zeros_like(H_sum)
 
-            # depth 0
-            H_sum[:, 0, :] = (V * Y_b).sum(dim=2)
-            H_cnt[:, 0, :] = V.sum(dim=2)
+            # Build node prefix incrementally from branch bits
+            node_prefix = torch.zeros((K1, N), dtype=TORCH_INT64, device=XS.device)
 
-            # depth 1
-            tk1 = (LF64 & 1)                             # [K1, N]
-            m0  = (tk1 == 0).to(TORCH_INT64).unsqueeze(1)  # [K1,1,N]
-            m1  = 1 - m0
-            H_sum[:, 1, :] = (V * (Y_b * m0)).sum(dim=2)
-            H_cnt[:, 1, :] = (V * m0).sum(dim=2)
-            H_sum[:, 2, :] = (V * (Y_b * m1)).sum(dim=2)
-            H_cnt[:, 2, :] = (V * m1).sum(dim=2)
-
-            # depth 2
-            tk2 = ((LF64 >> 1) & 3).to(torch.long)       # [K1, N]
-            oh2 = torch.nn.functional.one_hot(tk2, num_classes=4).to(TORCH_INT64)  # [K1,N,4]
-            oh2 = oh2.unsqueeze(1)                       # [K1,1,N,4]
-            V4  = V.unsqueeze(-1)                        # [K1,32,N,1]
-            sum2 = (V4 * (Y_b.unsqueeze(-1) * oh2)).sum(dim=2)   # [K1,32,4]
-            cnt2 = (V4 * oh2).sum(dim=2)                 # [K1,32,4]
-            H_sum[:, 3:7, :] = sum2.permute(0, 2, 1).contiguous()  # [K1,4,32]
-            H_cnt[:, 3:7, :] = cnt2.permute(0, 2, 1).contiguous()
-
-            # depths >= 3
-            if max_depth > 3:
-                F32 = K1 * 32
-                V_flat = V.view(F32, N)
-                Y_flat = Y64.view(1, N).expand(F32, N)
-                for d in range(3, max_depth):
-                    s = (d * (d - 1)) // 2
+            for d in range(max_depth):
+                # Compute node index at this depth
+                if d == 0:
+                    idx = torch.zeros((K1, N), dtype=torch.long, device=XS.device)
+                else:
                     base = (1 << d) - 1
-                    maskd = (1 << d) - 1
-                    idx_fn = (((LF64 >> s) & maskd) + base).to(torch.long)        # [K1, N]
-                    idx_b  = idx_fn.repeat_interleave(32, dim=0)                  # [K1*32, N]
+                    idx = (node_prefix + base).to(torch.long)  # [K1, N]
 
-                    out_sum = torch.zeros((F32, nodes), dtype=TORCH_INT64, device=XS.device)
-                    out_cnt = torch.zeros_like(out_sum)
-                    out_sum.scatter_add_(1, idx_b, (V_flat * Y_flat))
-                    out_cnt.scatter_add_(1, idx_b, V_flat)
+                # Accumulate histograms for each lane
+                for fs in range(K1):
+                    idx_fs = idx[fs, :]  # [N]
+                    V_fs = V[fs, :, :]   # [32, N]
+                    for lane in range(32):
+                        V_lane = V_fs[lane, :]  # [N]
+                        H_sum[fs, :, lane].scatter_add_(0, idx_fs, V_lane * Y64)
+                        H_cnt[fs, :, lane].scatter_add_(0, idx_fs, V_lane)
 
-                    H_sum += out_sum.view(K1, 32, nodes).permute(0, 2, 1)
-                    H_cnt += out_cnt.view(K1, 32, nodes).permute(0, 2, 1)
+                # Update node_prefix for next depth
+                if d < Dm:
+                    branch_bit = LF64[:, d, :]  # [K1, N]
+                    node_prefix = (node_prefix << 1) | branch_bit
 
-            # stack into He (add channel dim)
+            # Stack into He (add channel dim)
             He[:, ei, :, 0, :] = H_sum
             He[:, ei, :, 1, :] = H_cnt
 
