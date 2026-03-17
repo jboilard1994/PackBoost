@@ -214,11 +214,9 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 self.stop_training = False
                 break
 
-            # (a) feature sampling -> XS [nfeatsets, 32*M] uint32
-            if XB.is_cuda and torch.cuda.is_available():
-                XS = self.et_sample_1b(XB, self.Fsch, t).contiguous()
-            else:
-                XS = self.et_sample_1b(XB, Fsch_cpu, t).to(device)
+            # (a) feature sampling -> XS [nfeatsets, 32*M] uint32   
+            XS = self.et_sample_1b(XB, self.Fsch, t).contiguous()
+
 
             # (b) compute gradients (no triangular packing)
             G = self.prep_vars(Y_i32, P)  # G: int16
@@ -388,13 +386,9 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
 
     def et_sample_1b(self, X : Tensor, Fsch : Tensor, round : int) -> Tensor:
-        if X.device.type != 'cpu' and torch.cuda.is_available():
-            XS = torch.empty((self.nfeatsets, X.shape[1]*32), dtype=torch.uint32, device=X.device)
-            return kernels.et_sample_1b(X.contiguous(), XS.contiguous(), Fsch.contiguous(), round)
-        M = X.shape[1]
-        nfeatsets = self.nfeatsets
-        Fs = Fsch[round].view(nfeatsets, 32).to(dtype=torch.long, device=X.device)
-        return X.to(torch.int32)[Fs, :].transpose(1, 2).contiguous().view(nfeatsets, M*32).to(torch.uint32)
+        nfeatsets = int(self.nfeatsets)
+        Fs = Fsch[round].view(nfeatsets, 32).to(device=X.device, dtype=torch.long)
+        return X.to(torch.int32)[Fs, :].transpose(1, 2).contiguous().view(nfeatsets, X.shape[1] * 32).to(torch.uint32)
 
     def prep_vars(self, Y: torch.Tensor, P: torch.Tensor):
         """Compute quantized gradients only (no triangular packing)."""
