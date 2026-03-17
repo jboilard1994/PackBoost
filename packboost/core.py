@@ -392,9 +392,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
     def prep_vars(self, Y: torch.Tensor, P: torch.Tensor):
         """Compute quantized gradients only (no triangular packing)."""
-        if Y.is_cuda and torch.cuda.is_available():
-            return kernels.prep_vars(Y.contiguous(), P.contiguous())
-
         # Compute quantized residuals (use int64 to avoid int32 overflow on Q30 diff)
         g = (Y.to(torch.int64) - P.to(torch.int64)) >> 20
         G = g.clamp_(-(1 << 15), (1 << 15) - 1).to(torch.int16)

@@ -50,8 +50,6 @@ def _load_extension() -> ModuleType:
     sources = [
         str(src_dir / "kernels.cpp"),
         str(src_dir / "encode_cuts.cu"),
-        str(src_dir / "et_sample_1b.cu"),
-        str(src_dir / "prep_vars.cu"),
         str(src_dir / "h0.cu"),
         str(src_dir / "h.cu"),
         str(src_dir / "cut.cu"),
