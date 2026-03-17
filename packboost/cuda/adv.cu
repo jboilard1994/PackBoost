@@ -7,12 +7,11 @@
 
 constexpr int WARP_SIZE = 32;
 
-template <typename LeafT>
 __global__ void advance_and_predict_kernel(
     int32_t* __restrict__ P,            // [N]
     const uint32_t* __restrict__ X,     // [R, M]
-    const LeafT*  __restrict__ L_old,   // [K0, Dm, N]
-    LeafT*        __restrict__ L_new,   // [K0, Dm, N]
+    const uint8_t* __restrict__ L_old,  // [K0, Dm, N] branch bits
+    uint8_t*       __restrict__ L_new,  // [K0, Dm, N] branch bits
     const int32_t* __restrict__ V,      // [rounds, K0, 2*nodes]
     const uint16_t* __restrict__ I,     // [rounds, K0, nodes]
     // dims/params
@@ -33,22 +32,26 @@ __global__ void advance_and_predict_kernel(
     const int k = 32 * (stride * iblk + j) + wi;
     if (k >= N) continue;
 
-    uint16_t leaf_prev = 0;
+    // Reconstruct node prefix from branch bits stored in L_old
+    uint16_t node_prefix = 0;
     if (depth > 0) {
-      const size_t off_old = (((size_t)tree_fold * (size_t)Dm) + (size_t)(depth - 1)) * (size_t)N + (size_t)k;
-      leaf_prev = (uint16_t)L_old[off_old];
+      for (int i = 0; i < depth; ++i) {
+        const size_t off = (((size_t)tree_fold * (size_t)Dm) + (size_t)i) * (size_t)N + (size_t)k;
+        const uint16_t branch_bit = (uint16_t)L_old[off];  // 0 or 1
+        node_prefix |= (branch_bit << i);
+      }
     }
 
-    const int lo = (int)leaf_prev + ((1 << depth) - 1);
+    const int lo = (int)node_prefix + ((1 << depth) - 1);
     const uint16_t li = I[Ibase + (size_t)lo];
 
     const uint32_t word = X[(size_t)li * (size_t)M + (size_t)(k >> 5)];
     const uint32_t bit  = (word >> (k & 31)) & 1u;
 
-    const uint16_t leaf_new = (uint16_t)((leaf_prev << 1) | (uint16_t)bit);
+    // Store only the branch bit (0 or 1), not the full node index
     if (depth < Dm) {
       const size_t off_new = (((size_t)tree_fold * (size_t)Dm) + (size_t)depth) * (size_t)N + (size_t)k;
-      L_new[off_new] = (LeafT)leaf_new;
+      L_new[off_new] = (uint8_t)bit;
     }
 
     size_t idx = (size_t)(2 * lo + 1 + (int)bit);
@@ -63,10 +66,10 @@ __global__ void advance_and_predict_kernel(
 static void launch_advpred(
     torch::Tensor P,  // int32 [N]
     torch::Tensor X,  // int32 (bitwise uint32) [R, M]
-    torch::Tensor L_old,
-    torch::Tensor L_new,
+    torch::Tensor L_old,  // uint8 [K0, Dm, N] branch bits
+    torch::Tensor L_new,  // uint8 [K0, Dm, N] branch bits
     torch::Tensor V,  // int32 [rounds, K0, 2*nodes]
-    torch::Tensor I,  // int16 [rounds, K0, nodes] (uint16 payload)
+    torch::Tensor I,  // uint16 [rounds, K0, nodes]
     int tree_set)
 {
 
@@ -83,7 +86,7 @@ static void launch_advpred(
   // infer depths (grid.y) and stride/grid.z like original Numba call
   const int depths = std::min(tree_set + 1, Dm + 1);
 
-  const int zblocks = 512;                              // same as original workflow
+  const int zblocks = 512;
   int stride = (N + (zblocks * 32) - 1) / (zblocks * 32);
   if (stride < 1) stride = 1;
   const int gz = std::max(1, zblocks);
@@ -92,27 +95,17 @@ static void launch_advpred(
   const dim3 block(WARP_SIZE);
   auto stream = at::cuda::getCurrentCUDAStream();
 
-  if (L_old.scalar_type() == at::kByte && L_new.scalar_type() == at::kByte) {
-    advance_and_predict_kernel<uint8_t><<<grid, block, 0, stream.stream()>>>(
-        P.data_ptr<int32_t>(),
-        reinterpret_cast<const uint32_t*>(X.data_ptr()),
-        L_old.data_ptr<uint8_t>(),
-        L_new.data_ptr<uint8_t>(),
-        V.data_ptr<int32_t>(),
-        reinterpret_cast<const uint16_t*>(I.data_ptr<uint16_t>()),
-        N, R, M, K0, Dm, nodes, rounds, tree_set, stride);
-  } else if (L_old.scalar_type() == at::kShort && L_new.scalar_type() == at::kShort) {
-    advance_and_predict_kernel<uint16_t><<<grid, block, 0, stream.stream()>>>(
-        P.data_ptr<int32_t>(),
-        reinterpret_cast<const uint32_t*>(X.data_ptr()),
-        L_old.data_ptr<uint16_t>(),
-        L_new.data_ptr<uint16_t>(),
-        V.data_ptr<int32_t>(),
-        reinterpret_cast<const uint16_t*>(I.data_ptr<uint16_t>()),
-        N, R, M, K0, Dm, nodes, rounds, tree_set, stride);
-  } else {
-    TORCH_CHECK(false, "L_old/L_new must both be uint8 or both be int16 (uint16)");
-  }
+  TORCH_CHECK(L_old.scalar_type() == at::kByte && L_new.scalar_type() == at::kByte,
+              "L_old/L_new must both be uint8 for branch bits");
+
+  advance_and_predict_kernel<<<grid, block, 0, stream.stream()>>>(
+      P.data_ptr<int32_t>(),
+      reinterpret_cast<const uint32_t*>(X.data_ptr()),
+      L_old.data_ptr<uint8_t>(),
+      L_new.data_ptr<uint8_t>(),
+      V.data_ptr<int32_t>(),
+      reinterpret_cast<const uint16_t*>(I.data_ptr<uint16_t>()),
+      N, R, M, K0, Dm, nodes, rounds, tree_set, stride);
 }
 
 void advance_and_predict_launcher(

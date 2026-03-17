@@ -75,8 +75,7 @@ model = PackBoost(
 
 model.fit(X_train, y_train, rounds=200, era_ids=None)  # era_ids=None disables DES
 
-pred_q30 = model.predict(X_test)                # int32 in Q30 fixed-point
-pred = pred_q30.astype(np.float64) / (1 << 30)  # convert to float
+pred = model.predict(X_test)                     # float32, same scale as y_train
 print(pred[:5])
 ```
 ---
@@ -129,7 +128,7 @@ def fit(self,
 * Bit-packing requires `4*F < 2**16` (schedule dtype is `uint16`).
 * Device selection: if `device='cuda'` but CUDA is unavailable, training falls back to CPU.
 * **DES** uses computed `era_ends`; non-DES path treats the dataset as a single era.
-* Predictions are maintained in **Q30** fixed-point (`int32`). Convert via `pred / (1<<30)`.
+* Predictions are accumulated internally in **Q30** fixed-point (`int32`) and decoded to float on output.
 
 **Example with validation + callback**
 
@@ -155,10 +154,10 @@ model.fit(
 )
 ```
 
-### `PackBoost.predict(X) -> np.ndarray[int32]`
+### `PackBoost.predict(X) -> np.ndarray[float32]`
 
 * Input `X`: `np.int8` in `[0,4]`, shape `[N, F]`.
-* Returns: `int32` Q30 predictions; convert with `/ (1<<30)`.
+* Returns: `float32` predictions on the same scale/range as training target `y`.
 
 ---
 

@@ -45,33 +45,32 @@ static __device__ __forceinline__ void flush_node_reg(
 }
 
 
-// ---------------- Kernel (templated on LF dtype) ----------------
-// XS: [K1, cols_32M] (cols_32M = 32*M, padded), each entry is a 32-bit "lane" word
+// ---------------- Kernel (using branch bits) ----------------
+// XS: [K1, cols_32M] (cols_32M = 32*M, padded)
 // Y : [N] int16 (grad)
-// LF: [K1, N] (unsigned 16/32/64) packed leaf codes
+// LF: [K1, Dm, N] uint8 branch bits
 // era_ends: [E] int32 (exclusive ends), era_ends[E-1]==N
 // H : [K1, E, nodes, 2, 32] int64  (sum, count) per lane
-template <typename LF_T>
 __global__ void _h_des_sm(
     const uint32_t* __restrict__ XS,
     const int16_t* __restrict__ Y,
-    const LF_T* __restrict__ LF,
+    const uint8_t* __restrict__ LF,
     const int32_t* __restrict__ era_ends,
     int64_t* __restrict__ H,
-    int K1, int cols_32M, int N, int E, int max_depth,
+    int K1, int cols_32M, int N, int Dm, int E, int max_depth,
     int warps_per_block, int stride, int nodes_total)
 {
   const int feat_set   = blockIdx.x;
-  const int warp_in_blk= threadIdx.x >> 5;     // 0..(warps_per_block-1)
-  const int lane       = threadIdx.x & 31;     // 0..31
+  const int warp_in_blk= threadIdx.x >> 5;
+  const int lane       = threadIdx.x & 31;
   const int gwarp      = warps_per_block * blockIdx.y + warp_in_blk;
 
   if (feat_set >= K1) return;
 
-  // Shared histogram for depths >=3 : shape [(nodes_total-7), 2, 32] (int32)
+  // Shared histogram for depths >=3
   int n_ge3 = nodes_total - 7;
   if (n_ge3 < 1) n_ge3 = 1;
-  extern __shared__ int sh_high[]; // [n_ge3 * 2 * 32] ints
+  extern __shared__ int sh_high[];
 
   const unsigned mask = __ballot_sync(__activemask(), true);
 
@@ -82,12 +81,19 @@ __global__ void _h_des_sm(
 
     // Lane-local loads for this tile
     const int jj_lane = base + lane;
-    int32_t  y_lane = 0;
-    uint32_t l32    = 0;
+    int32_t y_lane = 0;
+    uint8_t branch_bits[16]; // max_depth <= 16
     if (jj_lane < N) {
       y_lane = (int32_t)Y[jj_lane];
-      l32    = (uint32_t)((LF_T)LF[(size_t)feat_set * (size_t)N + (size_t)jj_lane]);
+      // Load branch bits for this sample
+      for (int d = 0; d < Dm && d < 16; ++d) {
+        const size_t off = ((static_cast<size_t>(feat_set) * static_cast<size_t>(Dm)) + static_cast<size_t>(d)) * static_cast<size_t>(N) + static_cast<size_t>(jj_lane);
+        branch_bits[d] = LF[off];
+      }
+    } else {
+      for (int d = 0; d < 16; ++d) branch_bits[d] = 0;
     }
+
     // 32-bit feature word for this lane
     uint32_t xfd_local = 0u;
     if (jj_lane < cols_32M) {
@@ -158,41 +164,57 @@ __global__ void _h_des_sm(
         const int v = (int)(bits & 1u);
         bits >>= 1;
 
-        // broadcast label & leaf-code of the kth column
-        const int src_lane = k;                 // lane id == column id
+        // broadcast label & branch bits of the kth column
+        const int src_lane = k;
         const int32_t yk = __shfl_sync(mask, y_lane, src_lane);
-        uint32_t      lk = __shfl_sync(mask, l32,    src_lane);
 
-        // d = 0
+        // Shuffle branch bits for sample k
+        uint8_t bits_k[16];
+        for (int d = 0; d < Dm && d < 16; ++d) {
+          bits_k[d] = __shfl_sync(mask, branch_bits[d], src_lane);
+        }
+
+        // d = 0 (root)
         if (v) p0 = add_pack(p0, pack_sc((int)yk, 1));
 
+        // Build node prefix incrementally
+        unsigned node_prefix = 0;
+
         // d = 1
-        const unsigned tk1 = (lk & 1u); lk >>= 1;
-        if (v) {
-          (tk1 == 0u ? p10 : p11) = add_pack((tk1 == 0u ? p10 : p11), pack_sc((int)yk, 1));
+        if (max_depth > 1) {
+          unsigned tk1 = (Dm > 0) ? bits_k[0] : 0;
+          node_prefix = tk1;
+          if (v) {
+            (tk1 == 0u ? p10 : p11) = add_pack((tk1 == 0u ? p10 : p11), pack_sc((int)yk, 1));
+          }
         }
 
         // d = 2
-        const unsigned tk2 = (lk & 3u); lk >>= 2;
-        if (v) {
-          if      (tk2 == 0u) p20 = add_pack(p20, pack_sc((int)yk, 1));
-          else if (tk2 == 1u) p21 = add_pack(p21, pack_sc((int)yk, 1));
-          else if (tk2 == 2u) p22 = add_pack(p22, pack_sc((int)yk, 1));
-          else                p23 = add_pack(p23, pack_sc((int)yk, 1));
+        if (max_depth > 2) {
+          if (Dm > 1) {
+            node_prefix = (node_prefix << 1) | bits_k[1];
+          }
+          unsigned tk2 = node_prefix;
+          if (v) {
+            if      (tk2 == 0u) p20 = add_pack(p20, pack_sc((int)yk, 1));
+            else if (tk2 == 1u) p21 = add_pack(p21, pack_sc((int)yk, 1));
+            else if (tk2 == 2u) p22 = add_pack(p22, pack_sc((int)yk, 1));
+            else                p23 = add_pack(p23, pack_sc((int)yk, 1));
+          }
         }
 
         // d >= 3 -> accumulate in shared
         #pragma unroll
-        for (int d = 3; d < 32; ++d) {
-          if (d >= max_depth) break;
-          const unsigned to  = (1u << d) - 1u;
-          const unsigned tkd = (lk & to); lk >>= d;
-          const int node = (int)to + (int)tkd;   // 7..nodes_total-1
-          const int idx  = node - 7;
+        for (int d = 3; d < max_depth; ++d) {
+          if (d - 1 < Dm) {
+            node_prefix = (node_prefix << 1) | bits_k[d - 1];
+          }
+          const unsigned to = (1u << d) - 1u;
+          const int node = (int)to + (int)node_prefix;
+          const int idx = node - 7;
           if (v) {
-            // FIX 2: Use atomicAdd for safer updates to shared memory.
-            atomicAdd(&sh_high[(idx * 2 + 0) * 32 + lane], (int)yk); // sum
-            atomicAdd(&sh_high[(idx * 2 + 1) * 32 + lane], 1);       // cnt
+            atomicAdd(&sh_high[(idx * 2 + 0) * 32 + lane], (int)yk);
+            atomicAdd(&sh_high[(idx * 2 + 1) * 32 + lane], 1);
           }
         }
       } // k
@@ -263,7 +285,7 @@ static inline void infer_grid_stride_des(
 torch::Tensor h_des(
     torch::Tensor XS,        // [K1, cols_32M] (uint32/int32)
     torch::Tensor Y,         // [N] int16
-    torch::Tensor LF,        // [K1, N] uint16/uint32/uint64
+    torch::Tensor LF,        // [K1, Dm, N] uint8 branch bits
     torch::Tensor era_ends,  // [E] int32 (exclusive ends)
     int max_depth)
 {
@@ -272,13 +294,19 @@ torch::Tensor h_des(
   TORCH_CHECK(Y.scalar_type()==torch::kInt16, "Y must be int16.");
   TORCH_CHECK(XS.scalar_type()==torch::kUInt32 || XS.scalar_type()==torch::kInt32,
               "XS must be uint32/int32.");
-  TORCH_CHECK(LF.dim()==2 && XS.dim()==2 && Y.dim()==1, "Shapes: XS[K1,cols], Y[N], LF[K1,N].");
+  TORCH_CHECK(LF.scalar_type()==torch::kByte, "LF must be uint8.");
+  TORCH_CHECK(LF.dim()==3 && XS.dim()==2 && Y.dim()==1, "Shapes: XS[K1,cols], Y[N], LF[K1,Dm,N].");
   TORCH_CHECK(max_depth>0 && max_depth<=8,
               "h_des supports max_depth <= 8 (nodes <= 255).");
 
   const int K1       = (int)XS.size(0);
   const int cols_32M = (int)XS.size(1);
   const int N        = (int)Y.size(0);
+  const int Dm       = (int)LF.size(1);
+
+  TORCH_CHECK(LF.size(0) == K1, "LF.size(0) must equal K1");
+  TORCH_CHECK(LF.size(2) == N, "LF.size(2) must equal N");
+  TORCH_CHECK(Dm == max_depth - 1, "LF.size(1) must equal max_depth - 1");
 
   auto era_i32 = era_ends.to(XS.device(), torch::kInt32, /*non_blocking=*/false, /*copy=*/true)
                          .contiguous();
@@ -317,34 +345,13 @@ torch::Tensor h_des(
   auto stream = at::cuda::getCurrentCUDAStream();
   const uint32_t* XS_ptr = reinterpret_cast<const uint32_t*>(XS.data_ptr());
 
-  const auto lf_dt = LF.scalar_type();
-  if (lf_dt == torch::kUInt16) {
-    cudaFuncSetAttribute(_h_des_sm<uint16_t>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         (int)smem_high);
-    _h_des_sm<uint16_t><<<grid, block, smem_high, stream.stream()>>>(
-      XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint16_t>(),
+  cudaFuncSetAttribute(_h_des_sm, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       (int)smem_high);
+  _h_des_sm<<<grid, block, smem_high, stream.stream()>>>(
+      XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint8_t>(),
       era_i32.data_ptr<int32_t>(), H.data_ptr<int64_t>(),
-      K1, cols_32M, N, E, max_depth,
+      K1, cols_32M, N, Dm, E, max_depth,
       warps_per_block, stride, nodes_total);
-  } else if (lf_dt == torch::kUInt32) {
-    cudaFuncSetAttribute(_h_des_sm<uint32_t>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         (int)smem_high);
-    _h_des_sm<uint32_t><<<grid, block, smem_high, stream.stream()>>>(
-      XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint32_t>(),
-      era_i32.data_ptr<int32_t>(), H.data_ptr<int64_t>(),
-      K1, cols_32M, N, E, max_depth,
-      warps_per_block, stride, nodes_total);
-  } else if (lf_dt == torch::kUInt64) {
-    cudaFuncSetAttribute(_h_des_sm<uint64_t>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         (int)smem_high);
-    _h_des_sm<uint64_t><<<grid, block, smem_high, stream.stream()>>>(
-      XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint64_t>(),
-      era_i32.data_ptr<int32_t>(), H.data_ptr<int64_t>(),
-      K1, cols_32M, N, E, max_depth,
-      warps_per_block, stride, nodes_total);
-  } else {
-    TORCH_CHECK(false, "LF must be uint16/uint32/uint64.");
-  }
 
   TORCH_CHECK(cudaGetLastError() == cudaSuccess, "h_des launch failed: ",
               cudaGetErrorString(cudaGetLastError()));
