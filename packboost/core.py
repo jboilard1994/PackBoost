@@ -447,8 +447,9 @@ class PackBoost(BaseEstimator, RegressorMixin):
             L_old: torch.Tensor,   # [nfolds, Dm, N], uint8 branch bits
             tree_set: int) -> torch.Tensor:
         """
-        Returns LF: [nfeatsets, Dm, N] with explicit branch bits.
-        LF[fs, d, :] = L_old[FST[tree_set, fs, d+1], d, :] for d in 0..Dm-1
+        Returns LF: [nfeatsets, Dm, N] with depth-local prefix codes.
+        LF[fs, d, :] stores the (d+1)-bit prefix from fold FST[tree_set, fs, d+1].
+        This matches the old packed-path semantics without triangular packing.
         """
         # --- Fast path: GPU kernel ---
         if FST.is_cuda and L_old.is_cuda and torch.cuda.is_available():
@@ -468,17 +469,18 @@ class PackBoost(BaseEstimator, RegressorMixin):
         nfolds, Dm, N = L_old.shape
         device = L_old.device
 
-        # LF[fs, d, :] = L_old[FST[tree_set, fs, d+1], d, :]
-        # For each feature-set fs and depth d, gather from the appropriate fold
+        # LF[fs, d, :] must be the full prefix for depth (d+1) from the fold
+        # selected at that depth. Do not mix depth bits from different folds.
         LF = torch.empty((nfeatsets, Dm, N), dtype=L_old.dtype, device=device)
 
         for d in range(Dm):
-            # which_fold[fs] = FST[tree_set, fs, d+1]
             which_fold = FST[tree_set, :, d + 1].to(torch.long)  # [nfeatsets]
-            # Gather: LF[fs, d, :] = L_old[which_fold[fs], d, :]
             for fs in range(nfeatsets):
-                fold = which_fold[fs].item()
-                LF[fs, d, :] = L_old[fold, d, :]
+                fold = int(which_fold[fs].item())
+                prefix = torch.zeros(N, dtype=torch.int64, device=device)
+                for i in range(d + 1):
+                    prefix = (prefix << 1) | L_old[fold, i, :].to(torch.int64)
+                LF[fs, d, :] = prefix.to(LF.dtype)
 
         return LF.contiguous()
     
@@ -487,7 +489,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         """
         XS : [nfeatsets, 32*M] (uint32/int32), packed features
         Y  : [N]               (int16), gradient
-        LF : [nfeatsets, Dm, N] (uint8), explicit branch bits per depth
+        LF : [nfeatsets, Dm, N] (uint8), depth-local prefixes per depth
         max_depth: int
         Returns:
         H: [nfeatsets, (1<<max_depth)-1, 2, 32] int64
@@ -531,16 +533,13 @@ class PackBoost(BaseEstimator, RegressorMixin):
         Y_b = Y64.view(1, 1, N)
         ones = torch.ones((1, 1, N), dtype=TORCH_INT64, device=dev)
 
-        # Build node prefix incrementally from branch bits
-        node_prefix = torch.zeros((nfeatsets, N), dtype=TORCH_INT64, device=dev)
-
         for d in range(max_depth):
             # Compute node index at this depth
             if d == 0:
                 idx = torch.zeros((nfeatsets, N), dtype=torch.long, device=dev)
             else:
                 base = (1 << d) - 1
-                idx = (node_prefix + base).to(torch.long)  # [F, N]
+                idx = (LF64[:, d - 1, :] + base).to(torch.long)  # [F, N]
 
             # Accumulate histograms for each lane
             # We need to scatter per feature-set and per lane
@@ -552,11 +551,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
                     V_lane = V_fs[lane, :]  # [N]
                     H_sum[fs, :, lane].scatter_add_(0, idx_fs, V_lane * Y64)
                     H_cnt[fs, :, lane].scatter_add_(0, idx_fs, V_lane)
-
-            # Update node_prefix for next depth
-            if d < Dm:
-                branch_bit = LF64[:, d, :]  # [F, N]
-                node_prefix = (node_prefix << 1) | branch_bit
 
         # Stack channels: [F, nodes, 2, 32]
         H = torch.stack([H_sum, H_cnt], dim=2).contiguous()
@@ -807,10 +801,10 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 if depth == 0:
                     leaf_prev = torch.zeros(N, dtype=torch.int64, device=device)
                 else:
-                    # Build node from stored branch bits: sum 2^i * bit[i]
+                    # Build node using the same MSB-first prefix convention used in h0/H.
                     leaf_prev = torch.zeros(N, dtype=torch.int64, device=device)
                     for i in range(depth):
-                        leaf_prev |= (L_old[f, i].to(torch.int64) << i)
+                        leaf_prev = (leaf_prev << 1) | L_old[f, i].to(torch.int64)
 
                 lo = leaf_prev + ((1 << depth) - 1)
 
@@ -891,7 +885,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
     def h_des(self,
             XS: torch.Tensor,   # [K1, 32*M] uint32/int32  (padded to Np=32*M)
             Y:  torch.Tensor,   # [N] int16
-            LF: torch.Tensor,   # [K1, Dm, N] uint8 branch bits
+            LF: torch.Tensor,   # [K1, Dm, N] uint8 depth-local prefixes
             max_depth: int,
             era_bounds: torch.Tensor | None = None  # [E] int32 (exclusive ends; last==N)
             ) -> torch.Tensor:
@@ -975,16 +969,13 @@ class PackBoost(BaseEstimator, RegressorMixin):
             H_sum = torch.zeros((K1, nodes, 32), dtype=TORCH_INT64, device=XS.device)
             H_cnt = torch.zeros_like(H_sum)
 
-            # Build node prefix incrementally from branch bits
-            node_prefix = torch.zeros((K1, N), dtype=TORCH_INT64, device=XS.device)
-
             for d in range(max_depth):
                 # Compute node index at this depth
                 if d == 0:
                     idx = torch.zeros((K1, N), dtype=torch.long, device=XS.device)
                 else:
                     base = (1 << d) - 1
-                    idx = (node_prefix + base).to(torch.long)  # [K1, N]
+                    idx = (LF64[:, d - 1, :] + base).to(torch.long)  # [K1, N]
 
                 # Accumulate histograms for each lane
                 for fs in range(K1):
@@ -994,11 +985,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
                         V_lane = V_fs[lane, :]  # [N]
                         H_sum[fs, :, lane].scatter_add_(0, idx_fs, V_lane * Y64)
                         H_cnt[fs, :, lane].scatter_add_(0, idx_fs, V_lane)
-
-                # Update node_prefix for next depth
-                if d < Dm:
-                    branch_bit = LF64[:, d, :]  # [K1, N]
-                    node_prefix = (node_prefix << 1) | branch_bit
 
             # Stack into He (add channel dim)
             He[:, ei, :, 0, :] = H_sum

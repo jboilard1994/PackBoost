@@ -32,13 +32,13 @@ __global__ void advance_and_predict_kernel(
     const int k = 32 * (stride * iblk + j) + wi;
     if (k >= N) continue;
 
-    // Reconstruct node prefix from branch bits stored in L_old
+    // Reconstruct node prefix from branch bits stored in L_old (MSB-first)
     uint16_t node_prefix = 0;
     if (depth > 0) {
       for (int i = 0; i < depth; ++i) {
         const size_t off = (((size_t)tree_fold * (size_t)Dm) + (size_t)i) * (size_t)N + (size_t)k;
         const uint16_t branch_bit = (uint16_t)L_old[off];  // 0 or 1
-        node_prefix |= (branch_bit << i);
+        node_prefix = (node_prefix << 1) | branch_bit;
       }
     }
 

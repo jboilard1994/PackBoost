@@ -22,11 +22,11 @@ static __device__ __forceinline__ unsigned long long add_pack(unsigned long long
     return pack_sc(sa + sb, ca + cb);
   }
  
-// ---------------- Kernel (using branch bits) ----------------
+// ---------------- Kernel (using depth-local prefixes) ----------------
 __global__ void _h_sm(
     const uint32_t* __restrict__ XS, // [nfeatsets, cols_32M]
     const int16_t* __restrict__ Y,   // [N]
-    const uint8_t* __restrict__ LF,  // [nfeatsets, Dm, N] branch bits
+    const uint8_t* __restrict__ LF,  // [nfeatsets, Dm, N] depth-local prefixes
     int64_t* __restrict__ H,         // [nfeatsets, nodes, 2, 32] (int64)
     int nfeatsets,
     int cols_32M, // XS.shape[1]
@@ -68,17 +68,17 @@ __global__ void _h_sm(
       // Load lane’s locals
       const int jj_lane = base + lane;
       int32_t y_lane = 0;
-      // Load branch bits for this lane’s sample (up to Dm depths)
-      uint8_t branch_bits[16]; // max_depth <= 16 assumed
+      // Load depth-local prefixes for this lane's sample (up to Dm depths)
+      uint8_t prefix_bits[16]; // max_depth <= 16 assumed
       if (jj_lane < N) {
         y_lane = Y[jj_lane];
-        // Load branch bits: LF[feat_set, d, jj_lane] for d in 0..Dm-1
+        // Load depth-local prefixes: LF[feat_set, d, jj_lane] for d in 0..Dm-1
         for (int d = 0; d < Dm && d < 16; ++d) {
           const size_t off = ((static_cast<size_t>(feat_set) * static_cast<size_t>(Dm)) + static_cast<size_t>(d)) * static_cast<size_t>(N) + static_cast<size_t>(jj_lane);
-          branch_bits[d] = LF[off];
+          prefix_bits[d] = LF[off];
         }
       } else {
-        for (int d = 0; d < 16; ++d) branch_bits[d] = 0;
+        for (int d = 0; d < 16; ++d) prefix_bits[d] = 0;
       }
 
       // Load this lane’s 32-bit tile
@@ -104,10 +104,10 @@ __global__ void _h_sm(
         // all lanes participate in the shuffles each iter
         const int32_t yk = __shfl_sync(mask, y_lane, k);
 
-        // Shuffle branch bits for sample k
+        // Shuffle depth-local prefixes for sample k
         uint8_t bits_k[16];
         for (int d = 0; d < Dm && d < 16; ++d) {
-          bits_k[d] = __shfl_sync(mask, branch_bits[d], k);
+          bits_k[d] = __shfl_sync(mask, prefix_bits[d], k);
         }
 
         const int64_t add = static_cast<int64_t>(v) * (int64_t)yk;
@@ -116,23 +116,16 @@ __global__ void _h_sm(
         hf0 += add;
         hw0 += v;
 
-        // Build node prefix incrementally
-        unsigned node_prefix = 0;
-
         // d = 1
         if (max_depth > 1) {
-          unsigned tk = (Dm > 0) ? bits_k[0] : 0;
-          node_prefix = tk;
+          unsigned tk = (Dm > 0) ? bits_k[0] : 0u;
           if (tk == 0u) { hf10 += add; hw10 += v; }
           else          { hf11 += add; hw11 += v; }
         }
 
         // d = 2
         if (max_depth > 2) {
-          if (Dm > 1) {
-            node_prefix = (node_prefix << 1) | bits_k[1];
-          }
-          unsigned tk = node_prefix;
+          unsigned tk = (Dm > 1) ? bits_k[1] : 0u;
           if      (tk == 0u) { hf20 += add; hw20 += v; }
           else if (tk == 1u) { hf21 += add; hw21 += v; }
           else if (tk == 2u) { hf22 += add; hw22 += v; }
@@ -142,11 +135,9 @@ __global__ void _h_sm(
         // d >= 3
         #pragma unroll
         for (int d = 3; d < max_depth; ++d) {
-          if (d - 1 < Dm) {
-            node_prefix = (node_prefix << 1) | bits_k[d - 1];
-          }
           const unsigned to = (1u << d) - 1u;
-          const int node = static_cast<int>(to + node_prefix);
+          const unsigned tk = (d - 1 < Dm) ? bits_k[d - 1] : 0u;
+          const int node = static_cast<int>(to + tk);
           const int idx = node - 7;
           atomicAdd(&sh_high[(idx * 2 + 0) * 32 + lane], v * yk);
           atomicAdd(&sh_high[(idx * 2 + 1) * 32 + lane], v);
@@ -254,7 +245,7 @@ static inline int choose_warps_that_fit(size_t smem_high, size_t smem_cap) {
 // API: returns H tensor
 // XS: [nfeatsets, cols_32M] (torch.uint32)
 // Y : [N] (torch.int16)
-// LF: [nfeatsets, Dm, N] (torch.uint8 branch bits)
+// LF: [nfeatsets, Dm, N] (torch.uint8 depth-local prefixes)
 // max_depth: <= 8 (this SMEM variant)
 torch::Tensor h_sm(
     torch::Tensor XS,

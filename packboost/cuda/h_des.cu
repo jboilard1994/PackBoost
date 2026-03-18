@@ -45,10 +45,10 @@ static __device__ __forceinline__ void flush_node_reg(
 }
 
 
-// ---------------- Kernel (using branch bits) ----------------
+// ---------------- Kernel (using depth-local prefixes) ----------------
 // XS: [K1, cols_32M] (cols_32M = 32*M, padded)
 // Y : [N] int16 (grad)
-// LF: [K1, Dm, N] uint8 branch bits
+// LF: [K1, Dm, N] uint8 depth-local prefixes
 // era_ends: [E] int32 (exclusive ends), era_ends[E-1]==N
 // H : [K1, E, nodes, 2, 32] int64  (sum, count) per lane
 __global__ void _h_des_sm(
@@ -82,16 +82,16 @@ __global__ void _h_des_sm(
     // Lane-local loads for this tile
     const int jj_lane = base + lane;
     int32_t y_lane = 0;
-    uint8_t branch_bits[16]; // max_depth <= 16
+    uint8_t prefix_bits[16]; // max_depth <= 16
     if (jj_lane < N) {
       y_lane = (int32_t)Y[jj_lane];
-      // Load branch bits for this sample
+      // Load depth-local prefixes for this sample
       for (int d = 0; d < Dm && d < 16; ++d) {
         const size_t off = ((static_cast<size_t>(feat_set) * static_cast<size_t>(Dm)) + static_cast<size_t>(d)) * static_cast<size_t>(N) + static_cast<size_t>(jj_lane);
-        branch_bits[d] = LF[off];
+        prefix_bits[d] = LF[off];
       }
     } else {
-      for (int d = 0; d < 16; ++d) branch_bits[d] = 0;
+      for (int d = 0; d < 16; ++d) prefix_bits[d] = 0;
     }
 
     // 32-bit feature word for this lane
@@ -164,26 +164,22 @@ __global__ void _h_des_sm(
         const int v = (int)(bits & 1u);
         bits >>= 1;
 
-        // broadcast label & branch bits of the kth column
+        // broadcast label & depth-local prefixes of the kth column
         const int src_lane = k;
         const int32_t yk = __shfl_sync(mask, y_lane, src_lane);
 
-        // Shuffle branch bits for sample k
+        // Shuffle depth-local prefixes for sample k
         uint8_t bits_k[16];
         for (int d = 0; d < Dm && d < 16; ++d) {
-          bits_k[d] = __shfl_sync(mask, branch_bits[d], src_lane);
+          bits_k[d] = __shfl_sync(mask, prefix_bits[d], src_lane);
         }
 
         // d = 0 (root)
         if (v) p0 = add_pack(p0, pack_sc((int)yk, 1));
 
-        // Build node prefix incrementally
-        unsigned node_prefix = 0;
-
         // d = 1
         if (max_depth > 1) {
-          unsigned tk1 = (Dm > 0) ? bits_k[0] : 0;
-          node_prefix = tk1;
+          unsigned tk1 = (Dm > 0) ? bits_k[0] : 0u;
           if (v) {
             (tk1 == 0u ? p10 : p11) = add_pack((tk1 == 0u ? p10 : p11), pack_sc((int)yk, 1));
           }
@@ -191,10 +187,7 @@ __global__ void _h_des_sm(
 
         // d = 2
         if (max_depth > 2) {
-          if (Dm > 1) {
-            node_prefix = (node_prefix << 1) | bits_k[1];
-          }
-          unsigned tk2 = node_prefix;
+          unsigned tk2 = (Dm > 1) ? bits_k[1] : 0u;
           if (v) {
             if      (tk2 == 0u) p20 = add_pack(p20, pack_sc((int)yk, 1));
             else if (tk2 == 1u) p21 = add_pack(p21, pack_sc((int)yk, 1));
@@ -206,11 +199,9 @@ __global__ void _h_des_sm(
         // d >= 3 -> accumulate in shared
         #pragma unroll
         for (int d = 3; d < max_depth; ++d) {
-          if (d - 1 < Dm) {
-            node_prefix = (node_prefix << 1) | bits_k[d - 1];
-          }
           const unsigned to = (1u << d) - 1u;
-          const int node = (int)to + (int)node_prefix;
+          const unsigned tk = (d - 1 < Dm) ? bits_k[d - 1] : 0u;
+          const int node = (int)to + (int)tk;
           const int idx = node - 7;
           if (v) {
             atomicAdd(&sh_high[(idx * 2 + 0) * 32 + lane], (int)yk);
@@ -285,7 +276,7 @@ static inline void infer_grid_stride_des(
 torch::Tensor h_des(
     torch::Tensor XS,        // [K1, cols_32M] (uint32/int32)
     torch::Tensor Y,         // [N] int16
-    torch::Tensor LF,        // [K1, Dm, N] uint8 branch bits
+    torch::Tensor LF,        // [K1, Dm, N] uint8 depth-local prefixes
     torch::Tensor era_ends,  // [E] int32 (exclusive ends)
     int max_depth)
 {
