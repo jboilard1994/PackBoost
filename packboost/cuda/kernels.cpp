@@ -39,7 +39,7 @@ torch::Tensor h0_sm_butterfly(
 void repack_trees_for_features_cuda(
     const torch::Tensor& FST,     // uint8  [nsets, nfeatsets, max_depth]
     const torch::Tensor& L_old,   // uint8 [nfolds, Dm, N]
-    torch::Tensor& LF,            // uint8 [nfeatsets, Dm, N] (output)
+    torch::Tensor& LF,            // uint16 [nfeatsets, Dm, N] (output)
     int64_t tree_set      // which set (round)
 );
 
@@ -89,7 +89,7 @@ torch::Tensor h0_des_butterfly(
 torch::Tensor h_des(
     torch::Tensor XS,        // [nfeatsets, cols_32M] uint32/int32
     torch::Tensor Y,         // [N]            int16
-    torch::Tensor LF,        // [nfeatsets, Dm, N] uint8 branch bits
+    torch::Tensor LF,        // [nfeatsets, Dm, N] uint16 depth-local prefixes
     torch::Tensor era_ends,  // [E]            int32 (exclusive ends)
     int max_depth);
 

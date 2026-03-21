@@ -92,6 +92,8 @@ class PackBoost(BaseEstimator, RegressorMixin):
         self.nfeatsets = int(nfeatsets)
         self.nfolds    = int(nfolds)
         self.max_depth = int(max_depth)
+        if not (1 <= self.max_depth <= 16):
+            raise ValueError(f"max_depth must be in [1, 16], got {self.max_depth}")
         self.min_child_weight = float(min_child_weight)
         self.min_split_gain   = float(min_split_gain)
 
@@ -413,32 +415,30 @@ class PackBoost(BaseEstimator, RegressorMixin):
         # --- CPU vectorized fallback ---
         device = L_old.device
         H0 = torch.zeros((nfolds, nodes, 2), dtype=torch.int64, device=device)
-        H0_sum = H0[..., 0]  # [nfolds, nodes]
-        H0_cnt = H0[..., 1]  # [nfolds, nodes]
 
+        L64 = L_old.to(torch.int64, copy=False)  # [nfolds, Dm, N]
         g64 = G.to(torch.int64, copy=False).contiguous()  # [N]
-        SRC = g64.unsqueeze(0).expand(nfolds, N).contiguous()
-        ONES = torch.ones_like(SRC, dtype=torch.int64)
 
-        # Build node prefix incrementally from branch bits
-        node_prefix = torch.zeros((nfolds, N), dtype=torch.int64, device=device)
+        # Pre-accumulate MSB-first prefix for each depth (analogous to LF in H()).
+        # prefix_scan[d] is the accumulated branch-bit prefix up to (not including) depth d.
+        zero = torch.zeros((nfolds, N), dtype=torch.int64, device=device)
+        prefix_scan = [zero]
+        for d in range(Dm):
+            prefix_scan.append((prefix_scan[-1] << 1) | L64[:, d, :])
 
-        for d in range(max_depth):
-            # Compute node index at this depth
-            if d == 0:
-                idx = torch.zeros((nfolds, N), dtype=torch.long, device=device)
-            else:
-                base = (1 << d) - 1
-                idx = (node_prefix + base).to(torch.long)
+        # Node index at each depth: prefix + tree-level offset (mirrors h()'s idx_parts).
+        idx_parts = [
+            prefix_scan[d] + ((1 << d) - 1)
+            for d in range(max_depth)
+        ]
 
-            # Accumulate histograms
-            H0_sum.scatter_add_(1, idx, SRC)
-            H0_cnt.scatter_add_(1, idx, ONES)
+        # Stack -> [nfolds, D, N], flatten -> [nfolds, D*N], then single scatter each channel.
+        idx_flat = torch.stack(idx_parts, dim=1).reshape(nfolds, max_depth * N)
+        G_rep    = g64.unsqueeze(0).expand(nfolds, N).repeat(1, max_depth)
+        ones_rep = torch.ones(nfolds, max_depth * N, dtype=torch.int64, device=device)
 
-            # Update node_prefix for next depth using branch bit
-            if d < Dm:
-                branch_bit = L_old[:, d, :].to(torch.int64)  # [nfolds, N]
-                node_prefix = (node_prefix << 1) | branch_bit
+        H0[..., 0].scatter_add_(1, idx_flat, G_rep)
+        H0[..., 1].scatter_add_(1, idx_flat, ones_rep)
 
         return H0
 
@@ -447,7 +447,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             L_old: torch.Tensor,   # [nfolds, Dm, N], uint8 branch bits
             tree_set: int) -> torch.Tensor:
         """
-        Returns LF: [nfeatsets, Dm, N] with depth-local prefix codes.
+        Returns LF: [nfeatsets, Dm, N] with depth-local prefix codes (uint16).
         LF[fs, d, :] stores the (d+1)-bit prefix from fold FST[tree_set, fs, d+1].
         This matches the old packed-path semantics without triangular packing.
         """
@@ -455,7 +455,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         if FST.is_cuda and L_old.is_cuda and torch.cuda.is_available():
             nfeatsets = FST.shape[1]
             Dm, N = L_old.shape[1], L_old.shape[2]
-            LF = torch.empty((nfeatsets, Dm, N), dtype=L_old.dtype, device=L_old.device)
+            LF = torch.empty((nfeatsets, Dm, N), dtype=torch.uint16, device=L_old.device)
             kernels.repack_trees_for_features(
                 FST.contiguous(), L_old.contiguous(), LF, int(tree_set)
             )
@@ -471,7 +471,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
         # LF[fs, d, :] must be the full prefix for depth (d+1) from the fold
         # selected at that depth. Do not mix depth bits from different folds.
-        LF = torch.empty((nfeatsets, Dm, N), dtype=L_old.dtype, device=device)
+        LF = torch.empty((nfeatsets, Dm, N), dtype=torch.uint16, device=device)
 
         for d in range(Dm):
             which_fold = FST[tree_set, :, d + 1].to(torch.long)  # [nfeatsets]
@@ -489,7 +489,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         """
         XS : [nfeatsets, 32*M] (uint32/int32), packed features
         Y  : [N]               (int16), gradient
-        LF : [nfeatsets, Dm, N] (uint8), depth-local prefixes per depth
+        LF : [nfeatsets, Dm, N] (uint16), depth-local prefixes per depth
         max_depth: int
         Returns:
         H: [nfeatsets, (1<<max_depth)-1, 2, 32] int64
@@ -512,48 +512,44 @@ class PackBoost(BaseEstimator, RegressorMixin):
         assert cols_32M % 32 == 0, "XS must have columns divisible by 32"
         M = cols_32M // 32
 
-        # Prepare output
-        H_sum = torch.zeros((nfeatsets, nodes_tot, 32), dtype=TORCH_INT64, device=dev)
-        H_cnt = torch.zeros_like(H_sum)
+        # Output in final layout [nfeatsets, nodes_tot, 2, 32]; scatter directly into strided views.
+        H = torch.zeros((nfeatsets, nodes_tot, 2, 32), dtype=TORCH_INT64, device=dev)
 
         # Casts
         Y64  = Y.to(TORCH_INT64, copy=False).contiguous()  # [N]
         LF64 = LF.to(TORCH_INT64, copy=False).contiguous()  # [nfeatsets, Dm, N]
         XS64 = XS.to(TORCH_INT64, copy=False).contiguous().view(nfeatsets, M, 32)
 
-        # Build V = bit-unpacked features per lane
+        # Build V = bit-unpacked features per lane using vectorized bitwise ops
         bit_ids = torch.arange(32, dtype=TORCH_INT64, device=dev)
-        masks = (1 << bit_ids)
-        V_bits = ((XS64[..., None] & masks) != 0).to(TORCH_INT64)  # [F, M, 32, 32]
-        V = V_bits.permute(0, 2, 1, 3).reshape(nfeatsets, 32, 32 * M)  # [F, 32, 32*M]
+        V_bits = torch.bitwise_right_shift(XS64[..., None], bit_ids).bitwise_and_(1)  # [nfeatsets, M, 32, 32]
+        V = V_bits.permute(0, 2, 1, 3).reshape(nfeatsets, 32, 32 * M)  # [nfeatsets, 32, 32*M]
         if V.size(2) > N:
-            V = V[:, :, :N].contiguous()  # [F, 32, N]
+            V = V[:, :, :N].contiguous()  # [nfeatsets, 32, N]
 
-        # Common broadcasts
-        Y_b = Y64.view(1, 1, N)
-        ones = torch.ones((1, 1, N), dtype=TORCH_INT64, device=dev)
+        # Build node indices for all depths at once: [max_depth, nfeatsets, N]
+        # depth 0: all samples route to node 0; depth d>0: LF prefix + offset.
+        idx_parts = [
+            torch.zeros((nfeatsets, N), dtype=torch.long, device=dev) if d == 0
+            else (LF64[:, d - 1, :] + ((1 << d) - 1)).to(torch.long)
+            for d in range(max_depth)
+        ]
 
-        for d in range(max_depth):
-            # Compute node index at this depth
-            if d == 0:
-                idx = torch.zeros((nfeatsets, N), dtype=torch.long, device=dev)
-            else:
-                base = (1 << d) - 1
-                idx = (LF64[:, d - 1, :] + base).to(torch.long)  # [F, N]
+        # Stack -> [nfeatsets, D, N] -> flatten depth*N -> [nfeatsets, D*N]
+        # then expand lane axis -> [nfeatsets, 32, D*N]
+        idx_flat   = torch.stack(idx_parts, dim=1).reshape(nfeatsets, max_depth * N)
+        idx_expand = idx_flat.unsqueeze(1).expand(nfeatsets, 32, max_depth * N)
 
-            # Accumulate histograms for each lane
-            # We need to scatter per feature-set and per lane
-            # idx: [F, N], V: [F, 32, N], Y_b: [1, 1, N]
-            for fs in range(nfeatsets):
-                idx_fs = idx[fs, :]  # [N]
-                V_fs = V[fs, :, :]   # [32, N]
-                for lane in range(32):
-                    V_lane = V_fs[lane, :]  # [N]
-                    H_sum[fs, :, lane].scatter_add_(0, idx_fs, V_lane * Y64)
-                    H_cnt[fs, :, lane].scatter_add_(0, idx_fs, V_lane)
+        # Repeat V and Y-weighted V across the depth axis (nodes are disjoint per depth)
+        Vy     = V * Y64.view(1, 1, N)       # [nfeatsets, 32, N]
+        V_rep  = V.repeat(1, 1, max_depth)    # [nfeatsets, 32, D*N]
+        Vy_rep = Vy.repeat(1, 1, max_depth)   # [nfeatsets, 32, D*N]
 
-        # Stack channels: [F, nodes, 2, 32]
-        H = torch.stack([H_sum, H_cnt], dim=2).contiguous()
+        # H[:, :, ch, :] is [nfeatsets, nodes_tot, 32]; permute to [nfeatsets, 32, nodes_tot]
+        # so scatter dim 2 aligns with nodes_tot, matching idx_expand.
+        H[:, :, 0, :].permute(0, 2, 1).scatter_add_(2, idx_expand, Vy_rep)
+        H[:, :, 1, :].permute(0, 2, 1).scatter_add_(2, idx_expand, V_rep)
+
         return H
 
     def cut(
@@ -885,7 +881,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
     def h_des(self,
             XS: torch.Tensor,   # [K1, 32*M] uint32/int32  (padded to Np=32*M)
             Y:  torch.Tensor,   # [N] int16
-            LF: torch.Tensor,   # [K1, Dm, N] uint8 depth-local prefixes
+            LF: torch.Tensor,   # [K1, Dm, N] uint16 depth-local prefixes
             max_depth: int,
             era_bounds: torch.Tensor | None = None  # [E] int32 (exclusive ends; last==N)
             ) -> torch.Tensor:

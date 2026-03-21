@@ -48,13 +48,13 @@ static __device__ __forceinline__ void flush_node_reg(
 // ---------------- Kernel (using depth-local prefixes) ----------------
 // XS: [K1, cols_32M] (cols_32M = 32*M, padded)
 // Y : [N] int16 (grad)
-// LF: [K1, Dm, N] uint8 depth-local prefixes
+// LF: [K1, Dm, N] uint16 depth-local prefixes
 // era_ends: [E] int32 (exclusive ends), era_ends[E-1]==N
 // H : [K1, E, nodes, 2, 32] int64  (sum, count) per lane
 __global__ void _h_des_sm(
     const uint32_t* __restrict__ XS,
     const int16_t* __restrict__ Y,
-    const uint8_t* __restrict__ LF,
+    const uint16_t* __restrict__ LF,
     const int32_t* __restrict__ era_ends,
     int64_t* __restrict__ H,
     int K1, int cols_32M, int N, int Dm, int E, int max_depth,
@@ -82,7 +82,7 @@ __global__ void _h_des_sm(
     // Lane-local loads for this tile
     const int jj_lane = base + lane;
     int32_t y_lane = 0;
-    uint8_t prefix_bits[16]; // max_depth <= 16
+    uint16_t prefix_bits[16]; // max_depth <= 16
     if (jj_lane < N) {
       y_lane = (int32_t)Y[jj_lane];
       // Load depth-local prefixes for this sample
@@ -169,7 +169,7 @@ __global__ void _h_des_sm(
         const int32_t yk = __shfl_sync(mask, y_lane, src_lane);
 
         // Shuffle depth-local prefixes for sample k
-        uint8_t bits_k[16];
+        uint16_t bits_k[16];
         for (int d = 0; d < Dm && d < 16; ++d) {
           bits_k[d] = __shfl_sync(mask, prefix_bits[d], src_lane);
         }
@@ -276,7 +276,7 @@ static inline void infer_grid_stride_des(
 torch::Tensor h_des(
     torch::Tensor XS,        // [K1, cols_32M] (uint32/int32)
     torch::Tensor Y,         // [N] int16
-    torch::Tensor LF,        // [K1, Dm, N] uint8 depth-local prefixes
+    torch::Tensor LF,        // [K1, Dm, N] uint16 depth-local prefixes
     torch::Tensor era_ends,  // [E] int32 (exclusive ends)
     int max_depth)
 {
@@ -285,10 +285,10 @@ torch::Tensor h_des(
   TORCH_CHECK(Y.scalar_type()==torch::kInt16, "Y must be int16.");
   TORCH_CHECK(XS.scalar_type()==torch::kUInt32 || XS.scalar_type()==torch::kInt32,
               "XS must be uint32/int32.");
-  TORCH_CHECK(LF.scalar_type()==torch::kByte, "LF must be uint8.");
+  TORCH_CHECK(LF.scalar_type()==torch::kUInt16, "LF must be uint16.");
   TORCH_CHECK(LF.dim()==3 && XS.dim()==2 && Y.dim()==1, "Shapes: XS[K1,cols], Y[N], LF[K1,Dm,N].");
-  TORCH_CHECK(max_depth>0 && max_depth<=8,
-              "h_des supports max_depth <= 8 (nodes <= 255).");
+  TORCH_CHECK(max_depth>0 && max_depth<=16,
+              "h_des supports max_depth <= 16.");
 
   const int K1       = (int)XS.size(0);
   const int cols_32M = (int)XS.size(1);
@@ -339,7 +339,7 @@ torch::Tensor h_des(
   cudaFuncSetAttribute(_h_des_sm, cudaFuncAttributeMaxDynamicSharedMemorySize,
                        (int)smem_high);
   _h_des_sm<<<grid, block, smem_high, stream.stream()>>>(
-      XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint8_t>(),
+      XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint16_t>(),
       era_i32.data_ptr<int32_t>(), H.data_ptr<int64_t>(),
       K1, cols_32M, N, Dm, E, max_depth,
       warps_per_block, stride, nodes_total);
