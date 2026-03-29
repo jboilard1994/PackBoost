@@ -1,3 +1,5 @@
+
+docs
 .env
 venv
 docs
@@ -22,7 +24,6 @@ packboost/_backend.*
 .ipynb_checkpoints/
 
 # IDE metadata
-.vscode/
 .idea/
 *.swp
 
