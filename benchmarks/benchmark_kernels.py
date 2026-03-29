@@ -115,11 +115,10 @@ class KernelBenchmark:
         self.P = torch.randint(-1000, 1000, (self.N,),
                                dtype=torch.int32, device=self.device)
 
-        # Gradients and leaf-encoding (will be computed by prep_vars)
+        # Gradients (will be computed by prep_vars)
         self.G = torch.zeros(self.N, dtype=torch.int16, device=self.device)
-        self.LE = None
 
-        # Branch bits (simulated tree paths)
+        # Branch bits (simulated tree paths) - [K0, Dm, N] uint8
         self.L_old = torch.randint(0, 2, (self.K0, self.Dm, self.N),
                                    dtype=torch.uint8, device=self.device)
         self.L_new = torch.zeros_like(self.L_old)
@@ -228,17 +227,13 @@ class KernelBenchmark:
         self.benchmark_kernel("et_sample_1b", run, warmup, iterations, data_bytes)
 
     def bench_prep_vars(self, warmup: int = 5, iterations: int = 100):
-        """Benchmark prep_vars kernel"""
-        try:
-            from packboost.cuda import kernels
-        except ImportError:
-            return
+        """Benchmark prep_vars (pure torch: compute quantized gradients)"""
 
         def run():
-            self.LE, self.G = kernels.prep_vars(self.L_old, self.Y, self.P)
+            self.G = self.pack.prep_vars(self.Y, self.P)
 
-        # Data: Read L, Y, P, Write LE, G
-        data_bytes = self.K0 * self.Dm * self.N + self.N * 4 * 2 + self.N * 2
+        # Data: Read Y, P (int32), Write G (int16)
+        data_bytes = self.N * 4 * 2 + self.N * 2
 
         self.benchmark_kernel("prep_vars", run, warmup, iterations, data_bytes)
 
@@ -249,19 +244,16 @@ class KernelBenchmark:
         except ImportError:
             return
 
-        # LE must be computed by prep_vars first (produces uint16/32/64)
-        if self.LE is None:
-            self.LE, self.G = kernels.prep_vars(self.L_old, self.Y, self.P)
-
-        self.LF = torch.empty(self.K1, self.LE.shape[1], dtype=self.LE.dtype,
-                             device=self.device)
+        # LF: [K1, Dm, N] uint16 — depth-local prefix codes per feature-set
+        self.LF = torch.empty((self.K1, self.Dm, self.N), dtype=torch.uint16,
+                              device=self.device)
 
         def run():
-            kernels.repack_trees_for_features(self.FST, self.LE, self.LF, 0)
+            kernels.repack_trees_for_features(self.FST, self.L_old, self.LF, 0)
 
-        # Data: Read FST, LE, Write LF
+        # Data: Read FST, L_old, Write LF
         data_bytes = (self.K1 * self.max_depth +
-                     self.LE.nelement() * self.LE.element_size() +
+                     self.L_old.nelement() * self.L_old.element_size() +
                      self.LF.nelement() * self.LF.element_size())
 
         self.benchmark_kernel("repack", run, warmup, iterations, data_bytes)
@@ -273,12 +265,12 @@ class KernelBenchmark:
         except ImportError:
             return
 
-        # Need G, LE first
+        # Need G first
         if self.G.sum() == 0:
-            self.LE, self.G = kernels.prep_vars(self.L_old, self.Y, self.P)
+            self.G = self.pack.prep_vars(self.Y, self.P)
 
         def run():
-            self.H0 = kernels.h0_sm_butterfly(self.G, self.LE, self.max_depth)
+            self.H0 = kernels.h0_sm_butterfly(self.G, self.L_old, self.max_depth)
 
         # Data: Read G, L_old, Write H0
         nodes = 1 << self.max_depth
@@ -299,9 +291,9 @@ class KernelBenchmark:
         if self.XS is None:
             self.XB = kernels.encode_cuts(self.X_continuous)
             self.XS = self.pack.et_sample_1b(self.XB, self.Fsch, 0)
-            self.LE, self.G = kernels.prep_vars(self.L_old, self.Y, self.P)
-            self.LF = torch.empty(self.K1, self.LE.shape[1], dtype=self.LE.dtype, device=self.device)
-            kernels.repack_trees_for_features(self.FST, self.LE, self.LF, 0)
+            self.G = self.pack.prep_vars(self.Y, self.P)
+            self.LF = torch.empty((self.K1, self.Dm, self.N), dtype=torch.uint16, device=self.device)
+            kernels.repack_trees_for_features(self.FST, self.L_old, self.LF, 0)
 
         def run():
             self.H = kernels.h_sm(self.XS, self.G, self.LF, self.max_depth)
@@ -390,13 +382,13 @@ class KernelBenchmark:
         if self.XS is None:
             self.XS = self.pack.et_sample_1b(self.XB, self.Fsch, 0)
         if self.G.sum() == 0:
-            self.LE, self.G = kernels.prep_vars(self.L_old, self.Y, self.P)
+            self.G = self.pack.prep_vars(self.Y, self.P)
         if self.LF is None:
-            self.LF = torch.empty(self.K1, self.LE.shape[1], dtype=self.LE.dtype, device=self.device)
-            kernels.repack_trees_for_features(self.FST, self.LE, self.LF, 0)
+            self.LF = torch.empty((self.K1, self.Dm, self.N), dtype=torch.uint16, device=self.device)
+            kernels.repack_trees_for_features(self.FST, self.L_old, self.LF, 0)
 
         self.H = kernels.h_sm(self.XS, self.G, self.LF, self.max_depth)
-        self.H0 = kernels.h0_sm_butterfly(self.G, self.LE, self.max_depth)
+        self.H0 = kernels.h0_sm_butterfly(self.G, self.L_old, self.max_depth)
 
     def run_all(self, warmup: int = 5, iterations: int = 100):
         """Run all benchmarks in pipeline order"""
