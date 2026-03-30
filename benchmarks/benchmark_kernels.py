@@ -90,7 +90,7 @@ class KernelBenchmark:
         # Setup parameters
         self.K0 = 8  # Tree folds
         self.K1 = 64  # Feature sets (32 features each = 2048 total)
-        self.max_depth = 5
+        self.max_depth = 8
         self.Dm = self.max_depth - 1
         self.nodes = (1 << self.max_depth) - 1
         self.M = (N + 31) // 32  # 32-bit words for bit packing
