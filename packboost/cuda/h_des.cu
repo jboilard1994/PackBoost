@@ -45,16 +45,16 @@ static __device__ __forceinline__ void flush_node_reg(
 }
 
 
-// ---------------- Kernel (using depth-local prefixes) ----------------
+// ---------------- Kernel (using branch bits) ----------------
 // XS: [K1, cols_32M] (cols_32M = 32*M, padded)
 // Y : [N] int16 (grad)
-// LF: [K1, Dm, N] uint16 depth-local prefixes
+// LF: [K1, Dm, N] uint8 branch bits
 // era_ends: [E] int32 (exclusive ends), era_ends[E-1]==N
 // H : [K1, E, nodes, 2, 32] int64  (sum, count) per lane
 __global__ void _h_des_sm(
     const uint32_t* __restrict__ XS,
     const int16_t* __restrict__ Y,
-    const uint16_t* __restrict__ LF,
+    const uint8_t* __restrict__ LF,
     const int32_t* __restrict__ era_ends,
     int64_t* __restrict__ H,
     int K1, int cols_32M, int N, int Dm, int E, int max_depth,
@@ -82,16 +82,16 @@ __global__ void _h_des_sm(
     // Lane-local loads for this tile
     const int jj_lane = base + lane;
     int32_t y_lane = 0;
-    uint16_t prefix_bits[16]; // max_depth <= 16
+    uint8_t branch_bits[16]; // max_depth <= 16
     if (jj_lane < N) {
       y_lane = (int32_t)Y[jj_lane];
-      // Load depth-local prefixes for this sample
+      // Load branch bits for this sample
       for (int d = 0; d < Dm && d < 16; ++d) {
         const size_t off = ((static_cast<size_t>(feat_set) * static_cast<size_t>(Dm)) + static_cast<size_t>(d)) * static_cast<size_t>(N) + static_cast<size_t>(jj_lane);
-        prefix_bits[d] = LF[off];
+        branch_bits[d] = LF[off];
       }
     } else {
-      for (int d = 0; d < 16; ++d) prefix_bits[d] = 0;
+      for (int d = 0; d < 16; ++d) branch_bits[d] = 0;
     }
 
     // 32-bit feature word for this lane
@@ -164,22 +164,26 @@ __global__ void _h_des_sm(
         const int v = (int)(bits & 1u);
         bits >>= 1;
 
-        // broadcast label & depth-local prefixes of the kth column
+        // broadcast label & branch bits of the kth column
         const int src_lane = k;
         const int32_t yk = __shfl_sync(mask, y_lane, src_lane);
 
-        // Shuffle depth-local prefixes for sample k
-        uint16_t bits_k[16];
+        // Shuffle branch bits for sample k
+        uint8_t bits_k[16];
         for (int d = 0; d < Dm && d < 16; ++d) {
-          bits_k[d] = __shfl_sync(mask, prefix_bits[d], src_lane);
+          bits_k[d] = __shfl_sync(mask, branch_bits[d], src_lane);
         }
 
         // d = 0 (root)
         if (v) p0 = add_pack(p0, pack_sc((int)yk, 1));
 
+        // Build node prefix incrementally
+        unsigned node_prefix = 0;
+
         // d = 1
         if (max_depth > 1) {
-          unsigned tk1 = (Dm > 0) ? bits_k[0] : 0u;
+          unsigned tk1 = (Dm > 0) ? bits_k[0] : 0;
+          node_prefix = tk1;
           if (v) {
             (tk1 == 0u ? p10 : p11) = add_pack((tk1 == 0u ? p10 : p11), pack_sc((int)yk, 1));
           }
@@ -187,7 +191,10 @@ __global__ void _h_des_sm(
 
         // d = 2
         if (max_depth > 2) {
-          unsigned tk2 = (Dm > 1) ? bits_k[1] : 0u;
+          if (Dm > 1) {
+            node_prefix = (node_prefix << 1) | bits_k[1];
+          }
+          unsigned tk2 = node_prefix;
           if (v) {
             if      (tk2 == 0u) p20 = add_pack(p20, pack_sc((int)yk, 1));
             else if (tk2 == 1u) p21 = add_pack(p21, pack_sc((int)yk, 1));
@@ -199,9 +206,11 @@ __global__ void _h_des_sm(
         // d >= 3 -> accumulate in shared
         #pragma unroll
         for (int d = 3; d < max_depth; ++d) {
+          if (d - 1 < Dm) {
+            node_prefix = (node_prefix << 1) | bits_k[d - 1];
+          }
           const unsigned to = (1u << d) - 1u;
-          const unsigned tk = (d - 1 < Dm) ? bits_k[d - 1] : 0u;
-          const int node = (int)to + (int)tk;
+          const int node = (int)to + (int)node_prefix;
           const int idx = node - 7;
           if (v) {
             atomicAdd(&sh_high[(idx * 2 + 0) * 32 + lane], (int)yk);
@@ -276,7 +285,7 @@ static inline void infer_grid_stride_des(
 torch::Tensor h_des(
     torch::Tensor XS,        // [K1, cols_32M] (uint32/int32)
     torch::Tensor Y,         // [N] int16
-    torch::Tensor LF,        // [K1, Dm, N] uint16 depth-local prefixes
+    torch::Tensor LF,        // [K1, Dm, N] uint8 branch bits
     torch::Tensor era_ends,  // [E] int32 (exclusive ends)
     int max_depth)
 {
@@ -285,10 +294,10 @@ torch::Tensor h_des(
   TORCH_CHECK(Y.scalar_type()==torch::kInt16, "Y must be int16.");
   TORCH_CHECK(XS.scalar_type()==torch::kUInt32 || XS.scalar_type()==torch::kInt32,
               "XS must be uint32/int32.");
-  TORCH_CHECK(LF.scalar_type()==torch::kUInt16, "LF must be uint16.");
+  TORCH_CHECK(LF.scalar_type()==torch::kByte, "LF must be uint8.");
   TORCH_CHECK(LF.dim()==3 && XS.dim()==2 && Y.dim()==1, "Shapes: XS[K1,cols], Y[N], LF[K1,Dm,N].");
-  TORCH_CHECK(max_depth>0 && max_depth<=16,
-              "h_des supports max_depth <= 16.");
+  TORCH_CHECK(max_depth>0 && max_depth<=8,
+              "h_des supports max_depth <= 8 (nodes <= 255).");
 
   const int K1       = (int)XS.size(0);
   const int cols_32M = (int)XS.size(1);
@@ -339,7 +348,7 @@ torch::Tensor h_des(
   cudaFuncSetAttribute(_h_des_sm, cudaFuncAttributeMaxDynamicSharedMemorySize,
                        (int)smem_high);
   _h_des_sm<<<grid, block, smem_high, stream.stream()>>>(
-      XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint16_t>(),
+      XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint8_t>(),
       era_i32.data_ptr<int32_t>(), H.data_ptr<int64_t>(),
       K1, cols_32M, N, Dm, E, max_depth,
       warps_per_block, stride, nodes_total);
