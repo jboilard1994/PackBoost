@@ -807,10 +807,10 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 if depth == 0:
                     leaf_prev = torch.zeros(N, dtype=torch.int64, device=device)
                 else:
-                    # Build node from stored branch bits: sum 2^i * bit[i]
+                    # Build node from stored branch bits (MSB-first, matches h0/H)
                     leaf_prev = torch.zeros(N, dtype=torch.int64, device=device)
                     for i in range(depth):
-                        leaf_prev |= (L_old[f, i].to(torch.int64) << i)
+                        leaf_prev = (leaf_prev << 1) | L_old[f, i].to(torch.int64)
 
                 lo = leaf_prev + ((1 << depth) - 1)
 
