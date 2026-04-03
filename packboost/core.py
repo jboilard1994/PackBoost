@@ -339,12 +339,13 @@ class PackBoost(BaseEstimator, RegressorMixin):
         P  = torch.zeros(Np, dtype=torch.int32, device=device)
         D  = int(self.max_depth)
         Dm = max(D - 1, 0)
-        leaf_dtype = (torch.uint8 if D <= 8 else torch.int16)
+        leaf_dtype = (torch.uint8 if D <= 8 else torch.uint16)
         L  = torch.zeros((self.nfolds, Dm, Np), dtype=leaf_dtype, device=device)
         Ln = torch.zeros_like(L)
 
         del X_t
-        torch.cuda.empty_cache()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         # --- 3) walk trees round-by-round ---
         for k in range(int(self.tree_set)):
@@ -411,7 +412,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         out_dtype = torch.uint64 if Dm>8 else (torch.uint32 if Dm>6 else torch.uint16)
         LE = LE.to(out_dtype)
 
-        g = (Y.to(torch.int32) - P.to(torch.int32)) >> 20
+        g = (Y.to(torch.int64) - P.to(torch.int64)) >> 20
         G = g.clamp_(-32767, 32767).to(torch.int16)
 
         return LE.contiguous(), G.contiguous()
@@ -862,7 +863,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                     else:
                         raise AssertionError("L_new must be uint8 or uint16")
 
-                add_idx = (2 * lo + 1 + x).to(torch.long)
+                add_idx = (2 * lo + 1 - x).to(torch.long)
                 add_idx=torch.clamp(add_idx, max=max_idx)
                 P.add_(V[tree_set, f].gather(0, add_idx))
 
