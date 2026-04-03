@@ -219,10 +219,10 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
 
             # (b) compute gradients (no triangular packing)
-            G = self.prep_vars(Y_i32, P)  # G: int16
+            G, LE = self.prep_vars(Y_i32, P, L_old)  # G: int16, LE: uint16 path-encoded
 
-            # (c) repack by feature schedule -> LF [nfeatsets, Dm, N]
-            LF = self.repack(FST, L_old, t).contiguous()
+            # (c) repack LE by feature schedule -> LF [nfeatsets, N]
+            LF = self.repack(FST, LE, t).contiguous()
 
             # (d) histograms & (e) choose cuts
             if use_des:
@@ -281,7 +281,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                     pass
 
             # free big temporaries ASAP
-            del XS, G, LF
+            del XS, G, LE, LF
             if device.type == "cuda" and (t % 256 == 255):
                 torch.cuda.empty_cache()
 
@@ -390,13 +390,28 @@ class PackBoost(BaseEstimator, RegressorMixin):
         Fs = Fsch[round].view(nfeatsets, 32).to(device=X.device, dtype=torch.long)
         return X.to(torch.int32)[Fs, :].transpose(1, 2).contiguous().view(nfeatsets, X.shape[1] * 32).to(torch.uint32)
 
-    def prep_vars(self, Y: torch.Tensor, P: torch.Tensor):
-        """Compute quantized gradients only (no triangular packing)."""
+    def prep_vars(self, Y: torch.Tensor, P: torch.Tensor, L_old: torch.Tensor):
+        """Compute quantized gradients and encode leaf paths.
+
+        Returns
+        -------
+        G  : [N] int16  – quantized residual gradients
+        LE : [nfolds, N] uint16 – path encoding of L_old;
+             bit d is the branch taken at depth d (bit 0 = depth 0)
+        """
         # Compute quantized residuals (use int64 to avoid int32 overflow on Q30 diff)
         g = (Y.to(torch.int64) - P.to(torch.int64)) >> 20
         G = g.clamp_(-(1 << 15), (1 << 15) - 1).to(torch.int16)
 
-        return G.contiguous()
+        # Encode L_old paths: LE[f, n] bit d = branch taken at depth d
+        # L_old: [nfolds, Dm, N] uint8
+        nfolds, Dm, N = L_old.shape
+        LE = torch.zeros((nfolds, N), dtype=torch.int32, device=L_old.device)
+        for d in range(Dm):
+            LE |= (L_old[:, d, :].to(torch.int32) << d)
+        LE = LE.to(torch.uint16)
+
+        return G.contiguous(), LE.contiguous()
 
 
     def h0(self, G: torch.Tensor, L_old: torch.Tensor, max_depth: int) -> torch.Tensor:
@@ -443,58 +458,34 @@ class PackBoost(BaseEstimator, RegressorMixin):
         return H0
 
     def repack(self,
-            FST: torch.Tensor,     # [nsets, nfeatsets, max_depth], uint8
-            L_old: torch.Tensor,   # [nfolds, Dm, N], uint8 branch bits
+            FST: torch.Tensor,  # [nsets, nfeatsets, max_depth], uint8
+            LE: torch.Tensor,   # [nfolds, N], uint16 path-encoded
             tree_set: int) -> torch.Tensor:
         """
-        Returns LF: [nfeatsets, Dm, N] with explicit branch bits.
-        LF[fs, d, :] = L_old[FST[tree_set, fs, d+1], d, :] for d in 0..Dm-1
+        Returns LEF: [nfeatsets, N] uint16 — LE repacked by feature schedule.
+        LEF[fs, :] = LE[FST[tree_set, fs, 0], :]
         """
-        # --- Fast path: GPU kernel ---
-        if FST.is_cuda and L_old.is_cuda and torch.cuda.is_available():
-            nfeatsets = FST.shape[1]
-            Dm, N = L_old.shape[1], L_old.shape[2]
-            LF = torch.empty((nfeatsets, Dm, N), dtype=L_old.dtype, device=L_old.device)
-            kernels.repack_trees_for_features(
-                FST.contiguous(), L_old.contiguous(), LF, int(tree_set)
-            )
-            return LF.contiguous()
-
-        # --- CPU vectorized path ---
         assert FST.dim() == 3, "FST must be [nsets, nfeatsets, max_depth]"
-        assert L_old.dim() == 3, "L_old must be [nfolds, Dm, N]"
+        assert LE.dim() == 2, "LE must be [nfolds, N]"
 
-        nsets, nfeatsets, max_depth = FST.shape
-        nfolds, Dm, N = L_old.shape
-        device = L_old.device
+        which_fold = FST[tree_set, :, 0].to(torch.long)  # [nfeatsets]
+        LEF = LE.to(torch.int32)[which_fold, :].to(torch.uint16)  # [nfeatsets, N]
 
-        # LF[fs, d, :] = L_old[FST[tree_set, fs, d+1], d, :]
-        # For each feature-set fs and depth d, gather from the appropriate fold
-        LF = torch.empty((nfeatsets, Dm, N), dtype=L_old.dtype, device=device)
-
-        for d in range(Dm):
-            # which_fold[fs] = FST[tree_set, fs, d+1]
-            which_fold = FST[tree_set, :, d + 1].to(torch.long)  # [nfeatsets]
-            # Gather: LF[fs, d, :] = L_old[which_fold[fs], d, :]
-            for fs in range(nfeatsets):
-                fold = which_fold[fs].item()
-                LF[fs, d, :] = L_old[fold, d, :]
-
-        return LF.contiguous()
+        return LEF.contiguous()
     
 
     def H(self, XS: torch.Tensor, Y: torch.Tensor, LF: torch.Tensor, max_depth: int) -> torch.Tensor:
         """
         XS : [nfeatsets, 32*M] (uint32/int32), packed features
         Y  : [N]               (int16), gradient
-        LF : [nfeatsets, Dm, N] (uint8), explicit branch bits per depth
+        LF : [nfeatsets, N]   (uint16), path-encoded (bit d = branch at depth d)
         max_depth: int
         Returns:
         H: [nfeatsets, (1<<max_depth)-1, 2, 32] int64
             last dim = lane (0..31); channel 0=sum(y*v), 1=count(v)
         """
         nfeatsets, cols_32M = XS.shape
-        Dm = LF.shape[1]
+        Dm = max(max_depth - 1, 0)
         N = int(Y.shape[0])
         nodes_tot = (1 << max_depth) - 1
 
@@ -516,7 +507,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
         # Casts
         Y64  = Y.to(TORCH_INT64, copy=False).contiguous()  # [N]
-        LF64 = LF.to(TORCH_INT64, copy=False).contiguous()  # [nfeatsets, Dm, N]
+        LF64 = LF.to(TORCH_INT64, copy=False).contiguous()  # [nfeatsets, N]
         XS64 = XS.to(TORCH_INT64, copy=False).contiguous().view(nfeatsets, M, 32)
 
         # Build V = bit-unpacked features per lane
@@ -555,7 +546,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
             # Update node_prefix for next depth
             if d < Dm:
-                branch_bit = LF64[:, d, :]  # [F, N]
+                branch_bit = (LF64 >> d) & 1  # [F, N]
                 node_prefix = (node_prefix << 1) | branch_bit
 
         # Stack channels: [F, nodes, 2, 32]
@@ -891,7 +882,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
     def h_des(self,
             XS: torch.Tensor,   # [K1, 32*M] uint32/int32  (padded to Np=32*M)
             Y:  torch.Tensor,   # [N] int16
-            LF: torch.Tensor,   # [K1, Dm, N] uint8 branch bits
+            LF: torch.Tensor,   # [K1, N] uint16 path-encoded (bit d = branch at depth d)
             max_depth: int,
             era_bounds: torch.Tensor | None = None  # [E] int32 (exclusive ends; last==N)
             ) -> torch.Tensor:
@@ -900,7 +891,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         CPU parity masks XS per-era with 32-bit word masks and uses branch-bit traversal.
         """
         K1, cols_32M = int(XS.size(0)), int(XS.size(1))
-        Dm = LF.shape[1]
+        Dm = max(max_depth - 1, 0)
         N = int(Y.size(0))
         if era_bounds is None:
             era_ends = torch.tensor([N], device=XS.device, dtype=torch.int32)
@@ -926,7 +917,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         # Prepare base casted views
         XS64 = XS.to(TORCH_INT64, copy=False).view(K1, M, 32)  # [K1, M, 32]
         Y64  = Y.to(TORCH_INT64,  copy=False)                  # [N]
-        LF64 = LF.to(TORCH_INT64, copy=False)                  # [K1, Dm, N]
+        LF64 = LF.to(TORCH_INT64, copy=False)                  # [K1, N]
 
         # era starts from [0] + era_ends[:-1]
         E = int(era_ends.numel())
@@ -997,7 +988,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
                 # Update node_prefix for next depth
                 if d < Dm:
-                    branch_bit = LF64[:, d, :]  # [K1, N]
+                    branch_bit = (LF64 >> d) & 1  # [K1, N]
                     node_prefix = (node_prefix << 1) | branch_bit
 
             # Stack into He (add channel dim)
