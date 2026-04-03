@@ -101,12 +101,13 @@ static void launch_advpred(
         V.data_ptr<int32_t>(),
         reinterpret_cast<const uint16_t*>(I.data_ptr<uint16_t>()),
         N, R, M, K0, Dm, nodes, rounds, tree_set, stride);
-  } else if (L_old.scalar_type() == at::kShort && L_new.scalar_type() == at::kShort) {
+  } else if ((L_old.scalar_type() == at::kShort || L_old.scalar_type() == at::kUInt16) &&
+             (L_new.scalar_type() == at::kShort || L_new.scalar_type() == at::kUInt16)) {
     advance_and_predict_kernel<uint16_t><<<grid, block, 0, stream.stream()>>>(
         P.data_ptr<int32_t>(),
         reinterpret_cast<const uint32_t*>(X.data_ptr()),
-        L_old.data_ptr<uint16_t>(),
-        L_new.data_ptr<uint16_t>(),
+        reinterpret_cast<uint16_t*>(L_old.data_ptr()),
+        reinterpret_cast<uint16_t*>(L_new.data_ptr()),
         V.data_ptr<int32_t>(),
         reinterpret_cast<const uint16_t*>(I.data_ptr<uint16_t>()),
         N, R, M, K0, Dm, nodes, rounds, tree_set, stride);

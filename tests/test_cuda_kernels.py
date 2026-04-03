@@ -69,6 +69,7 @@ def test_prep_vars_matches_cpu_reference():
         out_LE, out_G = pack_gpu.prep_vars(L.cuda(), Y.cuda(), P.cuda())
         torch.cuda.synchronize()
 
+        assert ref_LE.dtype == torch.uint64
         assert out_LE.dtype == ref_LE.dtype, f"dtype mismatch: {out_LE.dtype} vs {ref_LE.dtype}"
         torch.testing.assert_close(out_LE.cpu(), ref_LE, msg=f"LE mismatch K={K} Dm={Dm} N={N}")
         torch.testing.assert_close(out_G.cpu(),  ref_G,  msg=f"G mismatch  K={K} Dm={Dm} N={N}")
@@ -100,14 +101,8 @@ def test_h0_matches_cpu_reference():
         # CPU prep_vars → reference LE, G (signed storage OK)
         ref_LE, ref_G = pack_cpu.prep_vars(L, Y, P)
 
-        # Also create an unsigned-storage variant to exercise launcher branches
-        bits = D * (D - 1) // 2
-        if D <= 6:
-            LE_unsigned = ref_LE.to(torch.uint16)
-        elif D <= 8:
-            LE_unsigned = ref_LE.to(torch.uint32)
-        else:
-            LE_unsigned = ref_LE.to(torch.uint64)
+        # LE is always stored as uint64 now.
+        LE_unsigned = ref_LE.to(torch.uint64)
 
         for use_unsigned in (True,):
             LE_host = LE_unsigned if use_unsigned else ref_LE
@@ -158,7 +153,7 @@ def test_repack_matches_cpu_reference():
 
         Y = torch.zeros(N, dtype=torch.int32)
         P = torch.zeros(N, dtype=torch.int32)
-        LE, _ = pack_cpu.prep_vars(L, Y, P)  # dtype auto: u16/u32/u64 based on D
+        LE, _ = pack_cpu.prep_vars(L, Y, P)
 
         # Build FST: [nsets, nfeatsets, D], each depth is a shuffled tiling of [0..K-1]
         base = torch.arange(K, dtype=torch.uint8)
@@ -175,11 +170,13 @@ def test_repack_matches_cpu_reference():
         # CPU reference
         LF_ref = pack_cpu.repack(FST, LE, tree_set)
 
+        assert LE.dtype == torch.uint64
         # GPU output
         LF_out = pack_gpu.repack(FST.cuda(), LE.cuda(), tree_set)
         torch.cuda.synchronize()
 
         # Checks
+        assert LF_ref.dtype == torch.uint64
         assert LF_out.dtype == LF_ref.dtype, f"dtype mismatch: {LF_out.dtype} vs {LF_ref.dtype}"
         assert LF_out.shape == LF_ref.shape == (nfeatsets, N)
         torch.testing.assert_close(
@@ -215,7 +212,7 @@ def test_h_matches_cpu_reference():
         Y_raw  = torch.randint(lo, hi + 1, (N,), dtype=torch.int32)
         P_raw  = torch.randint(lo, hi + 1, (N,), dtype=torch.int32)
 
-        LE_ref, G_ref = pack_cpu.prep_vars(L_bits, Y_raw, P_raw)  # LE dtype auto (u16/u32/u64)
+        LE_ref, G_ref = pack_cpu.prep_vars(L_bits, Y_raw, P_raw)
 
         # --- Build LF via repack (Murky FST wiring) ---
         # FST: [nsets, nfeatsets, D], each depth is a shuffled tiling of [0..K-1]
@@ -230,7 +227,7 @@ def test_h_matches_cpu_reference():
                 FST[s, :, d] = row[perm]
         tree_set = (3 * K + 5) % nsets
 
-        LF_ref = pack_cpu.repack(FST, LE_ref, tree_set)  # [nfeatsets, N], dtype(u16/u32/u64)
+        LF_ref = pack_cpu.repack(FST, LE_ref, tree_set)
 
         # --- Make XS with enough columns to cover N samples (N <= 32*M) ---
         M = (N + 31) // 32

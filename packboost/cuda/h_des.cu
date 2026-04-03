@@ -45,10 +45,10 @@ static __device__ __forceinline__ void flush_node_reg(
 }
 
 
-// ---------------- Kernel (templated on LF dtype) ----------------
+// ---------------- Kernel (uint64 packed LF) ----------------
 // XS: [K1, cols_32M] (cols_32M = 32*M, padded), each entry is a 32-bit "lane" word
 // Y : [N] int16 (grad)
-// LF: [K1, N] (unsigned 16/32/64) packed leaf codes
+// LF: [K1, N] (uint64) packed leaf codes
 // era_ends: [E] int32 (exclusive ends), era_ends[E-1]==N
 // H : [K1, E, nodes, 2, 32] int64  (sum, count) per lane
 template <typename LF_T>
@@ -59,7 +59,8 @@ __global__ void _h_des_sm(
     const int32_t* __restrict__ era_ends,
     int64_t* __restrict__ H,
     int K1, int cols_32M, int N, int E, int max_depth,
-    int warps_per_block, int stride, int nodes_total)
+    int warps_per_block, int stride, int nodes_total,
+    int sh_cap)
 {
   const int feat_set   = blockIdx.x;
   const int warp_in_blk= threadIdx.x >> 5;     // 0..(warps_per_block-1)
@@ -68,10 +69,8 @@ __global__ void _h_des_sm(
 
   if (feat_set >= K1) return;
 
-  // Shared histogram for depths >=3 : shape [(nodes_total-7), 2, 32] (int32)
-  int n_ge3 = nodes_total - 7;
-  if (n_ge3 < 1) n_ge3 = 1;
-  extern __shared__ int sh_high[]; // [n_ge3 * 2 * 32] ints
+  // Shared histogram for depths >=3 (capped at sh_cap; overflow goes to global)
+  extern __shared__ int sh_high[];
 
   const unsigned mask = __ballot_sync(__activemask(), true);
 
@@ -83,11 +82,13 @@ __global__ void _h_des_sm(
     // Lane-local loads for this tile
     const int jj_lane = base + lane;
     int32_t  y_lane = 0;
-    uint32_t l32    = 0;
+    uint64_t l64    = 0;
     if (jj_lane < N) {
       y_lane = (int32_t)Y[jj_lane];
-      l32    = (uint32_t)((LF_T)LF[(size_t)feat_set * (size_t)N + (size_t)jj_lane]);
+      l64    = (uint64_t)((LF_T)LF[(size_t)feat_set * (size_t)N + (size_t)jj_lane]);
     }
+    const uint32_t l64_lo = static_cast<uint32_t>(l64);
+    const uint32_t l64_hi = static_cast<uint32_t>(l64 >> 32);
     // 32-bit feature word for this lane
     uint32_t xfd_local = 0u;
     if (jj_lane < cols_32M) {
@@ -139,7 +140,7 @@ __global__ void _h_des_sm(
       const int k1  = s_seg_end[seg];
 
       // zero shared high-depth histogram (this segment only)
-      for (int r = 0; r < n_ge3; ++r) {
+      for (int r = 0; r < sh_cap; ++r) {
         sh_high[(r * 2 + 0) * 32 + lane] = 0; // sum
         sh_high[(r * 2 + 1) * 32 + lane] = 0; // cnt
       }
@@ -161,7 +162,9 @@ __global__ void _h_des_sm(
         // broadcast label & leaf-code of the kth column
         const int src_lane = k;                 // lane id == column id
         const int32_t yk = __shfl_sync(mask, y_lane, src_lane);
-        uint32_t      lk = __shfl_sync(mask, l32,    src_lane);
+        // 64-bit warp shuffle via two 32-bit shuffles (supports depth > 8)
+        uint64_t      lk = ((uint64_t)__shfl_sync(mask, l64_hi, src_lane) << 32)
+                          | (uint64_t)__shfl_sync(mask, l64_lo, src_lane);
 
         // d = 0
         if (v) p0 = add_pack(p0, pack_sc((int)yk, 1));
@@ -181,18 +184,24 @@ __global__ void _h_des_sm(
           else                p23 = add_pack(p23, pack_sc((int)yk, 1));
         }
 
-        // d >= 3 -> accumulate in shared
+        // d >= 3: shared if idx < sh_cap, else global atomic spillover
         #pragma unroll
         for (int d = 3; d < 32; ++d) {
           if (d >= max_depth) break;
           const unsigned to  = (1u << d) - 1u;
-          const unsigned tkd = (lk & to); lk >>= d;
+          const unsigned tkd = (static_cast<unsigned>(lk) & to); lk >>= d;
           const int node = (int)to + (int)tkd;   // 7..nodes_total-1
           const int idx  = node - 7;
           if (v) {
-            // FIX 2: Use atomicAdd for safer updates to shared memory.
-            atomicAdd(&sh_high[(idx * 2 + 0) * 32 + lane], (int)yk); // sum
-            atomicAdd(&sh_high[(idx * 2 + 1) * 32 + lane], 1);       // cnt
+            if (idx < sh_cap) {
+              atomicAdd(&sh_high[(idx * 2 + 0) * 32 + lane], (int)yk); // sum
+              atomicAdd(&sh_high[(idx * 2 + 1) * 32 + lane], 1);       // cnt
+            } else {
+              atomicAdd(HptrE(H, nodes_total, E, feat_set, era, node, 0, lane),
+                        static_cast<unsigned long long>(static_cast<int64_t>((int)yk)));
+              atomicAdd(HptrE(H, nodes_total, E, feat_set, era, node, 1, lane),
+                        static_cast<unsigned long long>(static_cast<int64_t>(1)));
+            }
           }
         }
       } // k
@@ -210,11 +219,11 @@ __global__ void _h_des_sm(
       __syncthreads();
 
       // drain shared high-depth rows to global for this ERA
-      const int rows_per_warp = (n_ge3 + warps_per_block - 1) / warps_per_block;
+      const int rows_per_warp = (sh_cap + warps_per_block - 1) / warps_per_block;
       for (int rr = 0; rr < rows_per_warp; ++rr) {
-        const int idx = rows_per_warp * warp_in_blk + rr;   // 0..n_ge3-1
+        const int idx = rows_per_warp * warp_in_blk + rr;   // 0..sh_cap-1
         const int node = 7 + idx;
-        if (idx < n_ge3 && node < nodes_total) {
+        if (idx < sh_cap && node < nodes_total) {
           const int base = (idx * 2) * 32 + lane;
           const int64_t fsum = (int64_t)sh_high[base + 0];
           const int64_t csum = (int64_t)sh_high[base + 32];
@@ -263,7 +272,7 @@ static inline void infer_grid_stride_des(
 torch::Tensor h_des(
     torch::Tensor XS,        // [K1, cols_32M] (uint32/int32)
     torch::Tensor Y,         // [N] int16
-    torch::Tensor LF,        // [K1, N] uint16/uint32/uint64
+    torch::Tensor LF,        // [K1, N] uint64
     torch::Tensor era_ends,  // [E] int32 (exclusive ends)
     int max_depth)
 {
@@ -273,8 +282,8 @@ torch::Tensor h_des(
   TORCH_CHECK(XS.scalar_type()==torch::kUInt32 || XS.scalar_type()==torch::kInt32,
               "XS must be uint32/int32.");
   TORCH_CHECK(LF.dim()==2 && XS.dim()==2 && Y.dim()==1, "Shapes: XS[K1,cols], Y[N], LF[K1,N].");
-  TORCH_CHECK(max_depth>0 && max_depth<=8,
-              "h_des supports max_depth <= 8 (nodes <= 255).");
+  TORCH_CHECK(max_depth>0,
+              "max_depth must be > 0.");
 
   const int K1       = (int)XS.size(0);
   const int cols_32M = (int)XS.size(1);
@@ -300,14 +309,19 @@ torch::Tensor h_des(
                            .memory_format(c10::MemoryFormat::Contiguous));
 
   int n_ge3 = nodes_total - 7; if (n_ge3 < 1) n_ge3 = 1;
-  const size_t smem_high = (size_t)n_ge3 * 2 * 32 * sizeof(int);
 
   auto* prop = at::cuda::getCurrentDeviceProperties();
   size_t smem_cap = prop->sharedMemPerBlockOptin ?
                       (size_t)prop->sharedMemPerBlockOptin :
                       (size_t)prop->sharedMemPerBlock;
 
-  const int warps_per_block = choose_warps_that_fit(smem_high, smem_cap);
+  // Cap shared-memory histogram to what fits; overflow nodes use global atomics
+  int sh_cap = std::min(n_ge3, (int)(smem_cap / (2 * 32 * sizeof(int))));
+  if (sh_cap < 0) sh_cap = 0;
+  const size_t smem_bytes = (size_t)sh_cap * 2 * 32 * sizeof(int);
+
+  const int warps_per_block = ((size_t)n_ge3 * 2 * 32 * sizeof(int) <= smem_cap) ?
+                              choose_warps_that_fit((size_t)n_ge3 * 2 * 32 * sizeof(int), smem_cap) : 1;
   int blocks_per_feat = 0, stride = 0;
   infer_grid_stride_des(K1, cols_32M, warps_per_block, blocks_per_feat, stride);
 
@@ -317,34 +331,14 @@ torch::Tensor h_des(
   auto stream = at::cuda::getCurrentCUDAStream();
   const uint32_t* XS_ptr = reinterpret_cast<const uint32_t*>(XS.data_ptr());
 
-  const auto lf_dt = LF.scalar_type();
-  if (lf_dt == torch::kUInt16) {
-    cudaFuncSetAttribute(_h_des_sm<uint16_t>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         (int)smem_high);
-    _h_des_sm<uint16_t><<<grid, block, smem_high, stream.stream()>>>(
-      XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint16_t>(),
-      era_i32.data_ptr<int32_t>(), H.data_ptr<int64_t>(),
-      K1, cols_32M, N, E, max_depth,
-      warps_per_block, stride, nodes_total);
-  } else if (lf_dt == torch::kUInt32) {
-    cudaFuncSetAttribute(_h_des_sm<uint32_t>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         (int)smem_high);
-    _h_des_sm<uint32_t><<<grid, block, smem_high, stream.stream()>>>(
-      XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint32_t>(),
-      era_i32.data_ptr<int32_t>(), H.data_ptr<int64_t>(),
-      K1, cols_32M, N, E, max_depth,
-      warps_per_block, stride, nodes_total);
-  } else if (lf_dt == torch::kUInt64) {
-    cudaFuncSetAttribute(_h_des_sm<uint64_t>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         (int)smem_high);
-    _h_des_sm<uint64_t><<<grid, block, smem_high, stream.stream()>>>(
-      XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint64_t>(),
-      era_i32.data_ptr<int32_t>(), H.data_ptr<int64_t>(),
-      K1, cols_32M, N, E, max_depth,
-      warps_per_block, stride, nodes_total);
-  } else {
-    TORCH_CHECK(false, "LF must be uint16/uint32/uint64.");
-  }
+  TORCH_CHECK(LF.scalar_type() == torch::kUInt64, "LF must be uint64.");
+  cudaFuncSetAttribute(_h_des_sm<uint64_t>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       (int)smem_bytes);
+  _h_des_sm<uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
+    XS_ptr, Y.data_ptr<int16_t>(), LF.data_ptr<uint64_t>(),
+    era_i32.data_ptr<int32_t>(), H.data_ptr<int64_t>(),
+    K1, cols_32M, N, E, max_depth,
+    warps_per_block, stride, nodes_total, sh_cap);
 
   TORCH_CHECK(cudaGetLastError() == cudaSuccess, "h_des launch failed: ",
               cudaGetErrorString(cudaGetLastError()));

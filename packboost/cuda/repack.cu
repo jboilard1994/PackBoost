@@ -7,8 +7,8 @@
 using at::Tensor;
 
 // FST: [nsets, nfeatsets, max_depth],  uint8
-// LE : [nfolds, N],                    packed (uint16/uint32/uint64)
-// LF : [nfeatsets, N],                 packed (same as LE)
+// LE : [nfolds, N],                    packed (uint64)
+// LF : [nfeatsets, N],                 packed (uint64)
 // Parity with Murky's Numba kernel:
 //   - gridDim.x = ceil(nfeatsets/8)
 //   - gridDim.y = strides
@@ -90,8 +90,8 @@ __global__ void repack_trees_for_features_kernel(
 
 void repack_trees_for_features_cuda(
     const torch::Tensor& FST,     // uint8  [nsets, nfeatsets, max_depth]
-    const torch::Tensor& LE,      // u16/u32/u64 [nfolds, N]
-    torch::Tensor& LF,            // u16/u32/u64 [nfeatsets, N] (output, in-place fill)
+    const torch::Tensor& LE,      // uint64 [nfolds, N]
+    torch::Tensor& LF,            // uint64 [nfeatsets, N] (output, in-place fill)
     int64_t tree_set      // which set (round)
 ) {
     
@@ -117,54 +117,20 @@ void repack_trees_for_features_cuda(
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    switch (LE.scalar_type()) {
-        case torch::kUInt16: { // uint16
-            size_t trees_bytes = static_cast<size_t>(nfolds) * 32 * sizeof(uint16_t);
-            size_t smem = fst_bytes + trees_bytes;
-            repack_trees_for_features_kernel<uint16_t>
-                <<<grid, block, smem, stream>>>(
-                    FST.data_ptr<uint8_t>(),
-                    LE.data_ptr<uint16_t>(),
-                    LF.data_ptr<uint16_t>(),
-                    nsets, nfeatsets, max_depth, nfolds, N,
-                    static_cast<int>(tree_set),
-                    inner_stride
-                );
-            break;
-        }
-        case at::kInt: // NOTE: if you use signed int32, change your tensor to kUInt32
-        case at::kLong: // signed long not supported for bit packing here
-            break;
-        case torch::kUInt32: { // uint32
-            size_t trees_bytes = static_cast<size_t>(nfolds) * 32 * sizeof(uint32_t);
-            size_t smem = fst_bytes + trees_bytes;
-            repack_trees_for_features_kernel<uint32_t>
-                <<<grid, block, smem, stream>>>(
-                    FST.data_ptr<uint8_t>(),
-                    reinterpret_cast<const uint32_t*>(LE.data_ptr()),
-                    reinterpret_cast<uint32_t*>(LF.data_ptr()),
-                    nsets, nfeatsets, max_depth, nfolds, N,
-                    static_cast<int>(tree_set),
-                    inner_stride
-                );
-            break;
-        }
-        case torch::kUInt64: { // uint64
-            size_t trees_bytes = static_cast<size_t>(nfolds) * 32 * sizeof(uint64_t);
-            size_t smem = fst_bytes + trees_bytes;
-            repack_trees_for_features_kernel<uint64_t>
-                <<<grid, block, smem, stream>>>(
-                    FST.data_ptr<uint8_t>(),
-                    LE.data_ptr<uint64_t>(),
-                    LF.data_ptr<uint64_t>(),
-                    nsets, nfeatsets, max_depth, nfolds, N,
-                    static_cast<int>(tree_set),
-                    inner_stride
-                );
-            
-            break;
-        }
-        default:
-            TORCH_CHECK(false, "Unsupported packed dtype for LE/LF. Use uint16/uint32/uint64.");
-    }
+    TORCH_CHECK(LE.scalar_type() == torch::kUInt64,
+                "LE must be uint64 (got ", LE.scalar_type(), ")");
+    TORCH_CHECK(LF.scalar_type() == torch::kUInt64,
+                "LF must be uint64 (got ", LF.scalar_type(), ")");
+
+    size_t trees_bytes = static_cast<size_t>(nfolds) * 32 * sizeof(uint64_t);
+    size_t smem = fst_bytes + trees_bytes;
+    repack_trees_for_features_kernel<uint64_t>
+        <<<grid, block, smem, stream>>>(
+            FST.data_ptr<uint8_t>(),
+            LE.data_ptr<uint64_t>(),
+            LF.data_ptr<uint64_t>(),
+            nsets, nfeatsets, max_depth, nfolds, N,
+            static_cast<int>(tree_set),
+            inner_stride
+        );
 }

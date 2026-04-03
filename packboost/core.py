@@ -221,7 +221,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 XS = self.et_sample_1b(XB, Fsch_cpu, t).to(device)
 
             # (b) pack leaves & gradients (length N)
-            LE, G = self.prep_vars(L_old, Y_i32, P)  # LE: u16/u32/u64 ; G: int16
+            LE, G = self.prep_vars(L_old, Y_i32, P)  # LE: uint64 ; G: int16
 
             # (c) repack by feature schedule -> LF [nfeatsets, N]
             LF = self.repack(FST, LE, t).contiguous()
@@ -409,8 +409,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             field = (L[:, d-1].to(torch.int64) & ((1 << d) - 1))
             LE |= (field << off)
 
-        out_dtype = torch.uint64 if Dm>8 else (torch.uint32 if Dm>6 else torch.uint16)
-        LE = LE.to(out_dtype)
+        LE = LE.to(torch.uint64)
 
         g = (Y.to(torch.int64) - P.to(torch.int64)) >> 20
         G = g.clamp_(-32767, 32767).to(torch.int16)
@@ -449,7 +448,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
     def repack(self, 
             FST: torch.Tensor,     # [nsets, nfeatsets, max_depth], uint8
-            LE:  torch.Tensor,     # [nfolds, N], packed (same dtype used in prep_vars)
+            LE:  torch.Tensor,     # [nfolds, N], packed uint64
             tree_set: int) -> torch.Tensor:
         """
         Returns LF: [nfeatsets, N] with Murky-parity bit packing:
@@ -502,7 +501,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         """
         XS : [nfeatsets, 32*M] (uint32/int32), packed features
         Y  : [N]               (int32/int64), target/gradient
-        LF : [nfeatsets, N]    (uint16/uint32/uint64), path codes (Murky parity)
+        LF : [nfeatsets, N]    (uint64), path codes (Murky parity)
         max_depth: int (<= 7 for the SMEM variant on GPU)
         Returns:
         H: [nfeatsets, (1<<max_depth)-1, 2, 32] int64
@@ -872,7 +871,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         # -------- DES: H0 per-era (parents) --------
     def h0_des(self,
             G:  torch.Tensor,   # [N] int16
-            LE: torch.Tensor,   # [nfolds, N] (u16/u32/u64)
+            LE: torch.Tensor,   # [nfolds, N] (uint64)
             max_depth: int,
             era_bounds: torch.Tensor | None = None  # [E] int32 (exclusive ends; last==N)
             ) -> torch.Tensor:
@@ -928,7 +927,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
     def h_des(self,
             XS: torch.Tensor,   # [K1, 32*M] uint32/int32  (padded to Np=32*M)
             Y:  torch.Tensor,   # [N] int16
-            LF: torch.Tensor,   # [K1, N] (u16/u32/u64)
+            LF: torch.Tensor,   # [K1, N] (uint64)
             max_depth: int,
             era_bounds: torch.Tensor | None = None  # [E] int32 (exclusive ends; last==N)
             ) -> torch.Tensor:

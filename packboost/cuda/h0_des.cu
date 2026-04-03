@@ -168,6 +168,46 @@ __global__ void _h0_des_butterfly(
     }
 }
 
+// Global-atomic fallback for deep trees when shared memory is insufficient
+__global__ void _h0_des_global_atomic(
+    const std::int16_t*  __restrict__ G,
+    const std::uint64_t* __restrict__ LE,
+    const std::int32_t*  __restrict__ era_ends,
+    std::int64_t*        __restrict__ H0,   // [nfolds, nodes, n_eras, 2]
+    const int N, const int nfolds, const int n_eras,
+    const int max_depth, const int stride_per_warp,
+    const int nodes
+){
+    const int tree_set = blockIdx.x;
+    const int bi       = blockIdx.y;
+    const int lane     = threadIdx.x;
+    if (tree_set >= nfolds || lane >= 32) return;
+
+    for (int j = 0; j < stride_per_warp; ++j) {
+        const int jj = 32 * (stride_per_warp * bi + j) + lane;
+        if (jj >= N) break;
+
+        std::uint64_t lk = LE[(std::size_t)tree_set * N + jj];
+        const std::int64_t g = (std::int64_t)G[jj];
+
+        // linear scan for era
+        int era = 0;
+        while (era < n_eras - 1 && jj >= era_ends[era]) ++era;
+
+        for (int d = 0; d < max_depth; ++d) {
+            const unsigned to = (1u << d) - 1u;
+            const unsigned tk = (d == 0) ? 0 : static_cast<unsigned>(lk & to);
+            if (d > 0) lk >>= d;
+            const int node = (int)to + (int)tk;
+
+            // H0 layout: [nfolds, nodes, n_eras, 2]
+            const std::size_t base = (((std::size_t)tree_set * nodes + node) * n_eras + era) * 2;
+            atomicAdd_i64(H0 + base + 0, g);
+            atomicAdd_i64(H0 + base + 1, (std::int64_t)1);
+        }
+    }
+}
+
 // ---- Host launcher (pick strides like h0_sm_butterfly; NO n_eras in the grid) ----
 torch::Tensor h0_des_butterfly(
     torch::Tensor G,          // [N], int16, CUDA
@@ -232,32 +272,10 @@ torch::Tensor h0_des_butterfly(
     std::size_t smem_cap = prop->sharedMemPerBlockOptin
                            ? (std::size_t)prop->sharedMemPerBlockOptin
                            : (std::size_t)prop->sharedMemPerBlock;
-    TORCH_CHECK(smem_bytes <= smem_cap,
-        "h0_des_butterfly requires ", smem_bytes, "B shared memory, device allows ", smem_cap, "B.");
-
     auto stream = at::cuda::getCurrentCUDAStream();
-    const auto dt = LE.scalar_type();
+    TORCH_CHECK(LE.scalar_type() == c10::ScalarType::UInt64, "LE must be uint64.");
 
-    // Launch per LE dtype
-    if (dt == c10::ScalarType::UInt16) {
-        cudaFuncSetAttribute(_h0_des_butterfly<std::uint16_t>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
-        _h0_des_butterfly<std::uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
-            G.data_ptr<std::int16_t>(),
-            LE.data_ptr<std::uint16_t>(),
-            era_ends.data_ptr<std::int32_t>(),
-            H0.data_ptr<std::int64_t>(),
-            N, nfolds, n_eras, max_depth, stride_per_warp);
-    } else if (dt == c10::ScalarType::UInt32) {
-        cudaFuncSetAttribute(_h0_des_butterfly<std::uint32_t>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
-        _h0_des_butterfly<std::uint32_t><<<grid, block, smem_bytes, stream.stream()>>>(
-            G.data_ptr<std::int16_t>(),
-            LE.data_ptr<std::uint32_t>(),
-            era_ends.data_ptr<std::int32_t>(),
-            H0.data_ptr<std::int64_t>(),
-            N, nfolds, n_eras, max_depth, stride_per_warp);
-    } else if (dt == c10::ScalarType::UInt64) {
+    if (smem_bytes <= smem_cap) {
         cudaFuncSetAttribute(_h0_des_butterfly<std::uint64_t>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
         _h0_des_butterfly<std::uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
@@ -266,35 +284,13 @@ torch::Tensor h0_des_butterfly(
             era_ends.data_ptr<std::int32_t>(),
             H0.data_ptr<std::int64_t>(),
             N, nfolds, n_eras, max_depth, stride_per_warp);
-    } else if (dt == c10::ScalarType::Short) {
-        cudaFuncSetAttribute(_h0_des_butterfly<std::int16_t>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
-        _h0_des_butterfly<std::int16_t><<<grid, block, smem_bytes, stream.stream()>>>(
-            G.data_ptr<std::int16_t>(),
-            LE.data_ptr<std::int16_t>(),
-            era_ends.data_ptr<std::int32_t>(),
-            H0.data_ptr<std::int64_t>(),
-            N, nfolds, n_eras, max_depth, stride_per_warp);
-    } else if (dt == c10::ScalarType::Int) {
-        cudaFuncSetAttribute(_h0_des_butterfly<std::int32_t>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
-        _h0_des_butterfly<std::int32_t><<<grid, block, smem_bytes, stream.stream()>>>(
-            G.data_ptr<std::int16_t>(),
-            LE.data_ptr<std::int32_t>(),
-            era_ends.data_ptr<std::int32_t>(),
-            H0.data_ptr<std::int64_t>(),
-            N, nfolds, n_eras, max_depth, stride_per_warp);
-    } else if (dt == c10::ScalarType::Long) {
-        cudaFuncSetAttribute(_h0_des_butterfly<std::int64_t>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
-        _h0_des_butterfly<std::int64_t><<<grid, block, smem_bytes, stream.stream()>>>(
-            G.data_ptr<std::int16_t>(),
-            LE.data_ptr<std::int64_t>(),
-            era_ends.data_ptr<std::int32_t>(),
-            H0.data_ptr<std::int64_t>(),
-            N, nfolds, n_eras, max_depth, stride_per_warp);
     } else {
-        TORCH_CHECK(false, "LE must be one of: (u)int16, (u)int32, (u)int64 (or signed variants).");
+        _h0_des_global_atomic<<<grid, block, 0, stream.stream()>>>(
+            G.data_ptr<std::int16_t>(),
+            LE.data_ptr<std::uint64_t>(),
+            era_ends.data_ptr<std::int32_t>(),
+            H0.data_ptr<std::int64_t>(),
+            N, nfolds, n_eras, max_depth, stride_per_warp, nodes);
     }
 
     TORCH_CHECK(cudaGetLastError() == cudaSuccess,
