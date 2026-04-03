@@ -395,20 +395,20 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
         Returns
         -------
-        G  : [N] int16  – quantized residual gradients
-        LE : [nfolds, N] uint16 – path encoding of L_old;
-             bit d is the branch taken at depth d (bit 0 = depth 0)
+           G  : [N] int16  – quantized residual gradients
+           LE : [nfolds, N] uint16 – left-aligned path encoding of L_old;
+               branch d is stored at bit position (Dm - d)
         """
         # Compute quantized residuals (use int64 to avoid int32 overflow on Q30 diff)
         g = (Y.to(torch.int64) - P.to(torch.int64)) >> 20
         G = g.clamp_(-(1 << 15), (1 << 15) - 1).to(torch.int16)
 
-        # Encode L_old paths: LE[f, n] bit d = branch taken at depth d
+        # Encode L_old paths as a left-aligned prefix.
         # L_old: [nfolds, Dm, N] uint8
         nfolds, Dm, N = L_old.shape
         LE = torch.zeros((nfolds, N), dtype=torch.int32, device=L_old.device)
         for d in range(Dm):
-            LE |= (L_old[:, d, :].to(torch.int32) << d)
+            LE |= (L_old[:, d, :].to(torch.int32) << (Dm - d))
         LE = LE.to(torch.uint16)
 
         return G.contiguous(), LE.contiguous()
@@ -478,7 +478,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         """
         XS : [nfeatsets, 32*M] (uint32/int32), packed features
         Y  : [N]               (int16), gradient
-        LF : [nfeatsets, N]   (uint16), path-encoded (bit d = branch at depth d)
+        LF : [nfeatsets, N]   (uint16), left-aligned packed path prefix
         max_depth: int
         Returns:
         H: [nfeatsets, (1<<max_depth)-1, 2, 32] int64
@@ -522,16 +522,13 @@ class PackBoost(BaseEstimator, RegressorMixin):
         Y_b = Y64.view(1, 1, N)
         ones = torch.ones((1, 1, N), dtype=TORCH_INT64, device=dev)
 
-        # Build node prefix incrementally from branch bits
-        node_prefix = torch.zeros((nfeatsets, N), dtype=TORCH_INT64, device=dev)
-
         for d in range(max_depth):
             # Compute node index at this depth
             if d == 0:
                 idx = torch.zeros((nfeatsets, N), dtype=torch.long, device=dev)
             else:
                 base = (1 << d) - 1
-                idx = (node_prefix + base).to(torch.long)  # [F, N]
+                idx = ((LF64 >> (max_depth - d)) + base).to(torch.long)  # [F, N]
 
             # Accumulate histograms for each lane
             # We need to scatter per feature-set and per lane
@@ -543,11 +540,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
                     V_lane = V_fs[lane, :]  # [N]
                     H_sum[fs, :, lane].scatter_add_(0, idx_fs, V_lane * Y64)
                     H_cnt[fs, :, lane].scatter_add_(0, idx_fs, V_lane)
-
-            # Update node_prefix for next depth
-            if d < Dm:
-                branch_bit = (LF64 >> d) & 1  # [F, N]
-                node_prefix = (node_prefix << 1) | branch_bit
 
         # Stack channels: [F, nodes, 2, 32]
         H = torch.stack([H_sum, H_cnt], dim=2).contiguous()
@@ -882,7 +874,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
     def h_des(self,
             XS: torch.Tensor,   # [K1, 32*M] uint32/int32  (padded to Np=32*M)
             Y:  torch.Tensor,   # [N] int16
-            LF: torch.Tensor,   # [K1, N] uint16 path-encoded (bit d = branch at depth d)
+            LF: torch.Tensor,   # [K1, N] uint16 left-aligned packed path prefix
             max_depth: int,
             era_bounds: torch.Tensor | None = None  # [E] int32 (exclusive ends; last==N)
             ) -> torch.Tensor:
@@ -966,16 +958,13 @@ class PackBoost(BaseEstimator, RegressorMixin):
             H_sum = torch.zeros((K1, nodes, 32), dtype=TORCH_INT64, device=XS.device)
             H_cnt = torch.zeros_like(H_sum)
 
-            # Build node prefix incrementally from branch bits
-            node_prefix = torch.zeros((K1, N), dtype=TORCH_INT64, device=XS.device)
-
             for d in range(max_depth):
                 # Compute node index at this depth
                 if d == 0:
                     idx = torch.zeros((K1, N), dtype=torch.long, device=XS.device)
                 else:
                     base = (1 << d) - 1
-                    idx = (node_prefix + base).to(torch.long)  # [K1, N]
+                    idx = ((LF64 >> (max_depth - d)) + base).to(torch.long)  # [K1, N]
 
                 # Accumulate histograms for each lane
                 for fs in range(K1):
@@ -985,11 +974,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
                         V_lane = V_fs[lane, :]  # [N]
                         H_sum[fs, :, lane].scatter_add_(0, idx_fs, V_lane * Y64)
                         H_cnt[fs, :, lane].scatter_add_(0, idx_fs, V_lane)
-
-                # Update node_prefix for next depth
-                if d < Dm:
-                    branch_bit = (LF64 >> d) & 1  # [K1, N]
-                    node_prefix = (node_prefix << 1) | branch_bit
 
             # Stack into He (add channel dim)
             He[:, ei, :, 0, :] = H_sum
