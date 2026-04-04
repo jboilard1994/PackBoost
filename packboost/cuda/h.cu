@@ -258,7 +258,7 @@ torch::Tensor h_sm(
   auto* prop = at::cuda::getCurrentDeviceProperties();
   size_t smem_cap = prop->sharedMemPerBlockOptin ? (size_t)prop->sharedMemPerBlockOptin
                                                  : (size_t)prop->sharedMemPerBlock;
-  // Try to fit full histogram in shared; spill remainder to global atomics
+  // Use shared memory only if the full histogram fits; otherwise fall back to pure global atomics
   size_t full_smem_high = (size_t)n_ge3 * 2 * 32 * sizeof(int);
   int warps_per_block = choose_warps_that_fit(full_smem_high, smem_cap);
   size_t smem_low = (size_t)warps_per_block * 7 * 32 * sizeof(unsigned long long);
@@ -266,11 +266,10 @@ torch::Tensor h_sm(
   if (full_smem_high + smem_low <= smem_cap) {
     sh_cap = n_ge3;
   } else {
-    warps_per_block = 1;
-    smem_low = (size_t)1 * 7 * 32 * sizeof(unsigned long long);
-    size_t avail = (smem_cap > smem_low) ? (smem_cap - smem_low) : 0;
-    sh_cap = std::min(n_ge3, (int)(avail / (2 * 32 * sizeof(int))));
-    if (sh_cap < 0) sh_cap = 0;
+    // Histogram doesn't fit entirely: skip sh_high, send all depths >= 3 to global atomics
+    sh_cap = 0;
+    warps_per_block = choose_warps_that_fit(0, smem_cap);
+    smem_low = (size_t)warps_per_block * 7 * 32 * sizeof(unsigned long long);
   }
   size_t smem_high = (size_t)sh_cap * 2 * 32 * sizeof(int);
   size_t smem_bytes = smem_high + smem_low;
