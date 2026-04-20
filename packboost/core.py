@@ -79,7 +79,69 @@ class PackBoost(BaseEstimator, RegressorMixin):
             qgrad_bits: int = 12,
             seed: int = 42,
             encode_cut_device: str = "cuda",
-            era_ids: np.ndarray | None = None):
+            era_ids: np.ndarray | None = None,
+            fold_specs: list = None):
+        """
+        Train the PackBoost model.
+
+        Parameters
+        ----------
+        X : np.ndarray[int8], shape (N, F)
+            Training features, quantised to int8 (values 0..4 expected).
+        y : np.ndarray[float32], shape (N,)
+            Training labels/targets.
+        Xv : np.ndarray[int8], optional
+            Validation features (same dtype/layout as X). Enables per-round
+            validation predictions accessible via callbacks.
+        Yv : np.ndarray[float32], optional
+            Validation labels. Required when Xv is provided.
+        nfolds : int, default 8
+            Number of fold replicates (parallel trees). Ignored when
+            ``fold_specs`` is provided.
+        rounds : int, default 10_000
+            Maximum number of boosting rounds.
+        max_depth : int, default 7
+            Maximum tree depth. Controls model capacity and memory usage.
+        callbacks : list, optional
+            List of callback objects called at the end of every round.
+            Use :class:`~packboost.callback.EarlyStoppingCallback` here.
+        feature_name : list of str, optional
+            Names for the F input features, stored for inspection only.
+        lr : float, default 0.07
+            Learning rate (shrinkage applied to each tree's leaf values).
+        L2 : float, default 100_000.0
+            L2 regularisation added to leaf-weight denominators.
+        min_child_weight : float, default 20.0
+            Minimum sum of gradient counts required in each child node for
+            a split to be accepted.
+        min_split_gain : float, default 0.0
+            Minimum gain required for a split to be accepted.
+        nfeatsets : int, default 32
+            Number of random feature sets sampled per round. Ignored when
+            ``fold_specs`` is provided.
+        qgrad_bits : int, default 12
+            Bit-width used to quantise gradients before accumulation.
+        seed : int, default 42
+            Random seed for feature-schedule generation.
+        encode_cut_device : str, default "cuda"
+            Device used to encode the cut matrix (``"cuda"`` or ``"cpu"``).
+        era_ids : np.ndarray[int], optional
+            Per-sample era identifiers of shape (N,). When provided the DES
+            (directional era scoring) cut kernel is used instead of the
+            standard cut kernel.
+        fold_specs : list of dict, optional
+            Advanced per-spec fold configuration. Each dict must contain:
+            ``allowed_samples`` (array-like of row indices),
+            ``allowed_features`` (array-like of feature indices),
+            ``nfold_replicates`` (int), and ``nfeatsets`` (int).
+            When this argument is set, ``nfolds`` and ``nfeatsets`` are
+            ignored and a ``UserWarning`` is emitted.
+
+        Returns
+        -------
+        self : PackBoost
+            The fitted estimator (``self``).
+        """
         assert X.dtype == np.int8 and y.dtype == np.float32
         device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
         encode_device = torch.device(
@@ -89,8 +151,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
         # ---------- meta ----------
         self.feature_name = feature_name
-        self.nfeatsets = int(nfeatsets)
-        self.nfolds    = int(nfolds)
         self.max_depth = int(max_depth)
         self.min_child_weight = float(min_child_weight)
         self.min_split_gain   = float(min_split_gain)
@@ -134,51 +194,156 @@ class PackBoost(BaseEstimator, RegressorMixin):
         self.dY    = Y_i32
         self.dP    = P
 
-        # leaves (length N)
-        L_old = torch.zeros((nfolds, Dm, N), dtype=leaf_dtype, device=device)
+        # ---------- parse nfolds into internal specs ----------
+        # Each internal spec owns a contiguous slice of the global featureset axis
+        # and a contiguous slice of the global fold (replicate) axis.
+        # int form  -> single trivial spec, no masks (matches prior behavior)
+        # list form -> one spec per dict, each with allowed_samples / allowed_features
+        import warnings
+
+        specs = []
+        if fold_specs is not None:
+            warnings.warn(
+                "fold_specs is defined; nfolds and nfeatsets parameters will be ignored.",
+                UserWarning, stacklevel=2,
+            )
+            required_keys = ('allowed_samples', 'allowed_features', 'nfold_replicates', 'nfeatsets')
+            for i, spec_in in enumerate(fold_specs):
+                if not isinstance(spec_in, dict):
+                    raise ValueError(f"fold_specs[{i}] must be a dict, got {type(spec_in).__name__}")
+                for k in required_keys:
+                    if k not in spec_in:
+                        raise ValueError(f"fold_specs[{i}] missing required key '{k}'")
+
+                allowed_features = np.asarray(spec_in['allowed_features']).astype(np.int64).ravel()
+                if allowed_features.size == 0:
+                    raise ValueError(f"fold_specs[{i}]: allowed_features is empty")
+                if allowed_features.min() < 0 or allowed_features.max() >= F:
+                    raise ValueError(
+                        f"fold_specs[{i}]: allowed_features indices must be in [0, {F}); "
+                        f"got min={allowed_features.min()}, max={allowed_features.max()}"
+                    )
+                # 4 bitplanes per feature; keep only those that fall within bF.
+                bp_cols = np.stack([4*allowed_features + k for k in range(4)], axis=1).ravel()
+                bp_cols = bp_cols[bp_cols < bF].astype(np.int64)
+
+                allowed_samples = np.asarray(spec_in['allowed_samples']).astype(np.int64).ravel()
+                if allowed_samples.size == 0:
+                    raise ValueError(f"fold_specs[{i}]: allowed_samples is empty")
+                if allowed_samples.min() < 0 or allowed_samples.max() >= N:
+                    raise ValueError(
+                        f"fold_specs[{i}]: allowed_samples indices must be in [0, {N})"
+                    )
+                sm_np = np.zeros(N, dtype=np.int16)
+                sm_np[allowed_samples] = 1
+                sample_mask = torch.from_numpy(sm_np).to(device=device, dtype=torch.int16).contiguous()
+
+                nrep_i = int(spec_in['nfold_replicates'])
+                nfs_i  = int(spec_in['nfeatsets'])
+                if nrep_i <= 0 or nfs_i <= 0:
+                    raise ValueError(f"fold_specs[{i}]: nfold_replicates and nfeatsets must be positive")
+                if bp_cols.size < lanes * nfs_i:
+                    raise ValueError(
+                        f"fold_specs[{i}]: need at least 32*nfeatsets={lanes*nfs_i} allowed bitplanes, "
+                        f"got {bp_cols.size} (from {allowed_features.size} features)"
+                    )
+
+                specs.append({
+                    'nfold_replicates': nrep_i,
+                    'nfeatsets':        nfs_i,
+                    'allowed_bitplanes': bp_cols,
+                    'sample_mask':       sample_mask,
+                })
+        else:
+            specs.append({
+                'nfold_replicates': int(nfolds),
+                'nfeatsets':        int(nfeatsets),
+                'allowed_bitplanes': None,   # None == all bitplanes allowed
+                'sample_mask':       None,   # None == all samples allowed
+            })
+
+        nfolds_total    = sum(s['nfold_replicates'] for s in specs)
+        nfeatsets_total = sum(s['nfeatsets']        for s in specs)
+
+        # Compute per-spec offsets along the global featureset / fold axes.
+        rep_cursor = 0
+        fs_cursor  = 0
+        for s in specs:
+            s['rep_start'] = rep_cursor
+            s['rep_end']   = rep_cursor + s['nfold_replicates']
+            s['fs_start']  = fs_cursor
+            s['fs_end']    = fs_cursor  + s['nfeatsets']
+            rep_cursor = s['rep_end']
+            fs_cursor  = s['fs_end']
+
+        self.nfolds    = nfolds_total
+        self.nfeatsets = nfeatsets_total
+        self._fold_specs = specs
+
+        # leaves (length N) - global across all folds
+        L_old = torch.zeros((nfolds_total, Dm, N), dtype=leaf_dtype, device=device)
         L_new = torch.zeros_like(L_old)
 
-        # ---------- schedules ----------
+        # ---------- schedules (per-spec) ----------
         rng = np.random.RandomState(seed)
         if bF >= (1 << 16):
             raise ValueError(
                 f"encode_cuts produced {bF} bitplanes (4*F). "
                 f"Schedule dtype is uint16; reduce F or extend to uint32."
             )
-        
-        '''
-        Fsch_cpu = torch.from_numpy(
-            rng.randint(0, bF, size=(rounds, lanes * nfeatsets), dtype=np.uint16)
-        ).contiguous()
-        self.Fsch = Fsch_cpu.to(device=device, dtype=torch.uint16).contiguous()
-        '''
-        K1 = lanes * nfeatsets
 
-        if bF < K1:
-            raise ValueError(f"Need bF >= 32*nfeatsets for sampling without replacement; got bF={bF}, K1={K1}")
+        for s in specs:
+            K1_s = lanes * s['nfeatsets']
+            pool = s['allowed_bitplanes'] if s['allowed_bitplanes'] is not None \
+                   else np.arange(bF, dtype=np.int64)
+            if pool.size < K1_s:
+                raise ValueError(
+                    f"Need pool >= 32*nfeatsets for sampling without replacement; "
+                    f"got pool={pool.size}, K1={K1_s}"
+                )
+            Fsch_np = np.empty((rounds, K1_s), dtype=np.uint16)
+            for t in range(rounds):
+                Fsch_np[t, :] = rng.choice(pool, size=K1_s, replace=False).astype(np.uint16, copy=False)
+            s['Fsch'] = torch.from_numpy(Fsch_np).to(device=device, dtype=torch.uint16).contiguous()
 
-        Fsch_np = np.empty((rounds, K1), dtype=np.uint16)
-        for t in range(rounds):
-            # distinct within round t
-            Fsch_np[t, :] = rng.choice(bF, size=K1, replace=False).astype(np.uint16, copy=False)
+            # Per-spec FST: fold ids are LOCAL to the spec (0 .. nfold_replicates-1).
+            # Depth-varying permutation within this spec's replicate block preserves
+            # the standard fold-diversity mechanism.
+            nrep_s = s['nfold_replicates']
+            nfs_s  = s['nfeatsets']
+            base = torch.arange(nrep_s, dtype=torch.uint8, device=device)
+            rep  = (nfs_s + nrep_s - 1) // nrep_s
+            row  = base.repeat(rep)[:nfs_s]
+            FST_s = torch.empty((rounds, nfs_s, D), dtype=torch.uint8, device=device)
+            for r in range(rounds):
+                for d in range(D):
+                    perm = torch.randperm(nfs_s, device=device)
+                    FST_s[r, :, d] = row[perm]
+            s['FST'] = FST_s.contiguous()
 
-        Fsch_cpu = torch.from_numpy(Fsch_np).contiguous()
-        self.Fsch = Fsch_cpu.to(device=device, dtype=torch.uint16).contiguous()
-
-
-        base = torch.arange(nfolds, dtype=torch.uint8, device=device)
-        rep  = (nfeatsets + nfolds - 1) // nfolds
-        row  = base.repeat(rep)[:nfeatsets]
-        FST  = torch.empty((rounds, nfeatsets, D), dtype=torch.uint8, device=device)
-        for s in range(rounds):
-            for d in range(D):
-                perm = torch.randperm(nfeatsets, device=device)
-                FST[s, :, d] = row[perm]
-        FST = FST.contiguous()
+        # Concatenated global Fsch/FST are kept on self for backward-compat
+        # (callbacks / external inspection). Training uses the per-spec tensors.
+        self.Fsch = torch.cat([s['Fsch'] for s in specs], dim=1).contiguous()
+        # FST is uint8 (same as before); global fold ids must fit in a byte.
+        if nfolds_total > 255:
+            raise ValueError(f"nfolds_total={nfolds_total} exceeds uint8 FST capacity (255)")
+        FST_global_parts = [
+            (s['FST'].to(torch.int16) + int(s['rep_start'])).to(torch.uint8)
+            for s in specs
+        ]
+        FST = torch.cat(FST_global_parts, dim=1).contiguous()
 
         # ---------- outputs ----------
-        self.V = torch.zeros((rounds, nfolds, 2 * nodes), dtype=torch.int32,  device=device)
-        self.I = torch.zeros((rounds, nfolds,     nodes), dtype=torch.uint16, device=device)
+        self.V = torch.zeros((rounds, nfolds_total, 2 * nodes), dtype=torch.int32,  device=device)
+        self.I = torch.zeros((rounds, nfolds_total,     nodes), dtype=torch.uint16, device=device)
+
+        # Per-spec single-round scratch slabs: cut writes here (tree_set=0), then
+        # we copy the row into the global V / I at the spec's replicate slice.
+        for s in specs:
+            s['_V_slab'] = torch.zeros((1, s['nfold_replicates'], 2 * nodes),
+                                       dtype=torch.int32,  device=device)
+            s['_I_slab'] = torch.zeros((1, s['nfold_replicates'],     nodes),
+                                       dtype=torch.uint16, device=device)
 
         # ---------- optional validation ----------
         use_val = (Xv is not None) and (Yv is not None)
@@ -195,7 +360,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             self.Yv_i32 = Yv_i32
             self.Yv     = torch.from_numpy(Yv).to(device=device)
 
-            Lv  = torch.zeros((nfolds, Dm, Nv), dtype=leaf_dtype, device=device)
+            Lv  = torch.zeros((nfolds_total, Dm, Nv), dtype=leaf_dtype, device=device)
             Lvn = torch.zeros_like(Lv)
             del Xv_t
             if device.type == "cuda":
@@ -204,67 +369,98 @@ class PackBoost(BaseEstimator, RegressorMixin):
             XBv = Pv = Yv_i32 = Lv = Lvn = None
 
         # ---------- boosting loop ----------
-        lr_per_fold = lr / float(nfolds)
+        lr_per_fold = lr / float(nfolds_total)
         self.tree_set = 0
 
         for t in range(rounds):
-            
+
             # early stopping check
             if self.stop_training:
                 self.stop_training = False
                 break
 
-            # (a) feature sampling -> XS [nfeatsets, 32*M] uint32
-            if XB.is_cuda and torch.cuda.is_available():
-                XS = self.et_sample_1b(XB, self.Fsch, t).contiguous()
-            else:
-                XS = self.et_sample_1b(XB, Fsch_cpu, t).to(device)
+            # (b) pack leaves & gradients (length N) - computed once, shared across specs
+            LE, G = self.prep_vars(L_old, Y_i32, P)  # LE: [nfolds_total, N] ; G: [N] int16
 
-            # (b) pack leaves & gradients (length N)
-            LE, G = self.prep_vars(L_old, Y_i32, P)  # LE: u16/u32/u64 ; G: int16
+            # ----- per-spec inner loop: cut results accumulate into self.V / self.I -----
+            for s in specs:
+                rs, re_  = s['rep_start'], s['rep_end']
+                nrep_s   = s['nfold_replicates']
+                nfs_s    = s['nfeatsets']
+                Fsch_s   = s['Fsch']
+                FST_s    = s['FST']
 
-            # (c) repack by feature schedule -> LF [nfeatsets, N]
-            LF = self.repack(FST, LE, t).contiguous()
+                # Masked gradient for this spec (zero-out excluded samples).
+                if s['sample_mask'] is not None:
+                    G_s = G * s['sample_mask']
+                else:
+                    G_s = G
 
-            # (d) histograms & (e) choose cuts
-            if use_des:
-                # DES path (multi-era aware). Kernel API shapes:
-                #   h0_des -> [K0, 2**D, E, 2]
-                #   h_des  -> [K1, E, (2**D-1), 2, 32]
-                #   cut_des expects H0 in nodes-major: [K0, nodes, E, 2]
-                if int(era_ends[-1].item()) != N:
-                    raise ValueError(
-                        f"era_ends[-1] must equal N ({N}), got {int(era_ends[-1].item())}"
+                # (a) feature sampling for this spec -> XS_s [nfs_s, 32*M] uint32
+                if XB.is_cuda and torch.cuda.is_available():
+                    XS_s = self.et_sample_1b(XB, Fsch_s, t, nfeatsets=nfs_s).contiguous()
+                else:
+                    XS_s = self.et_sample_1b(XB, Fsch_s.cpu(), t, nfeatsets=nfs_s).to(device)
+
+                # Slice LE to this spec's replicates [nrep_s, N] (contiguous along dim 0).
+                LE_s = LE[rs:re_].contiguous()
+
+                # (c) repack by feature schedule -> LF_s [nfs_s, N]
+                LF_s = self.repack(FST_s, LE_s, t).contiguous()
+
+                # Reusable single-round V/I scratch slabs (tree_set=0 into the slab).
+                V_s = s['_V_slab']
+                I_s = s['_I_slab']
+                V_s.zero_()
+                I_s.zero_()
+
+                # (d) histograms & (e) choose cuts
+                if use_des:
+                    if int(era_ends[-1].item()) != N:
+                        raise ValueError(
+                            f"era_ends[-1] must equal N ({N}), got {int(era_ends[-1].item())}"
+                        )
+                    # Pass a single-round view of Fsch/FST so the kernel's tree_set=0 maps to round t.
+                    Fsch_row = Fsch_s[t:t+1].contiguous()
+                    FST_row  = FST_s[t:t+1].contiguous()
+
+                    H0_all = self.h0_des(G_s, LE_s, int(max_depth), era_ends)           # [nrep_s, 2**D, E, 2]
+                    H0e    = H0_all[:, :nodes, :, :].contiguous()                        # [nrep_s, nodes, E, 2]
+                    He     = self.h_des(XS_s, G_s, LF_s, int(max_depth), era_ends)       # [nfs_s, E, nodes, 2, 32]
+
+                    self.cut_des(
+                        Fsch_row, FST_row, He, H0e, V_s, I_s,
+                        tree_set=0, L2=L2, lr=lr_per_fold,
+                        qgrad_bits=qgrad_bits, max_depth=D,
+                        min_child_weight=min_child_weight,
+                        min_split_gain=min_split_gain,
                     )
+                    del He, H0_all, H0e, Fsch_row, FST_row
+                else:
+                    Fsch_row = Fsch_s[t:t+1].contiguous()
+                    FST_row  = FST_s[t:t+1].contiguous()
 
-                H0_all = self.h0_des(G, LE, int(max_depth), era_ends)            # [K0, 2**D, E, 2]
-                H0e    = H0_all[:, :nodes, :, :].contiguous()                    # [K0, nodes, E, 2]
-                He     = self.h_des(XS, G, LF, int(max_depth), era_ends)         # [K1, E, nodes, 2, 32]
+                    H_s  = self.H (XS_s, G_s, LF_s, D).contiguous()                      # [nfs_s, nodes, 2, 32]
+                    H0_s = self.h0(G_s, LE_s, D).contiguous()                            # [nrep_s, 2**D, 2]
+                    self.cut(
+                        Fsch_row, FST_row, H_s, H0_s[:, : H_s.size(1), :].contiguous(),  # -> [nrep_s, nodes, 2]
+                        V_s, I_s,
+                        tree_set=0, L2=L2, lr=lr_per_fold,
+                        qgrad_bits=qgrad_bits, max_depth=D,
+                        min_child_weight=min_child_weight,
+                        min_split_gain=min_split_gain,
+                    )
+                    del H_s, H0_s, Fsch_row, FST_row
 
-                self.cut_des(
-                    self.Fsch, FST, He, H0e, self.V, self.I,
-                    tree_set=t, L2=L2, lr=lr_per_fold,
-                    qgrad_bits=qgrad_bits, max_depth=D,
-                    min_child_weight=min_child_weight,
-                    min_split_gain=min_split_gain,
-                )
+                # Copy this spec's split results into the global V / I at the right replicate slice.
+                self.V[t, rs:re_] = V_s[0]
+                self.I[t, rs:re_] = I_s[0]
 
-                del He, H0_all, H0e
-            else:
-                # Non-DES path (single era)
-                H  = self.H (XS, G, LF, D).contiguous()                          # [K1, nodes, 2, 32]
-                H0 = self.h0(G, LE, D).contiguous()                              # [K0, 2**D, 2]
-                self.cut(
-                    self.Fsch, FST, H, H0[:, : H.size(1), :].contiguous(),       # -> [K0, nodes, 2]
-                    self.V, self.I,
-                    tree_set=t, L2=L2, lr=lr_per_fold,
-                    qgrad_bits=qgrad_bits, max_depth=D,
-                    min_child_weight=min_child_weight,
-                    min_split_gain=min_split_gain,
-                )
-                del H, H0
+                del XS_s, LE_s, LF_s
+                if s['sample_mask'] is not None:
+                    del G_s
 
-            # (f) advance + predict
+            # (f) advance + predict (uses global V / I spanning all replicates)
             self.advance_and_predict(P, XB, L_old, L_new, self.V, self.I, tree_set=t)
             L_old, L_new = L_new, L_old
 
@@ -283,11 +479,11 @@ class PackBoost(BaseEstimator, RegressorMixin):
                     pass
 
             # free big temporaries ASAP
-            del XS, LE, G, LF
+            del LE, G
             if device.type == "cuda" and (t % 256 == 255):
                 torch.cuda.empty_cache()
 
-        
+
         # ---------- restore best model if early stopping was used ----------
         for cb in callbacks:
             if isinstance(cb, EarlyStoppingCallback) and cb.keep_best:
@@ -386,12 +582,13 @@ class PackBoost(BaseEstimator, RegressorMixin):
         return XB
 
 
-    def et_sample_1b(self, X : Tensor, Fsch : Tensor, round : int) -> Tensor:
+    def et_sample_1b(self, X : Tensor, Fsch : Tensor, round : int, nfeatsets : int = None) -> Tensor:
+        if nfeatsets is None:
+            nfeatsets = self.nfeatsets
         if X.device.type != 'cpu' and torch.cuda.is_available():
-            XS = torch.empty((self.nfeatsets, X.shape[1]*32), dtype=torch.uint32, device=X.device)
+            XS = torch.empty((nfeatsets, X.shape[1]*32), dtype=torch.uint32, device=X.device)
             return kernels.et_sample_1b(X.contiguous(), XS.contiguous(), Fsch.contiguous(), round)
         M = X.shape[1]
-        nfeatsets = self.nfeatsets
         Fs = Fsch[round].view(nfeatsets, 32).to(dtype=torch.long, device=X.device)
         return X.to(torch.int32)[Fs, :].transpose(1, 2).contiguous().view(nfeatsets, M*32).to(torch.uint32)
 
