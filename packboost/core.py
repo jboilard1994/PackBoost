@@ -19,6 +19,36 @@ class PackBoost(BaseEstimator, RegressorMixin):
         self.feature_name = None
         self.comment = comment
 
+    def release_gpu_memory(self):
+        """Explicitly free all GPU tensors held by this model.
+
+        Call this before ``del model`` inside loops to ensure CUDA memory is
+        returned to the allocator immediately, rather than waiting for the
+        Python garbage collector.
+        """
+        _gpu_attrs = (
+            'V', 'I', 'Fsch', 'FST', 'X_packed_',
+            'Y_i32', 'P_', 'dY', 'dP',
+            'Pv_', 'Yv_i32', 'Yv',
+        )
+        for _attr in _gpu_attrs:
+            if hasattr(self, _attr):
+                delattr(self, _attr)
+        if hasattr(self, '_fold_specs'):
+            for _s in self._fold_specs:
+                for _k in ('Fsch', 'FST', '_V_slab', '_I_slab', 'sample_mask'):
+                    if _k in _s and torch.is_tensor(_s[_k]):
+                        del _s[_k]
+            delattr(self, '_fold_specs')
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def __del__(self):
+        try:
+            self.release_gpu_memory()
+        except Exception:
+            pass
+
     @classmethod
     def from_params(cls, V, I, device='cuda'):
         """
@@ -150,27 +180,8 @@ class PackBoost(BaseEstimator, RegressorMixin):
         callbacks = [] if callbacks is None else callbacks
 
         # ---------- release GPU state from any previous fit() call ----------
-        # Drop all large tensors stored on self so they are freed before new
-        # allocations begin.  Without this, the old and new tensors coexist
-        # during the second call, roughly doubling peak GPU memory.
-        _prev_gpu_attrs = (
-            'V', 'I', 'Fsch', 'FST', 'X_packed_',
-            'Y_i32', 'P_', 'dY', 'dP',
-            'Pv_', 'Yv_i32', 'Yv',
-        )
-        for _attr in _prev_gpu_attrs:
-            if hasattr(self, _attr):
-                delattr(self, _attr)
-        # Per-spec tensors (Fsch, FST, _V_slab, _I_slab, sample_mask) live
-        # inside self._fold_specs dicts; drop those too.
-        if hasattr(self, '_fold_specs'):
-            for _s in self._fold_specs:
-                for _k in ('Fsch', 'FST', '_V_slab', '_I_slab', 'sample_mask'):
-                    if _k in _s and torch.is_tensor(_s[_k]):
-                        del _s[_k]
-            delattr(self, '_fold_specs')
-        if device.type == "cuda" and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # Handles the case where fit() is called again on the same instance.
+        self.release_gpu_memory()
 
         # ---------- meta ----------
         self.feature_name = feature_name
