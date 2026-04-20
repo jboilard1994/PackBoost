@@ -460,6 +460,11 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 if s['sample_mask'] is not None:
                     del G_s
 
+            # free LE / G as early as possible so that PyTorch's CUDA allocator
+            # can reclaim (or reuse) those blocks before the next round's
+            # prep_vars call.  advance_and_predict and validation do not need them.
+            del LE, G
+
             # (f) advance + predict (uses global V / I spanning all replicates)
             self.advance_and_predict(P, XB, L_old, L_new, self.V, self.I, tree_set=t)
             L_old, L_new = L_new, L_old
@@ -478,8 +483,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 except Exception:
                     pass
 
-            # free big temporaries ASAP
-            del LE, G
             if device.type == "cuda" and (t % 256 == 255):
                 torch.cuda.empty_cache()
 
