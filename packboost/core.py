@@ -80,7 +80,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             seed: int = 42,
             encode_cut_device: str = "cuda",
             era_ids: np.ndarray | None = None):
-        assert X.dtype == np.int8 and y.dtype == np.float32
+        assert y.dtype == np.float32
         device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
         encode_device = torch.device(
             encode_cut_device if (encode_cut_device != "cuda" or torch.cuda.is_available()) else "cpu"
@@ -116,8 +116,15 @@ class PackBoost(BaseEstimator, RegressorMixin):
         era_ends = torch.from_numpy(ends_np).to(device=device, dtype=torch.int32).contiguous()
 
         # ---------- encode_cuts(X) ----------
-        X_t = torch.from_numpy(X).to(device=encode_device, dtype=torch.int8)
+        X_int8, X_nan_np = self._extract_nan(X)
+        if X_nan_np is None:
+            X_nan_np = np.zeros((N, F), dtype=np.uint8)
+        self.nan_feature_count = F
+        X_t = torch.from_numpy(X_int8).to(device=encode_device, dtype=torch.int8)
         XB  = self.encode_cuts(X_t).contiguous().to(device=device)              # [4F, M] uint32
+        X_nan_t = torch.from_numpy(X_nan_np).to(device=encode_device, dtype=torch.uint8)
+        XB = torch.cat([XB, self.encode_nan_cuts(X_nan_t).to(device=device)], dim=0)
+        del X_nan_t
         bF, M = XB.shape
         Np = 32 * M
         del X_t
@@ -183,10 +190,16 @@ class PackBoost(BaseEstimator, RegressorMixin):
         # ---------- optional validation ----------
         use_val = (Xv is not None) and (Yv is not None)
         if use_val:
-            assert Xv.dtype == np.int8 and Yv.dtype == np.float32
+            assert Yv.dtype == np.float32
             Nv = int(Xv.shape[0]); self.val_N = Nv
-            Xv_t = torch.from_numpy(Xv).to(device=encode_device, dtype=torch.int8)
+            Xv_int8, Xv_nan_np = self._extract_nan(Xv)
+            if Xv_nan_np is None:
+                Xv_nan_np = np.zeros((Nv, F), dtype=np.uint8)
+            Xv_t = torch.from_numpy(Xv_int8).to(device=encode_device, dtype=torch.int8)
             XBv  = self.encode_cuts(Xv_t).contiguous().to(device=device)
+            Xv_nan_t = torch.from_numpy(Xv_nan_np).to(device=encode_device, dtype=torch.uint8)
+            XBv = torch.cat([XBv, self.encode_nan_cuts(Xv_nan_t).to(device=device)], dim=0)
+            del Xv_nan_t
             Pv   = torch.zeros(Nv, dtype=torch.int32, device=device)
             yvq30  = (Yv * (1 << 30)).astype(np.int64)
             Yv_i32 = torch.from_numpy(yvq30[:Nv].astype(np.int32)).to(device=device)
@@ -308,30 +321,35 @@ class PackBoost(BaseEstimator, RegressorMixin):
         """
         Predict with the currently trained model.
 
-        X : np.ndarray[int8] or torch.Tensor[int8] of shape [N, F]
-            Raw discrete features (0..4 expected per your pipeline).
+        X : np.ndarray of shape [N, F], int8 or float (NaN values handled automatically).
         Returns:
-            np.ndarray[int32] if X is numpy, else torch.Tensor[int32] (length N).
+            np.ndarray[int32] (length N).
         """
         # --- device & inputs ---
         device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
-        if isinstance(X, np.ndarray):
-            assert X.dtype == np.int8, "X must be int8"
-            X_t = torch.from_numpy(X).to(device=device, dtype=torch.int8)
-            return_numpy = True
-        else:
-            # torch path
-            assert torch.is_tensor(X) and X.dtype == torch.int8, "X must be torch.int8"
-            X_t = X.to(device=device, dtype=torch.int8, copy=False)
-            return_numpy = False
+        return_numpy = isinstance(X, np.ndarray)
 
-        N = X_t.shape[0]
+        if isinstance(X, np.ndarray):
+            X_int8, X_nan_np = self._extract_nan(X)
+        else:
+            assert torch.is_tensor(X) and X.dtype == torch.int8, "tensor X must be torch.int8 (no NaN)"
+            X_int8 = X.cpu().numpy()
+            X_nan_np = None
+
+        N = X_int8.shape[0]
         # guardrails
         assert hasattr(self, "V") and hasattr(self, "I"), "Model not fitted: missing V/I"
         assert hasattr(self, "tree_set") and self.tree_set > 0, "Model has no trees"
 
         # --- 1) encode cuts -> packed uint32 words [4F, M] ---
+        X_t = torch.from_numpy(X_int8).to(device=device, dtype=torch.int8)
         XB = self.encode_cuts(X_t).contiguous()           # [4F, M] uint32
+        nan_feature_count = getattr(self, "nan_feature_count", 0)
+        if nan_feature_count > 0:
+            if X_nan_np is None:
+                X_nan_np = np.zeros((N, nan_feature_count), dtype=np.uint8)
+            X_nan_t = torch.from_numpy(X_nan_np).to(device=device, dtype=torch.uint8)
+            XB = torch.cat([XB, self.encode_nan_cuts(X_nan_t).contiguous()], dim=0)
         M  = XB.shape[1]
         Np = 32 * M                                       # padded length
 
@@ -342,8 +360,6 @@ class PackBoost(BaseEstimator, RegressorMixin):
         leaf_dtype = (torch.uint8 if D <= 8 else torch.int16)
         L  = torch.zeros((self.nfolds, Dm, Np), dtype=leaf_dtype, device=device)
         Ln = torch.zeros_like(L)
-
-        del X_t
         torch.cuda.empty_cache()
 
         # --- 3) walk trees round-by-round ---
@@ -359,6 +375,16 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
 
     
+    @staticmethod
+    def _extract_nan(X: np.ndarray):
+        """Return (X_int8, nan_mask_uint8_or_None). Fills NaN with 0 before int8 cast."""
+        if X.dtype == np.int8:
+            return X, None
+        nan_mask = np.isnan(X)
+        if not nan_mask.any():
+            return X.astype(np.int8), None
+        return np.where(nan_mask, np.int8(0), X).astype(np.int8), nan_mask.astype(np.uint8)
+
     def encode_cuts(self, X: torch.Tensor) -> torch.Tensor:
         # X: [N, F], int8 expected
         if X.device.type != 'cpu' and torch.cuda.is_available():
@@ -385,6 +411,19 @@ class PackBoost(BaseEstimator, RegressorMixin):
         XB = words.permute(0, 2, 1).contiguous().reshape(4 * F, M)                       # [4F, M]
         return XB
 
+
+    def encode_nan_cuts(self, X_nan: torch.Tensor) -> torch.Tensor:
+        # X_nan: [N, F] uint8, 1 = was NaN before quantization; produces [F, M] uint32
+        N, F = X_nan.shape
+        M = (N + 31) // 32
+        Np = M * 32
+        if Np != N:
+            pad = torch.zeros((Np - N, F), dtype=torch.uint8, device=X_nan.device)
+            X_nan = torch.cat([X_nan, pad], dim=0)
+        bits = X_nan.t().contiguous().view(F, M, 32).to(torch.uint32)
+        weights = (1 << torch.arange(32, dtype=torch.int64, device=X_nan.device)).to(torch.uint32)
+        words = (bits * weights.view(1, 1, 32)).sum(dim=2, dtype=torch.int64).to(torch.uint32)
+        return words.contiguous()
 
     def et_sample_1b(self, X : Tensor, Fsch : Tensor, round : int) -> Tensor:
         if X.device.type != 'cpu' and torch.cuda.is_available():
