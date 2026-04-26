@@ -80,7 +80,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             seed: int = 42,
             encode_cut_device: str = "cuda",
             era_ids: np.ndarray | None = None):
-        assert y.dtype == np.float32
+        assert X.dtype == np.int8 and y.dtype == np.float32
         device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
         encode_device = torch.device(
             encode_cut_device if (encode_cut_device != "cuda" or torch.cuda.is_available()) else "cpu"
@@ -190,7 +190,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         # ---------- optional validation ----------
         use_val = (Xv is not None) and (Yv is not None)
         if use_val:
-            assert Yv.dtype == np.float32
+            assert Xv.dtype == np.int8 and Yv.dtype == np.float32
             Nv = int(Xv.shape[0]); self.val_N = Nv
             Xv_int8, Xv_nan_np = self._extract_nan(Xv)
             if Xv_nan_np is None:
@@ -330,11 +330,11 @@ class PackBoost(BaseEstimator, RegressorMixin):
         return_numpy = isinstance(X, np.ndarray)
 
         if isinstance(X, np.ndarray):
+            assert X.dtype == np.int8, "X must be int8 (-128 = NaN sentinel)"
             X_int8, X_nan_np = self._extract_nan(X)
         else:
-            assert torch.is_tensor(X) and X.dtype == torch.int8, "tensor X must be torch.int8 (no NaN)"
-            X_int8 = X.cpu().numpy()
-            X_nan_np = None
+            assert torch.is_tensor(X) and X.dtype == torch.int8, "tensor X must be torch.int8 (-128 = NaN sentinel)"
+            X_int8, X_nan_np = self._extract_nan(X.cpu().numpy())
 
         N = X_int8.shape[0]
         # guardrails
@@ -377,13 +377,10 @@ class PackBoost(BaseEstimator, RegressorMixin):
     
     @staticmethod
     def _extract_nan(X: np.ndarray):
-        """Return (X_int8, nan_mask_uint8_or_None). Fills NaN with 0 before int8 cast."""
-        if X.dtype == np.int8:
-            return X, None
-        nan_mask = np.isnan(X)
-        if not nan_mask.any():
-            return X.astype(np.int8), None
-        return np.where(nan_mask, np.int8(0), X).astype(np.int8), nan_mask.astype(np.uint8)
+        """Return (X_int8, nan_mask_uint8_or_None). Treats -128 as NaN sentinel, fills with 0."""
+        nan_mask = (X == np.int8(-128)).astype(np.uint8)
+        X_int8 = np.where(nan_mask, np.int8(0), X)
+        return X_int8, nan_mask if nan_mask.any() else None
 
     def encode_cuts(self, X: torch.Tensor) -> torch.Tensor:
         # X: [N, F], int8 expected
