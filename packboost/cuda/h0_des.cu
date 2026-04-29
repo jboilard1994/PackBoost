@@ -40,6 +40,7 @@ static_assert(sizeof(std::int64_t)       == 8, "int64_t must be 64-bit.");
 template <typename T>
 __global__ void _h0_des_butterfly(
     const std::int16_t*  __restrict__ G,         // [N]
+    const std::int16_t*  __restrict__ W,         // [N]
     const T*             __restrict__ LE,        // [nfolds, N] (signed/unsigned ok)
     const std::int32_t*  __restrict__ era_ends,  // [n_eras], increasing, last == N (X-space)
     std::int64_t*        __restrict__ H0,        // [nfolds, nodes, n_eras, 2] (int64)
@@ -92,6 +93,7 @@ __global__ void _h0_des_butterfly(
                 const int jj = start + lane;
                 U lk = static_cast<U>(LE[(std::size_t)tree_set * N + jj]);
                 const int g = (int)G[jj];
+                const int w = (int)W[jj];
 
                 #pragma unroll
                 for (int d = 0; d < 32; ++d) {
@@ -101,8 +103,8 @@ __global__ void _h0_des_butterfly(
                     if (d > 0) lk >>= d;
                     const int node = to + tk;  // 0..used_nodes-1
 
-                    s_hist[SH_idx(node, 0, lane)] += g;   // sum(G)
-                    s_hist[SH_idx(node, 1, lane)] += 1;   // count
+                    s_hist[SH_idx(node, 0, lane)] += g * w;   // sum(W*G)
+                    s_hist[SH_idx(node, 1, lane)] += w;       // sum(W)
                 }
             }
             __syncwarp();
@@ -171,12 +173,16 @@ __global__ void _h0_des_butterfly(
 // ---- Host launcher (pick strides like h0_sm_butterfly; NO n_eras in the grid) ----
 torch::Tensor h0_des_butterfly(
     torch::Tensor G,          // [N], int16, CUDA
+    torch::Tensor W,          // [N], int16, CUDA
     torch::Tensor LE,         // [nfolds, N], (u)int16/32/64 or signed, CUDA
     torch::Tensor era_ends,   // [n_eras], int32 (CUDA) in X-space
     int max_depth
 ){
     TORCH_CHECK(G.is_cuda() && LE.is_cuda() && era_ends.is_cuda(),
                 "G, LE, era_ends must be CUDA tensors.");
+    TORCH_CHECK(W.is_cuda() && W.scalar_type() == c10::ScalarType::Short,
+                "W must be CUDA int16.");
+    TORCH_CHECK(W.size(0) == G.size(0), "W must match G length.");
     TORCH_CHECK(G.dim() == 1 && LE.dim() == 2, "G:[N], LE:[nfolds,N].");
     TORCH_CHECK(era_ends.dim() == 1, "era_ends must be 1D.");
     TORCH_CHECK(G.scalar_type() == c10::ScalarType::Short, "G must be int16.");
@@ -244,6 +250,7 @@ torch::Tensor h0_des_butterfly(
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
         _h0_des_butterfly<std::uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
             G.data_ptr<std::int16_t>(),
+            W.data_ptr<std::int16_t>(),
             LE.data_ptr<std::uint16_t>(),
             era_ends.data_ptr<std::int32_t>(),
             H0.data_ptr<std::int64_t>(),
@@ -253,6 +260,7 @@ torch::Tensor h0_des_butterfly(
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
         _h0_des_butterfly<std::uint32_t><<<grid, block, smem_bytes, stream.stream()>>>(
             G.data_ptr<std::int16_t>(),
+            W.data_ptr<std::int16_t>(),
             LE.data_ptr<std::uint32_t>(),
             era_ends.data_ptr<std::int32_t>(),
             H0.data_ptr<std::int64_t>(),
@@ -262,6 +270,7 @@ torch::Tensor h0_des_butterfly(
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
         _h0_des_butterfly<std::uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
             G.data_ptr<std::int16_t>(),
+            W.data_ptr<std::int16_t>(),
             LE.data_ptr<std::uint64_t>(),
             era_ends.data_ptr<std::int32_t>(),
             H0.data_ptr<std::int64_t>(),
@@ -271,6 +280,7 @@ torch::Tensor h0_des_butterfly(
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
         _h0_des_butterfly<std::int16_t><<<grid, block, smem_bytes, stream.stream()>>>(
             G.data_ptr<std::int16_t>(),
+            W.data_ptr<std::int16_t>(),
             LE.data_ptr<std::int16_t>(),
             era_ends.data_ptr<std::int32_t>(),
             H0.data_ptr<std::int64_t>(),
@@ -280,6 +290,7 @@ torch::Tensor h0_des_butterfly(
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
         _h0_des_butterfly<std::int32_t><<<grid, block, smem_bytes, stream.stream()>>>(
             G.data_ptr<std::int16_t>(),
+            W.data_ptr<std::int16_t>(),
             LE.data_ptr<std::int32_t>(),
             era_ends.data_ptr<std::int32_t>(),
             H0.data_ptr<std::int64_t>(),
@@ -289,6 +300,7 @@ torch::Tensor h0_des_butterfly(
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
         _h0_des_butterfly<std::int64_t><<<grid, block, smem_bytes, stream.stream()>>>(
             G.data_ptr<std::int16_t>(),
+            W.data_ptr<std::int16_t>(),
             LE.data_ptr<std::int64_t>(),
             era_ends.data_ptr<std::int32_t>(),
             H0.data_ptr<std::int64_t>(),

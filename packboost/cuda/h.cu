@@ -27,6 +27,7 @@ template <typename LF_T>
 __global__ void _h_sm(
     const uint32_t* __restrict__ XS, // [nfeatsets, N]
     const int16_t* __restrict__ Y, // [N]
+    const int16_t* __restrict__ W, // [N]
     const LF_T* __restrict__ LF, // [nfeatsets, N] (u16/u32/u64)
     int64_t* __restrict__ H, // [nfeatsets, nodes, 2, 32] (int64)
     int nfeatsets,
@@ -68,9 +69,11 @@ __global__ void _h_sm(
       // Load lane’s locals
       const int jj_lane = base + lane;
       int32_t y_lane = 0;
+      int32_t w_lane = 0;
       uint32_t l32 = 0;
       if (jj_lane < N) {
         y_lane = Y[jj_lane];
+        w_lane = (int32_t)W[jj_lane];
         // LF indexed [nfeatsets, N]
         LF_T lval = LF[static_cast<size_t>(feat_set) * static_cast<size_t>(N) + jj_lane];
         // Cast to 32-bit for warp shuffle (max_depth<=7 => safe)
@@ -99,24 +102,27 @@ __global__ void _h_sm(
 
         // all lanes participate in the shuffles each iter
         const int32_t yk = __shfl_sync(mask, y_lane, k);
+        const int32_t wk = __shfl_sync(mask, w_lane, k);
         uint32_t      lk = __shfl_sync(mask, l32,    k);
 
+        const int vw = v * wk;
+
         // d = 0
-        hf0 += static_cast<int64_t>(v) * (int64_t)yk;
-        hw0 += v;
+        hf0 += static_cast<int64_t>(vw) * (int64_t)yk;
+        hw0 += vw;
 
         // d = 1
         unsigned tk = lk & 1u; lk >>= 1;
-        const int64_t add = static_cast<int64_t>(v) * (int64_t)yk;
-        if (tk == 0u) { hf10 += add; hw10 += v; }
-        else          { hf11 += add; hw11 += v; }
+        const int64_t add = static_cast<int64_t>(vw) * (int64_t)yk;
+        if (tk == 0u) { hf10 += add; hw10 += vw; }
+        else          { hf11 += add; hw11 += vw; }
 
         // d = 2
         tk = lk & 3u; lk >>= 2;
-        if      (tk == 0u) { hf20 += add; hw20 += v; }
-        else if (tk == 1u) { hf21 += add; hw21 += v; }
-        else if (tk == 2u) { hf22 += add; hw22 += v; }
-        else               { hf23 += add; hw23 += v; }
+        if      (tk == 0u) { hf20 += add; hw20 += vw; }
+        else if (tk == 1u) { hf21 += add; hw21 += vw; }
+        else if (tk == 2u) { hf22 += add; hw22 += vw; }
+        else               { hf23 += add; hw23 += vw; }
 
         // d >= 3 (no branch; multiply by v)
         #pragma unroll
@@ -124,8 +130,8 @@ __global__ void _h_sm(
         const unsigned to  = (1u << d) - 1u;
         const unsigned tkd = lk & to; lk >>= d;
         const int idx = static_cast<int>(to + tkd) - 7;
-        atomicAdd(&sh_high[(idx * 2 + 0) * 32 + lane], v * yk);
-        atomicAdd(&sh_high[(idx * 2 + 1) * 32 + lane], v);
+        atomicAdd(&sh_high[(idx * 2 + 0) * 32 + lane], vw * yk);
+        atomicAdd(&sh_high[(idx * 2 + 1) * 32 + lane], vw);
         }
         }
 
@@ -237,9 +243,13 @@ static inline int choose_warps_that_fit(size_t smem_high, size_t smem_cap) {
 torch::Tensor h_sm(
     torch::Tensor XS,
     torch::Tensor Y,
+    torch::Tensor W,
     torch::Tensor LF,
     int max_depth)
 {
+  TORCH_CHECK(W.is_cuda() && W.scalar_type() == torch::kInt16,
+              "W must be CUDA int16 (got ", W.scalar_type(), ")");
+  TORCH_CHECK(W.size(0) == Y.size(0), "W must match Y length.");
   const int nfeatsets = static_cast<int>(XS.size(0));
   const int cols_32M = static_cast<int>(XS.size(1));
   const int N = static_cast<int>(Y.size(0));
@@ -287,6 +297,7 @@ torch::Tensor h_sm(
       _h_sm<uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
       XS_ptr,
       Y.data_ptr<int16_t>(),
+      W.data_ptr<int16_t>(),
       LF.data_ptr<uint16_t>(),
       H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth,
@@ -299,6 +310,7 @@ torch::Tensor h_sm(
     _h_sm<uint32_t><<<grid, block, smem_bytes, stream.stream()>>>(
       XS_ptr,
       Y.data_ptr<int16_t>(),
+      W.data_ptr<int16_t>(),
       LF.data_ptr<uint32_t>(),
       H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth,
@@ -311,6 +323,7 @@ torch::Tensor h_sm(
     _h_sm<uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
       XS_ptr,
       Y.data_ptr<int16_t>(),
+      W.data_ptr<int16_t>(),
       static_cast<uint64_t*>(LF.data_ptr()),
       H.data_ptr<int64_t>(),
       nfeatsets, cols_32M, N, max_depth,

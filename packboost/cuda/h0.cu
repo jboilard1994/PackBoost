@@ -6,6 +6,7 @@
 template <typename T>
 __global__ void _h0_sm(
     const int16_t* G,
+    const int16_t* W,
     const T* LE,
     int64_t* H0,
     const int N,
@@ -35,13 +36,14 @@ __global__ void _h0_sm(
         if (jj < N) {
             T lk = LE[(size_t)tree_set*N + jj];
             int16_t g = G[jj];
+            int w = (int)W[jj];
 
             for (int d = 0; d < max_depth; ++d) {
                 const int to = (1<<d)-1;
                 const int tk = (d == 0) ? 0 : (lk & to);
                 if (d > 0) lk >>= d;
-                SH(to + tk, 0, wi) += g;
-                SH(to + tk, 1, wi) += 1;
+                SH(to + tk, 0, wi) += g * w;
+                SH(to + tk, 1, wi) += w;
             }
         }
     }
@@ -57,9 +59,13 @@ __global__ void _h0_sm(
 
 torch::Tensor h0_sm(
     torch::Tensor G,        // [N], int16, CUDA
+    torch::Tensor W,        // [N], int16, CUDA
     torch::Tensor LE,       // [nfolds, N], (u)int16/32/64, CUDA
     int max_depth
 ){
+    TORCH_CHECK(W.is_cuda() && W.scalar_type() == c10::ScalarType::Short,
+                "W must be CUDA int16.");
+    TORCH_CHECK(W.size(0) == G.size(0), "W must have same length as G.");
 
     const int64_t nfolds64 = LE.size(0);
     const int64_t N64      = LE.size(1);
@@ -95,6 +101,7 @@ torch::Tensor h0_sm(
         cudaFuncSetAttribute(_h0_sm<uint16_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
         _h0_sm<uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
             G.data_ptr<int16_t>(),
+            W.data_ptr<int16_t>(),
             LE.data_ptr<uint16_t>(),
             H0.data_ptr<int64_t>(),
             N, nfolds, max_depth, stride
@@ -103,6 +110,7 @@ torch::Tensor h0_sm(
         cudaFuncSetAttribute(_h0_sm<uint32_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
         _h0_sm<uint32_t><<<grid, block, smem_bytes, stream.stream()>>>(
             G.data_ptr<int16_t>(),
+            W.data_ptr<int16_t>(),
             LE.data_ptr<uint32_t>(),
             H0.data_ptr<int64_t>(),
             N, nfolds, max_depth, stride
@@ -111,6 +119,7 @@ torch::Tensor h0_sm(
         cudaFuncSetAttribute(_h0_sm<uint64_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
         _h0_sm<uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
             G.data_ptr<int16_t>(),
+            W.data_ptr<int16_t>(),
             LE.data_ptr<uint64_t>(),
             H0.data_ptr<int64_t>(),
             N, nfolds, max_depth, stride
@@ -143,6 +152,7 @@ static __device__ __forceinline__ uint64_t add_pack(uint64_t a, uint64_t b) {
 template <typename T>
 __global__ void _h0_sm_butterfly(
     const int16_t* __restrict__ G,   // [N]
+    const int16_t* __restrict__ W,   // [N]
     const T*       __restrict__ LE,  // [nfolds, N], UNSIGNED in template
     int64_t*     __restrict__ H0,  // [nfolds, 2^D, 2] int64
     const int N,
@@ -178,6 +188,7 @@ __global__ void _h0_sm_butterfly(
 
         U lk = static_cast<U>(LE[(size_t)tree_set * N + jj]);
         const int g = (int)G[jj];
+        const int w = (int)W[jj];
 
         for (int d = 0; d < 32; ++d) {
             if (d >= max_depth) break;
@@ -187,7 +198,7 @@ __global__ void _h0_sm_butterfly(
             const int node = to + tk;  // 0..used_nodes-1
 
             s_hist[SH_idx(node, 0, lane)] += g;   // sum(G)
-            s_hist[SH_idx(node, 1, lane)] += 1;   // count
+            s_hist[SH_idx(node, 1, lane)] += w;   // sum(W)
         }
     }
 
@@ -244,10 +255,14 @@ __global__ void _h0_sm_butterfly(
 
 torch::Tensor h0_sm_butterfly(
     torch::Tensor G,        // [N], int16, CUDA
+    torch::Tensor W,        // [N], int16, CUDA
     torch::Tensor LE,       // [nfolds, N], (u)int16/32/64, CUDA
     int max_depth
 ){
     TORCH_CHECK(G.is_cuda() && LE.is_cuda(), "G and LE must be CUDA tensors.");
+    TORCH_CHECK(W.is_cuda() && W.scalar_type() == c10::ScalarType::Short,
+                "W must be CUDA int16.");
+    TORCH_CHECK(W.size(0) == G.size(0), "W must have same length as G.");
     TORCH_CHECK(G.dim() == 1 && LE.dim() == 2, "G:[N], LE:[nfolds,N].");
     TORCH_CHECK(G.scalar_type() == c10::ScalarType::Short, "G must be int16.");
     TORCH_CHECK(max_depth > 0, "max_depth must be > 0.");
@@ -297,17 +312,20 @@ torch::Tensor h0_sm_butterfly(
     if (dt == c10::ScalarType::UInt16) {
         cudaFuncSetAttribute(_h0_sm_butterfly<uint16_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
         _h0_sm_butterfly<uint16_t><<<grid, block, smem_bytes, stream.stream()>>>(
-            G.data_ptr<int16_t>(), LE.data_ptr<uint16_t>(), H0.data_ptr<int64_t>(),
+            G.data_ptr<int16_t>(), W.data_ptr<int16_t>(),
+            LE.data_ptr<uint16_t>(), H0.data_ptr<int64_t>(),
             N, nfolds, max_depth, stride);
     } else if (dt == c10::ScalarType::UInt32) {
         cudaFuncSetAttribute(_h0_sm_butterfly<uint32_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
         _h0_sm_butterfly<uint32_t><<<grid, block, smem_bytes, stream.stream()>>>(
-            G.data_ptr<int16_t>(), LE.data_ptr<uint32_t>(), H0.data_ptr<int64_t>(),
+            G.data_ptr<int16_t>(), W.data_ptr<int16_t>(),
+            LE.data_ptr<uint32_t>(), H0.data_ptr<int64_t>(),
             N, nfolds, max_depth, stride);
     } else if (dt == c10::ScalarType::UInt64) {
         cudaFuncSetAttribute(_h0_sm_butterfly<uint64_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
         _h0_sm_butterfly<uint64_t><<<grid, block, smem_bytes, stream.stream()>>>(
-            G.data_ptr<int16_t>(), LE.data_ptr<uint64_t>(), H0.data_ptr<int64_t>(),
+            G.data_ptr<int16_t>(), W.data_ptr<int16_t>(),
+            LE.data_ptr<uint64_t>(), H0.data_ptr<int64_t>(),
             N, nfolds, max_depth, stride);
     }  else {
         TORCH_CHECK(false, "LE must be one of: (u)int16, (u)int32, (u)int64.");

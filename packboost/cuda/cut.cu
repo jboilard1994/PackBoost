@@ -27,7 +27,8 @@ extern "C" __global__ void cut_cuda_kernel(
     int tree_set,
     // hyperparams
     float L2, float lr, int qgrad_bits, int max_depth,
-    float min_child_weight, float min_split_gain)
+    float min_child_weight, float min_split_gain,
+    float max_delta_step)
 {
   #pragma fp_contract(off)
 
@@ -65,8 +66,9 @@ extern "C" __global__ void cut_cuda_kernel(
   const float qscale = lr * (float)(1u << (31 - qgrad_bits))
                        * powf(2.0f, -(float)(max_depth - depth));
 
-  const bool use_min_child = (min_child_weight > 0.0f);
-  const bool use_min_gain  = (min_split_gain  > 0.0f);
+  const bool use_min_child   = (min_child_weight > 0.0f);
+  const bool use_min_gain    = (min_split_gain   > 0.0f);
+  const bool use_delta_clip  = (max_delta_step   > 0.0f);
 
   // ---- per-candidate search (each lane keeps its own best per fold)
   for (int k = 0; k < K1; ++k) {
@@ -108,8 +110,10 @@ extern "C" __global__ void cut_cuda_kernel(
 
     if (mxs[tree_fold] < S_bits) {
       mxs[tree_fold] = S_bits;
-      vls[tree_fold] = __float2int_rz(__fmul_rn(qscale, V0f));
-      vrs[tree_fold] = __float2int_rz(__fmul_rn(qscale, V1f));
+      const float cv0 = use_delta_clip ? fmaxf(-max_delta_step, fminf(max_delta_step, V0f)) : V0f;
+      const float cv1 = use_delta_clip ? fmaxf(-max_delta_step, fminf(max_delta_step, V1f)) : V1f;
+      vls[tree_fold] = __float2int_rz(__fmul_rn(qscale, cv0));
+      vrs[tree_fold] = __float2int_rz(__fmul_rn(qscale, cv1));
       fs [tree_fold] = (uint16_t)k;
     }
   }
@@ -165,7 +169,8 @@ void cut_cuda_launcher(
     int qgrad_bits,
     int max_depth,
     double min_child_weight,
-    double min_split_gain)
+    double min_split_gain,
+    double max_delta_step)
 {
   const int treesets = F.size(0);
   const int K1       = H.size(0);
@@ -191,5 +196,6 @@ void cut_cuda_launcher(
       qgrad_bits,
       max_depth,
       static_cast<float>(min_child_weight),
-      static_cast<float>(min_split_gain));
+      static_cast<float>(min_split_gain),
+      static_cast<float>(max_delta_step));
 }

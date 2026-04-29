@@ -39,12 +39,14 @@ prep_vars(torch::Tensor L,
 
 torch::Tensor h0_sm(
     torch::Tensor G,        // [N],    int16, cuda
+    torch::Tensor W,        // [N],    int16, cuda
     torch::Tensor LE,       // [nfolds, N], int16/int32/int64 (signed storage)
     int max_depth
 );
 
 torch::Tensor h0_sm_butterfly(
     torch::Tensor G,        // [N], int16, CUDA
+    torch::Tensor W,        // [N], int16, CUDA
     torch::Tensor LE,       // [nfolds, N], (u)int16/32/64, CUDA
     int max_depth
 );
@@ -59,6 +61,7 @@ void repack_trees_for_features_cuda(
 torch::Tensor h_sm(
     torch::Tensor XS,
     torch::Tensor Y,
+    torch::Tensor W,
     torch::Tensor LF,
     int max_depth);
 
@@ -75,7 +78,8 @@ void cut_cuda_launcher(
     int qgrad_bits,
     int max_depth,
     double min_child_weight,
-    double min_split_gain);
+    double min_split_gain,
+    double max_delta_step);
 
 
 static void launch_advpred(
@@ -94,6 +98,7 @@ void advance_and_predict_launcher(
 
 torch::Tensor h0_des_butterfly(
     torch::Tensor G,          // [N], int16, CUDA
+    torch::Tensor W,          // [N], int16, CUDA
     torch::Tensor LE,         // [nfolds, N], (u)int16/32/64, CUDA
     torch::Tensor era_ends,   // [E], int32, CUDA or CPU (will be moved)
     int max_depth
@@ -102,6 +107,7 @@ torch::Tensor h0_des_butterfly(
 torch::Tensor h_des(
     torch::Tensor XS,        // [nfeatsets, N] uint32/int32
     torch::Tensor Y,         // [N]            int16
+    torch::Tensor W,         // [N]            int16
     torch::Tensor LF,        // [nfeatsets, N] uint16/uint32/uint64
     torch::Tensor era_ends,  // [E]            int32 (exclusive ends)
     int max_depth);
@@ -119,7 +125,8 @@ void cut_des_cuda_launcher(
     int qgrad_bits,
     int max_depth,
     double min_child_weight,
-    double min_split_gain);
+    double min_split_gain,
+    double max_delta_step);
 
 namespace {
 

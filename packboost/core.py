@@ -79,7 +79,75 @@ class PackBoost(BaseEstimator, RegressorMixin):
             qgrad_bits: int = 12,
             seed: int = 42,
             encode_cut_device: str = "cuda",
-            era_ids: np.ndarray | None = None):
+            era_ids: np.ndarray | None = None,
+            sample_weight: np.ndarray | None = None,
+            max_delta_step: float = 0.0,
+            profile_every: int = 0):
+        """
+        Fit the PackBoost model.
+
+        Parameters
+        ----------
+        X : np.ndarray, shape (N, F), dtype int8
+            Quantized feature matrix.
+        y : np.ndarray, shape (N,), dtype float32
+            Target values.
+        Xv : np.ndarray, optional
+            Validation feature matrix (same dtype/shape convention as X).
+        Yv : np.ndarray, optional
+            Validation targets.
+        nfolds : int
+            Number of ensemble folds (parallel trees).
+        rounds : int
+            Maximum number of boosting rounds.
+        max_depth : int
+            Maximum tree depth (supports up to 8 with the SMEM kernel).
+        callbacks : list, optional
+            List of callback objects called after each round.
+        feature_name : list, optional
+            Names for each feature column, used for reporting.
+        lr : float
+            Learning rate (shrinkage applied to each tree's leaf values).
+        L2 : float
+            L2 regularization on leaf values (in the same units as
+            ``sample_weight``; scale accordingly if weights are not mean~1).
+        min_child_weight : float
+            Minimum sum of sample weights required in a leaf to allow a split.
+            Interpreted in the same units as ``sample_weight``.
+        min_split_gain : float
+            Minimum gain required to accept a split.
+        nfeatsets : int
+            Number of random feature subsets sampled per round.
+        qgrad_bits : int
+            Bit-width used to quantize gradients to int16 before histogram
+            accumulation.
+        seed : int
+            Random seed for feature-set sampling.
+        encode_cut_device : str
+            Device used for cut-encoding pre-processing (``"cuda"`` or
+            ``"cpu"``).
+        era_ids : np.ndarray, shape (N,), optional
+            Era/group IDs for era-aware gradient normalization.
+        sample_weight : np.ndarray, shape (N,), optional
+            Per-sample weights. Passed as float, then rounded to the nearest
+            integer and stored as int16. Weights should be expressed as
+            **integer ratios** with mean ~1 to avoid quantization dropout
+            (e.g. ``[1, 1, 10]`` to make the last sample 10x more important).
+            Values below 0.5 round to 0 and are effectively excluded.
+            Equivalent to replicating each sample ``w`` times in the dataset.
+        max_delta_step : float, optional
+            If > 0, clips each leaf value to ``[-max_delta_step, +max_delta_step]``
+            before quantization. Useful when using sample weights to prevent
+            high-weight leaves from producing extreme gradient steps. Default 0
+            (disabled). Equivalent to XGBoost's ``max_delta_step``.
+        profile_every : int, optional
+            If > 0, collect internal diagnostics every N rounds and store
+            them in ``self.profile_`` as a ``pandas.DataFrame``. Columns:
+            ``round, G_min, G_max, G_mean_abs, V_min, V_max, V_mean_abs,
+            V_nonzero, P_min, P_max, P_mean, Pv_min, Pv_max, Pv_mean``.
+            Default 0 (disabled). Overhead is negligible (a few GPU
+            reductions on already-resident tensors).
+        """
         assert X.dtype == np.int8 and y.dtype == np.float32
         device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
         encode_device = torch.device(
@@ -128,6 +196,21 @@ class PackBoost(BaseEstimator, RegressorMixin):
         yq30  = (y * (1 << 30)).astype(np.int64)
         Y_i32 = torch.from_numpy(yq30[:N].astype(np.int32)).to(device=device)
         P     = torch.zeros(N, dtype=torch.int32, device=device)
+
+        # ---------- sample weights (int16, mean ~ 1) ----------
+        # If user passes float weights, quantize to int16. Default = ones.
+        # The histograms accumulate sum(w) into channel 1 (replacing the count
+        # semantics). min_child_weight and L2 are interpreted in these same
+        # weighted units, so callers should pass weights normalized to mean ~ 1.
+        if sample_weight is None:
+            W_i16 = torch.ones(N, dtype=torch.int16, device=device)
+        else:
+            assert sample_weight.shape[0] == N, "sample_weight length must equal N"
+            w_np = np.asarray(sample_weight, dtype=np.float32)
+            w_q  = np.rint(w_np).astype(np.int32)
+            w_q  = np.clip(w_q, -32768, 32767).astype(np.int16)
+            W_i16 = torch.from_numpy(w_q).to(device=device)
+        self.W_i16 = W_i16
 
         self.Y_i32 = Y_i32
         self.P_    = P
@@ -207,6 +290,10 @@ class PackBoost(BaseEstimator, RegressorMixin):
         lr_per_fold = lr / float(nfolds)
         self.tree_set = 0
 
+        # ---------- profiling setup ----------
+        do_profile = (profile_every > 0)
+        _prof_rows = [] if do_profile else None
+
         for t in range(rounds):
             
             # early stopping check
@@ -223,6 +310,12 @@ class PackBoost(BaseEstimator, RegressorMixin):
             # (b) pack leaves & gradients (length N)
             LE, G = self.prep_vars(L_old, Y_i32, P)  # LE: u16/u32/u64 ; G: int16
 
+            # --- profile: gradient stats (before they're consumed) ---
+            if do_profile and (t % profile_every == 0):
+                _g_min = int(G.min().item())
+                _g_max = int(G.max().item())
+                _g_mabs = float(G.float().abs().mean().item())
+
             # (c) repack by feature schedule -> LF [nfeatsets, N]
             LF = self.repack(FST, LE, t).contiguous()
 
@@ -237,9 +330,9 @@ class PackBoost(BaseEstimator, RegressorMixin):
                         f"era_ends[-1] must equal N ({N}), got {int(era_ends[-1].item())}"
                     )
 
-                H0_all = self.h0_des(G, LE, int(max_depth), era_ends)            # [K0, 2**D, E, 2]
+                H0_all = self.h0_des(G, W_i16, LE, int(max_depth), era_ends)     # [K0, 2**D, E, 2]
                 H0e    = H0_all[:, :nodes, :, :].contiguous()                    # [K0, nodes, E, 2]
-                He     = self.h_des(XS, G, LF, int(max_depth), era_ends)         # [K1, E, nodes, 2, 32]
+                He     = self.h_des(XS, G, W_i16, LF, int(max_depth), era_ends)  # [K1, E, nodes, 2, 32]
 
                 self.cut_des(
                     self.Fsch, FST, He, H0e, self.V, self.I,
@@ -247,13 +340,14 @@ class PackBoost(BaseEstimator, RegressorMixin):
                     qgrad_bits=qgrad_bits, max_depth=D,
                     min_child_weight=min_child_weight,
                     min_split_gain=min_split_gain,
+                    max_delta_step=max_delta_step,
                 )
 
                 del He, H0_all, H0e
             else:
                 # Non-DES path (single era)
-                H  = self.H (XS, G, LF, D).contiguous()                          # [K1, nodes, 2, 32]
-                H0 = self.h0(G, LE, D).contiguous()                              # [K0, 2**D, 2]
+                H  = self.H (XS, G, W_i16, LF, D).contiguous()                   # [K1, nodes, 2, 32]
+                H0 = self.h0(G, W_i16, LE, D).contiguous()                       # [K0, 2**D, 2]
                 self.cut(
                     self.Fsch, FST, H, H0[:, : H.size(1), :].contiguous(),       # -> [K0, nodes, 2]
                     self.V, self.I,
@@ -261,6 +355,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                     qgrad_bits=qgrad_bits, max_depth=D,
                     min_child_weight=min_child_weight,
                     min_split_gain=min_split_gain,
+                    max_delta_step=max_delta_step,
                 )
                 del H, H0
 
@@ -274,6 +369,39 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 Lv, Lvn = Lvn, Lv
 
             self.tree_set = t + 1
+
+            # --- profile: leaf value & prediction stats ---
+            if do_profile and (t % profile_every == 0):
+                Vt = self.V[t].float()
+                Vt_nz = Vt[Vt != 0]
+                _v_nz = int(Vt_nz.numel())
+                if _v_nz > 0:
+                    _v_min = int(Vt_nz.min().item())
+                    _v_max = int(Vt_nz.max().item())
+                    _v_mabs = float(Vt_nz.abs().mean().item())
+                else:
+                    _v_min = _v_max = 0
+                    _v_mabs = 0.0
+
+                _p_min = float(P.min().item())
+                _p_max = float(P.max().item())
+                _p_mean = float(P.float().mean().item())
+
+                if use_val:
+                    _pv_min = float(Pv.min().item())
+                    _pv_max = float(Pv.max().item())
+                    _pv_mean = float(Pv.float().mean().item())
+                else:
+                    _pv_min = _pv_max = _pv_mean = float('nan')
+
+                _prof_rows.append({
+                    'round': t,
+                    'G_min': _g_min, 'G_max': _g_max, 'G_mean_abs': _g_mabs,
+                    'V_min': _v_min, 'V_max': _v_max, 'V_mean_abs': _v_mabs,
+                    'V_nonzero': _v_nz,
+                    'P_min': _p_min, 'P_max': _p_max, 'P_mean': _p_mean,
+                    'Pv_min': _pv_min, 'Pv_max': _pv_max, 'Pv_mean': _pv_mean,
+                })
 
             # (h) callbacks
             for cb in callbacks:
@@ -293,6 +421,13 @@ class PackBoost(BaseEstimator, RegressorMixin):
             if isinstance(cb, EarlyStoppingCallback) and cb.keep_best:
                 cb.restore_best(self)
                 break
+
+        # ---------- assemble profile DataFrame ----------
+        if do_profile and _prof_rows:
+            import pandas as _pd
+            self.profile_ = _pd.DataFrame(_prof_rows).set_index('round')
+        elif do_profile:
+            self.profile_ = None
 
         # ---------- stash for inference ----------
         self.FST  = FST
@@ -417,21 +552,23 @@ class PackBoost(BaseEstimator, RegressorMixin):
         return LE.contiguous(), G.contiguous()
 
 
-    def h0(self, G: torch.Tensor, LE: torch.Tensor, max_depth: int) -> torch.Tensor:
+    def h0(self, G: torch.Tensor, W: torch.Tensor, LE: torch.Tensor, max_depth: int) -> torch.Tensor:
         nfolds, N = LE.shape
         nodes = 1 << max_depth
         if (G.is_cuda or LE.is_cuda) and torch.cuda.is_available():
-            return kernels.h0_sm_butterfly(G.contiguous(), LE.contiguous(), int(max_depth))
+            return kernels.h0_sm_butterfly(G.contiguous(), W.contiguous(), LE.contiguous(), int(max_depth))
 
         # --- CPU vectorized fallback ---
         H0 = torch.zeros((nfolds, nodes, 2), dtype=torch.int64, device=LE.device)
         H0_sum = H0[..., 0]  # [nfolds, nodes]
-        H0_cnt = H0[..., 1]  # [nfolds, nodes]
+        H0_w   = H0[..., 1]  # [nfolds, nodes]
 
         le64 = LE.to(torch.int64, copy=False).contiguous()   # [nfolds, N]
         g64  = G.to(torch.int64,  copy=False).contiguous()   # [N]
+        w64  = W.to(torch.int64,  copy=False).contiguous()   # [N]
         SRC  = g64.unsqueeze(0).expand(nfolds, N).contiguous()
-        ONES = torch.ones_like(SRC, dtype=torch.int64)
+        WSRC = w64.unsqueeze(0).expand(nfolds, N).contiguous()
+        WGSRC = (g64 * w64).unsqueeze(0).expand(nfolds, N).contiguous()  # weighted gradient
 
         for d in range(max_depth):
             if d == 0:
@@ -441,8 +578,8 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 base = (1 << d) - 1
                 mask = (1 << d) - 1
                 idx = (((le64 >> s) & mask) + base).to(torch.long)
-            H0_sum.scatter_add_(1, idx, SRC)
-            H0_cnt.scatter_add_(1, idx, ONES)
+            H0_sum.scatter_add_(1, idx, WGSRC)
+            H0_w.scatter_add_(1, idx, WSRC)
 
         return H0
 
@@ -497,15 +634,16 @@ class PackBoost(BaseEstimator, RegressorMixin):
         return LF.contiguous()
     
 
-    def H(self, XS: torch.Tensor, Y: torch.Tensor, LF: torch.Tensor, max_depth: int) -> torch.Tensor:
+    def H(self, XS: torch.Tensor, Y: torch.Tensor, W: torch.Tensor, LF: torch.Tensor, max_depth: int) -> torch.Tensor:
         """
         XS : [nfeatsets, 32*M] (uint32/int32), packed features
-        Y  : [N]               (int32/int64), target/gradient
+        Y  : [N]               (int16), gradient
+        W  : [N]               (int16), per-sample weights
         LF : [nfeatsets, N]    (uint16/uint32/uint64), path codes (Murky parity)
         max_depth: int (<= 7 for the SMEM variant on GPU)
         Returns:
         H: [nfeatsets, (1<<max_depth)-1, 2, 32] int64
-            last dim = lane (0..31); channel 0=sum(y*v), 1=count(v)
+            channel 0 = sum(y*v), 1 = sum(w*v)
         """
         nfeatsets, cols_32M = XS.shape
         N = int(Y.shape[0])
@@ -513,8 +651,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
         # --- GPU fast path ---
         if (XS.is_cuda or Y.is_cuda or LF.is_cuda) and torch.cuda.is_available():
-            # Expect your compiled extension to expose kernels.h_sm .to(torch.int32)
-            return kernels.h_sm(XS.contiguous(), Y.contiguous(), LF.contiguous(), int(max_depth))
+            return kernels.h_sm(XS.contiguous(), Y.contiguous(), W.contiguous(), LF.contiguous(), int(max_depth))
 
         # --- CPU vectorized fallback ---
         dev = XS.device
@@ -530,6 +667,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
         # Casts (no copies if already correct)
         Y64  = Y.to(TORCH_INT64,  copy=False).contiguous()                     # [N]
+        W64  = W.to(TORCH_INT64,  copy=False).contiguous()                     # [N]
         LF64 = LF.to(TORCH_INT64, copy=False).contiguous()                     # [F, N]
         XS64 = XS.to(TORCH_INT64, copy=False).contiguous().view(nfeatsets, M, 32)  # [F, M, 32]
 
@@ -545,29 +683,30 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
         # Common broadcasts
         Y_b  = Y64.view(1, 1, N)                      # [1,1,N]
-        ones = torch.ones((1, 1, N), dtype=TORCH_INT64, device=dev)
+        W_b  = W64.view(1, 1, N)                      # [1,1,N]
+        WY_b = W_b * Y_b                              # [1,1,N] weighted gradient
 
         # -------- depth = 0 (node 0) --------
-        H_sum[:, 0, :] = (V * Y_b).sum(dim=2)         # [F, 32]
-        H_cnt[:, 0, :] = V.sum(dim=2)                 # [F, 32]
+        H_sum[:, 0, :] = (V * WY_b).sum(dim=2)        # [F, 32]
+        H_cnt[:, 0, :] = (V * W_b).sum(dim=2)         # [F, 32]
 
         # -------- depth = 1 (nodes 1,2) --------
         tk1 = (LF64 & 1)                               # [F, N]
         m0  = (tk1 == 0).to(TORCH_INT64).unsqueeze(1)  # [F,1,N]
         m1  = 1 - m0                                   # [F,1,N]
 
-        H_sum[:, 1, :] = (V * (Y_b * m0)).sum(dim=2)   # -> node 1
-        H_cnt[:, 1, :] = (V * m0).sum(dim=2)
-        H_sum[:, 2, :] = (V * (Y_b * m1)).sum(dim=2)   # -> node 2
-        H_cnt[:, 2, :] = (V * m1).sum(dim=2)
+        H_sum[:, 1, :] = (V * (WY_b * m0)).sum(dim=2)  # -> node 1
+        H_cnt[:, 1, :] = (V * (W_b * m0)).sum(dim=2)
+        H_sum[:, 2, :] = (V * (WY_b * m1)).sum(dim=2)  # -> node 2
+        H_cnt[:, 2, :] = (V * (W_b * m1)).sum(dim=2)
 
         # -------- depth = 2 (nodes 3..6) via one-hot --------
         tk2 = ((LF64 >> 1) & 3).to(torch.long)         # [F, N]
         oh2 = Fn.one_hot(tk2, num_classes=4).to(TORCH_INT64)  # [F, N, 4]
         oh2 = oh2.unsqueeze(1)                         # [F,1,N,4]
         V4  = V.unsqueeze(-1)                          # [F,32,N,1]
-        sum2 = (V4 * (Y_b.unsqueeze(-1) * oh2)).sum(dim=2)   # [F,32,4]
-        cnt2 = (V4 * oh2).sum(dim=2)                   # [F,32,4]
+        sum2 = (V4 * (WY_b.unsqueeze(-1) * oh2)).sum(dim=2)  # [F,32,4]
+        cnt2 = (V4 * (W_b.unsqueeze(-1) * oh2)).sum(dim=2)   # [F,32,4]
         H_sum[:, 3:7, :] = sum2.permute(0, 2, 1).contiguous()  # [F,4,32]
         H_cnt[:, 3:7, :] = cnt2.permute(0, 2, 1).contiguous()
 
@@ -576,6 +715,8 @@ class PackBoost(BaseEstimator, RegressorMixin):
             F32 = nfeatsets * 32
             V_flat  = V.view(F32, N)                               # [F*32, N]
             Y_flat  = Y64.view(1, N).expand(F32, N)               # [F*32, N]
+            W_flat  = W64.view(1, N).expand(F32, N)               # [F*32, N]
+            WY_flat = (Y64 * W64).view(1, N).expand(F32, N)       # [F*32, N] weighted grad
 
             for d in range(3, max_depth):
                 s     = (d * (d - 1)) // 2
@@ -588,8 +729,8 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 out_sum = torch.zeros((F32, nodes_tot), dtype=TORCH_INT64, device=dev)
                 out_cnt = torch.zeros_like(out_sum)
 
-                out_sum.scatter_add_(1, idx_b, (V_flat * Y_flat))
-                out_cnt.scatter_add_(1, idx_b, V_flat)
+                out_sum.scatter_add_(1, idx_b, (V_flat * WY_flat))
+                out_cnt.scatter_add_(1, idx_b, (V_flat * W_flat))
 
                 # reshape back to [F, 32, nodes] -> [F, nodes, 32]
                 H_sum[:, :, :] += out_sum.view(nfeatsets, 32, nodes_tot).permute(0, 2, 1)
@@ -614,6 +755,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         max_depth: int,
         min_child_weight: float = 20.0,
         min_split_gain: float = 0.0,
+        max_delta_step: float = 0.0,
     ):
         use_cuda = (
             F.is_cuda or FST.is_cuda or H.is_cuda or
@@ -628,6 +770,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 int(tree_set), float(L2), float(lr),
                 int(qgrad_bits), int(max_depth),
                 float(min_child_weight), float(min_split_gain),
+                float(max_delta_step),
             )
             return V, I
 
@@ -765,6 +908,11 @@ class PackBoost(BaseEstimator, RegressorMixin):
             V0_sel = G0_sel / (N0_sel + L2_sel)
             V1_sel = (G01_sel - G0_sel) / ((N01_sel - N0_sel) + L2_sel)
 
+            # Clip leaf values if max_delta_step > 0 (mirrors CUDA kernel)
+            if max_delta_step > 0.0:
+                V0_sel = V0_sel.clamp(-max_delta_step, max_delta_step)
+                V1_sel = V1_sel.clamp(-max_delta_step, max_delta_step)
+
             # Only write leaves that had at least one valid candidate
             mask = valid_leaf
             if not mask.any().item():
@@ -871,6 +1019,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         # -------- DES: H0 per-era (parents) --------
     def h0_des(self,
             G:  torch.Tensor,   # [N] int16
+            W:  torch.Tensor,   # [N] int16
             LE: torch.Tensor,   # [nfolds, N] (u16/u32/u64)
             max_depth: int,
             era_bounds: torch.Tensor | None = None  # [E] int32 (exclusive ends; last==N)
@@ -892,7 +1041,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
         use_cuda = (G.is_cuda or LE.is_cuda or era_ends.is_cuda) and torch.cuda.is_available()
         if use_cuda:
-            return kernels.h0_des(G.contiguous(), LE.contiguous(), era_ends.contiguous(), int(max_depth)).contiguous()
+            return kernels.h0_des(G.contiguous(), W.contiguous(), LE.contiguous(), era_ends.contiguous(), int(max_depth)).contiguous()
 
         # -------- CPU parity (multi-era) --------
         E = int(era_ends.numel())
@@ -915,8 +1064,9 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
             # Slice to this era and reuse your CPU h0()
             G_e  = G[e0:e1].to(device=LE.device, dtype=G.dtype, copy=False).contiguous()
+            W_e  = W[e0:e1].to(device=LE.device, dtype=W.dtype, copy=False).contiguous()
             LE_e = LE[:, e0:e1].to(device=LE.device, dtype=LE.dtype, copy=False).contiguous()
-            H0_slice = self.h0(G_e, LE_e, max_depth)  # [nfolds, 2**D, 2] (int64)
+            H0_slice = self.h0(G_e, W_e, LE_e, max_depth)  # [nfolds, 2**D, 2] (int64)
 
             # Place into era dimension
             H0e[:, :, ei, :] = H0_slice
@@ -927,6 +1077,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
     def h_des(self,
             XS: torch.Tensor,   # [K1, 32*M] uint32/int32  (padded to Np=32*M)
             Y:  torch.Tensor,   # [N] int16
+            W:  torch.Tensor,   # [N] int16
             LF: torch.Tensor,   # [K1, N] (u16/u32/u64)
             max_depth: int,
             era_bounds: torch.Tensor | None = None  # [E] int32 (exclusive ends; last==N)
@@ -948,7 +1099,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         use_cuda = (XS.is_cuda or Y.is_cuda or LF.is_cuda or era_ends.is_cuda) and torch.cuda.is_available()
         if use_cuda:
             return kernels.h_des(
-                XS.contiguous(), Y.contiguous(), LF.contiguous(),
+                XS.contiguous(), Y.contiguous(), W.contiguous(), LF.contiguous(),
                 era_ends.contiguous(), int(max_depth)
             ).contiguous()
 
@@ -963,6 +1114,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         # Prepare base casted views (no copy if already correct)
         XS64 = XS.to(TORCH_INT64, copy=False).view(K1, M, 32)  # [K1, M, 32]
         Y64  = Y.to(TORCH_INT64,  copy=False)                  # [N]
+        W64  = W.to(TORCH_INT64,  copy=False)                  # [N]
         LF64 = LF.to(TORCH_INT64, copy=False)                  # [K1, N]
 
         # era starts from [0] + era_ends[:-1]
@@ -1009,7 +1161,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
             # Broadcasts
             Y_b  = Y64.view(1, 1, N)                      # [1,1,N]
-            onesN = torch.ones((1, 1, N), dtype=TORCH_INT64, device=XS.device)
+            W_b  = W64.view(1, 1, N)                      # [1,1,N]
 
             # Allocate per-era accumulators (match H() layout then assign into He[:, ei])
             H_sum = torch.zeros((K1, nodes, 32), dtype=TORCH_INT64, device=XS.device)
@@ -1017,16 +1169,16 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
             # depth 0
             H_sum[:, 0, :] = (V * Y_b).sum(dim=2)
-            H_cnt[:, 0, :] = V.sum(dim=2)
+            H_cnt[:, 0, :] = (V * W_b).sum(dim=2)
 
             # depth 1
             tk1 = (LF64 & 1)                             # [K1, N]
             m0  = (tk1 == 0).to(TORCH_INT64).unsqueeze(1)  # [K1,1,N]
             m1  = 1 - m0
             H_sum[:, 1, :] = (V * (Y_b * m0)).sum(dim=2)
-            H_cnt[:, 1, :] = (V * m0).sum(dim=2)
+            H_cnt[:, 1, :] = (V * (W_b * m0)).sum(dim=2)
             H_sum[:, 2, :] = (V * (Y_b * m1)).sum(dim=2)
-            H_cnt[:, 2, :] = (V * m1).sum(dim=2)
+            H_cnt[:, 2, :] = (V * (W_b * m1)).sum(dim=2)
 
             # depth 2
             tk2 = ((LF64 >> 1) & 3).to(torch.long)       # [K1, N]
@@ -1034,7 +1186,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
             oh2 = oh2.unsqueeze(1)                       # [K1,1,N,4]
             V4  = V.unsqueeze(-1)                        # [K1,32,N,1]
             sum2 = (V4 * (Y_b.unsqueeze(-1) * oh2)).sum(dim=2)   # [K1,32,4]
-            cnt2 = (V4 * oh2).sum(dim=2)                 # [K1,32,4]
+            cnt2 = (V4 * (W_b.unsqueeze(-1) * oh2)).sum(dim=2)   # [K1,32,4]
             H_sum[:, 3:7, :] = sum2.permute(0, 2, 1).contiguous()  # [K1,4,32]
             H_cnt[:, 3:7, :] = cnt2.permute(0, 2, 1).contiguous()
 
@@ -1043,6 +1195,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 F32 = K1 * 32
                 V_flat = V.view(F32, N)
                 Y_flat = Y64.view(1, N).expand(F32, N)
+                W_flat = W64.view(1, N).expand(F32, N)
                 for d in range(3, max_depth):
                     s = (d * (d - 1)) // 2
                     base = (1 << d) - 1
@@ -1053,7 +1206,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                     out_sum = torch.zeros((F32, nodes), dtype=TORCH_INT64, device=XS.device)
                     out_cnt = torch.zeros_like(out_sum)
                     out_sum.scatter_add_(1, idx_b, (V_flat * Y_flat))
-                    out_cnt.scatter_add_(1, idx_b, V_flat)
+                    out_cnt.scatter_add_(1, idx_b, (V_flat * W_flat))
 
                     H_sum += out_sum.view(K1, 32, nodes).permute(0, 2, 1)
                     H_cnt += out_cnt.view(K1, 32, nodes).permute(0, 2, 1)
@@ -1080,6 +1233,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         max_depth: int,
         min_child_weight: float = 20.0,
         min_split_gain: float = 0.0,
+        max_delta_step: float = 0.0,
     ):
         use_cuda = any(t.is_cuda for t in (F, FST, H, H0, V, I)) and torch.cuda.is_available()
         if use_cuda:
@@ -1091,6 +1245,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 int(tree_set), float(L2), float(lr),
                 int(qgrad_bits), int(max_depth),
                 float(min_child_weight), float(min_split_gain),
+                float(max_delta_step),
             )
             return V, I
 
@@ -1218,11 +1373,13 @@ class PackBoost(BaseEstimator, RegressorMixin):
                     ):
                         best_dir  [lane, f] = dir_score
                         best_sbits[lane, f] = S_bits
+                        cv0 = max(-max_delta_step, min(max_delta_step, V0f)) if max_delta_step > 0.0 else V0f
+                        cv1 = max(-max_delta_step, min(max_delta_step, V1f)) if max_delta_step > 0.0 else V1f
                         best_vl   [lane, f] = int(
-                            torch.trunc(torch.tensor(qsn * V0f, device=device)).item()
+                            torch.trunc(torch.tensor(qsn * cv0, device=device)).item()
                         )
                         best_vr   [lane, f] = int(
-                            torch.trunc(torch.tensor(qsn * V1f, device=device)).item()
+                            torch.trunc(torch.tensor(qsn * cv1, device=device)).item()
                         )
                         best_k    [lane, f] = k
 

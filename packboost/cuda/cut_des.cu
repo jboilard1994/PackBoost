@@ -39,7 +39,8 @@ extern "C" __global__ void cut_des_cuda_kernel(
     int tree_set,
     // hyperparams
     float L2, float lr, int qgrad_bits, int max_depth,
-    float min_child_weight, float min_split_gain)
+    float min_child_weight, float min_split_gain,
+    float max_delta_step)
 {
   #pragma fp_contract(off)
 
@@ -59,8 +60,9 @@ extern "C" __global__ void cut_des_cuda_kernel(
   const float qscale = lr * (float)(1u << (31 - qgrad_bits))
                        * powf(2.0f, -(float)(max_depth - depth));
 
-  const bool use_min_child = (min_child_weight > 0.0f);
-  const bool use_min_gain  = (min_split_gain  > 0.0f);
+  const bool use_min_child  = (min_child_weight > 0.0f);
+  const bool use_min_gain   = (min_split_gain   > 0.0f);
+  const bool use_delta_clip = (max_delta_step   > 0.0f);
 
   // Per-lane per-fold scratch (track best candidate)
   float    best_dir [CUTCUDA_MAX_FOLDS];
@@ -158,8 +160,10 @@ extern "C" __global__ void cut_des_cuda_kernel(
     if (better_pair(dir_score, S_bits, best_dir[tree_fold], best_sbit[tree_fold])) {
       best_dir [tree_fold] = dir_score;
       best_sbit[tree_fold] = S_bits;
-      best_vl  [tree_fold] = __float2int_rz(qscale * V0f);
-      best_vr  [tree_fold] = __float2int_rz(qscale * V1f);
+      const float cv0 = use_delta_clip ? fmaxf(-max_delta_step, fminf(max_delta_step, V0f)) : V0f;
+      const float cv1 = use_delta_clip ? fmaxf(-max_delta_step, fminf(max_delta_step, V1f)) : V1f;
+      best_vl  [tree_fold] = __float2int_rz(qscale * cv0);
+      best_vr  [tree_fold] = __float2int_rz(qscale * cv1);
       best_k   [tree_fold] = (uint16_t)k;
     }
   }
@@ -221,7 +225,8 @@ void cut_des_cuda_launcher(
     int qgrad_bits,
     int max_depth,
     double min_child_weight,
-    double min_split_gain)
+    double min_split_gain,
+    double max_delta_step)
 {
   TORCH_CHECK(F.dim()==2 && FST.dim()==3 && H.dim()==5 && H0.dim()==4,
               "Shapes must be: F[rounds,32*K1], FST[rounds,K1,D], H[K1,E,nodes,2,32], H0[K0,nodes,E,2]");
@@ -257,7 +262,8 @@ void cut_des_cuda_launcher(
       rounds, K0, K1, E, nodes, D, (int)tree_set,
       (float)L2, (float)lr, qgrad_bits, max_depth,
       (float)min_child_weight,
-      (float)min_split_gain);
+      (float)min_split_gain,
+      (float)max_delta_step);
 
   auto err = cudaGetLastError();
   TORCH_CHECK(err == cudaSuccess, "cut_des_cuda_kernel launch failed: ",

@@ -113,11 +113,13 @@ def test_h0_matches_cpu_reference():
             LE_host = LE_unsigned if use_unsigned else ref_LE
             G_host  = ref_G
 
+            W_host = torch.ones(N, dtype=torch.int16)
+
             # CPU reference
-            H0_ref = pack_cpu.h0(G_host, LE_host, D)
+            H0_ref = pack_cpu.h0(G_host, W_host, LE_host, D)
 
             # GPU result
-            H0_out = pack_gpu.h0(G_host.cuda(), LE_host.cuda(), D)
+            H0_out = pack_gpu.h0(G_host.cuda(), W_host.cuda(), LE_host.cuda(), D)
             torch.cuda.synchronize()
 
             # Shape check: [K, 2^D, 2]
@@ -240,14 +242,16 @@ def test_h_matches_cpu_reference():
 
         # --- CPU reference ---
         Y32_cpu = G_ref#.to(torch.int32)                 # H expects int32 Y
-        H_ref   = pack_cpu.H(XS_cpu, Y32_cpu, LF_ref, D)
+        W_cpu   = torch.ones(N, dtype=torch.int16)
+        H_ref   = pack_cpu.H(XS_cpu, Y32_cpu, W_cpu, LF_ref, D)
 
         # --- GPU output ---
         XS_gpu  = XS_cpu.cuda()
         Y32_gpu = Y32_cpu.cuda()
+        W_gpu   = W_cpu.cuda()
         LF_gpu  = LF_ref.cuda()
 
-        H_out = pack_gpu.H(XS_gpu, Y32_gpu, LF_gpu, D)
+        H_out = pack_gpu.H(XS_gpu, Y32_gpu, W_gpu, LF_gpu, D)
         torch.cuda.synchronize()
 
         # --- Checks ---
@@ -308,8 +312,9 @@ def test_cut_matches_cpu_reference():
         M = (N + 31) // 32
         XS_cpu = torch.randint(0, 2 ** 32, (nfeatsets, 32 * M), dtype=torch.int64).to(torch.uint32)
 
-        H_ref   = pack_cpu.H(XS_cpu, G_ref, LF_ref, D)
-        H0_full = pack_cpu.h0(G_ref, LE_ref, D)
+        W_ref = torch.ones(N, dtype=torch.int16)
+        H_ref   = pack_cpu.H(XS_cpu, G_ref, W_ref, LF_ref, D)
+        H0_full = pack_cpu.h0(G_ref, W_ref, LE_ref, D)
         H0_ref  = H0_full[:, : (1 << D) - 1, :]
 
         F_row_elems = 32 * nfeatsets
@@ -454,7 +459,8 @@ def test_h0_des_matches_per_era_baseline_tail():
     P = torch.randint(lo, hi + 1, (N,), dtype=torch.int32)
     LE, G = pack_cpu.prep_vars(L_bits, Y, P)
 
-    H0_out = pack_gpu.h0_des(G.cuda(), LE.cuda(), D, era_ends.cuda())
+    W = torch.ones(N, dtype=torch.int16)
+    H0_out = pack_gpu.h0_des(G.cuda(), W.cuda(), LE.cuda(), D, era_ends.cuda())
     #H0_out = _norm_H0_layout(H0_out, K0, E, nodes_all)
 
     print(H0_out.shape)
@@ -462,7 +468,7 @@ def test_h0_des_matches_per_era_baseline_tail():
     # CPU per-era baseline
     s = 0; H0_refs = []
     for e in era_ends.tolist():
-        H0_e = pack_cpu.h0(G[s:e], LE[:, s:e], D)
+        H0_e = pack_cpu.h0(G[s:e], W[s:e], LE[:, s:e], D)
         H0_refs.append(H0_e.unsqueeze(2))
         s = e
     H0_ref = torch.cat(H0_refs, dim=2).contiguous()
@@ -512,7 +518,8 @@ def test_h_des_matches_per_era_baseline():
     XS = torch.randint(0, 2**32, (K1, N), dtype=torch.int64).to(torch.uint32)
 
     # --- GPU DES h ---
-    He_out = pack_gpu.h_des(XS.cuda(), G.cuda(), LF.cuda(), D, era_ends.cuda())
+    W = torch.ones(N, dtype=torch.int16)
+    He_out = pack_gpu.h_des(XS.cuda(), G.cuda(), W.cuda(), LF.cuda(), D, era_ends.cuda())
     torch.cuda.synchronize()
     He_out = _norm_He_layout(He_out, K1, E, nodes)
 
@@ -520,7 +527,7 @@ def test_h_des_matches_per_era_baseline():
     He_refs = []
     s = 0
     for e in era_ends.tolist():
-        H_e = pack_cpu.H(XS[:, s:e], G[s:e], LF[:, s:e], D)  # [K1, nodes, 2, 32]
+        H_e = pack_cpu.H(XS[:, s:e], G[s:e], W[s:e], LF[:, s:e], D)  # [K1, nodes, 2, 32]
         He_refs.append(H_e.unsqueeze(1))                     # [K1, 1, nodes, 2, 32]
         s = e
     He_ref = torch.cat(He_refs, dim=1)                       # [K1, E, nodes, 2, 32]
@@ -563,8 +570,9 @@ def test_cut_des_matches_cpu_reference():
 
     # XS and DES stats (GPU)
     XS = torch.randint(0, 2**32, (K1, N), dtype=torch.int64).to(torch.uint32)
-    H0_all_gpu = pack_gpu.h0_des(G.cuda(), LE.cuda(), D, era_ends.cuda())             # [K0, 2**D, E, 2]
-    He_gpu     = pack_gpu.h_des  (XS.cuda(), G.cuda(), LF.cuda(), D, era_ends.cuda()) # [K1, E, nodes, 2, 32]
+    W = torch.ones(N, dtype=torch.int16)
+    H0_all_gpu = pack_gpu.h0_des(G.cuda(), W.cuda(), LE.cuda(), D, era_ends.cuda())             # [K0, 2**D, E, 2]
+    He_gpu     = pack_gpu.h_des  (XS.cuda(), G.cuda(), W.cuda(), LF.cuda(), D, era_ends.cuda()) # [K1, E, nodes, 2, 32]
     torch.cuda.synchronize()
 
     # Canonical DES layouts for selector
@@ -632,8 +640,9 @@ def test_des_end_to_end_cut_agrees_with_stacked_baseline():
 
     # XS + DES stats via GPU
     XS = torch.randint(0, 2**32, (K1, N), dtype=torch.int64).to(torch.uint32)
-    H0_all_gpu = pack_gpu.h0_des(G.cuda(), LE.cuda(), D, era_ends.cuda())             # [K0, 2**D, E, 2]
-    He_gpu     = pack_gpu.h_des  (XS.cuda(), G.cuda(), LF.cuda(), D, era_ends.cuda()) # [K1, E, nodes, 2, 32]
+    W = torch.ones(N, dtype=torch.int16)
+    H0_all_gpu = pack_gpu.h0_des(G.cuda(), W.cuda(), LE.cuda(), D, era_ends.cuda())             # [K0, 2**D, E, 2]
+    He_gpu     = pack_gpu.h_des  (XS.cuda(), G.cuda(), W.cuda(), LF.cuda(), D, era_ends.cuda()) # [K1, E, nodes, 2, 32]
     torch.cuda.synchronize()
 
     H0e_gpu = H0_all_gpu[:, :nodes, :, :].contiguous()   # [K0, nodes, E, 2]
