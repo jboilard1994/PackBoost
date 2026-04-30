@@ -129,12 +129,15 @@ class PackBoost(BaseEstimator, RegressorMixin):
         era_ids : np.ndarray, shape (N,), optional
             Era/group IDs for era-aware gradient normalization.
         sample_weight : np.ndarray, shape (N,), optional
-            Per-sample weights. Passed as float, then rounded to the nearest
-            integer and stored as int16. Weights should be expressed as
-            **integer ratios** with mean ~1 to avoid quantization dropout
-            (e.g. ``[1, 1, 10]`` to make the last sample 10x more important).
-            Values below 0.5 round to 0 and are effectively excluded.
-            Equivalent to replicating each sample ``w`` times in the dataset.
+            Per-sample weights (float, must be >= 0). Fractional values are
+            supported: internally weights are scaled by 1024 before rounding
+            to int16, giving a resolution of 1/1024 ≈ 0.001. The maximum
+            representable weight is 32767/1024 ≈ 31.999; a ``ValueError`` is
+            raised if any weight exceeds this. Values below ~0.00049 round to
+            0 and are effectively excluded. L2 and min_child_weight are scaled
+            by the same factor internally so their user-facing units remain
+            unchanged (mean weight ~1). Passing ``np.ones(N)`` is equivalent
+            to not passing sample_weight.
         max_delta_step : float, optional
             If > 0, clips each leaf value to ``[-max_delta_step, +max_delta_step]``
             before quantization. Useful when using sample weights to prevent
@@ -198,18 +201,36 @@ class PackBoost(BaseEstimator, RegressorMixin):
         P     = torch.zeros(N, dtype=torch.int32, device=device)
 
         # ---------- sample weights (int16, mean ~ 1) ----------
-        # If user passes float weights, quantize to int16. Default = ones.
-        # The histograms accumulate sum(w) into channel 1 (replacing the count
-        # semantics). min_child_weight and L2 are interpreted in these same
-        # weighted units, so callers should pass weights normalized to mean ~ 1.
+        # Fractional weights are supported via fixed-point scaling: w=1.0 maps to
+        # W_i16=1024, giving 1/1024 resolution. L2 and min_child_weight are scaled
+        # by the same factor so the effective leaf value formula stays:
+        #   V = sum(G*w) / (sum(w) + L2).
+        # Default (no weights): W_i16=1, w_scale=1 (unchanged behavior).
+        _W_FRAC_SCALE = 1024
+        _W_MAX = 32767.0 / _W_FRAC_SCALE   # ~31.999
         if sample_weight is None:
             W_i16 = torch.ones(N, dtype=torch.int16, device=device)
+            _w_scale = 1
         else:
             assert sample_weight.shape[0] == N, "sample_weight length must equal N"
             w_np = np.asarray(sample_weight, dtype=np.float32)
-            w_q  = np.rint(w_np).astype(np.int32)
-            w_q  = np.clip(w_q, -32768, 32767).astype(np.int16)
+            if np.any(w_np < 0.0):
+                raise ValueError(
+                    f"sample_weight contains negative values (min={w_np.min():.6g}). "
+                    "Negative weights are not supported."
+                )
+            w_max = float(w_np.max())
+            if w_max > _W_MAX:
+                raise ValueError(
+                    f"sample_weight contains values exceeding the maximum representable weight "
+                    f"of {_W_MAX:.4f} (got {w_max:.6g}). "
+                    f"Normalize weights so that max(sample_weight) <= {_W_MAX:.4f}, "
+                    f"e.g. sample_weight = sample_weight / sample_weight.max() * {_W_MAX:.4f}."
+                )
+            w_q  = np.rint(w_np * _W_FRAC_SCALE).astype(np.int64)
+            w_q  = np.clip(w_q, 0, 32767).astype(np.int16)
             W_i16 = torch.from_numpy(w_q).to(device=device)
+            _w_scale = _W_FRAC_SCALE
         self.W_i16 = W_i16
 
         self.Y_i32 = Y_i32
@@ -336,9 +357,9 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
                 self.cut_des(
                     self.Fsch, FST, He, H0e, self.V, self.I,
-                    tree_set=t, L2=L2, lr=lr_per_fold,
+                    tree_set=t, L2=L2 * _w_scale, lr=lr_per_fold,
                     qgrad_bits=qgrad_bits, max_depth=D,
-                    min_child_weight=min_child_weight,
+                    min_child_weight=min_child_weight * _w_scale,
                     min_split_gain=min_split_gain,
                     max_delta_step=max_delta_step,
                 )
@@ -351,9 +372,9 @@ class PackBoost(BaseEstimator, RegressorMixin):
                 self.cut(
                     self.Fsch, FST, H, H0[:, : H.size(1), :].contiguous(),       # -> [K0, nodes, 2]
                     self.V, self.I,
-                    tree_set=t, L2=L2, lr=lr_per_fold,
+                    tree_set=t, L2=L2 * _w_scale, lr=lr_per_fold,
                     qgrad_bits=qgrad_bits, max_depth=D,
-                    min_child_weight=min_child_weight,
+                    min_child_weight=min_child_weight * _w_scale,
                     min_split_gain=min_split_gain,
                     max_delta_step=max_delta_step,
                 )
