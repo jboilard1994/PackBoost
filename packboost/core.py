@@ -19,6 +19,29 @@ class PackBoost(BaseEstimator, RegressorMixin):
         self.feature_name = None
         self.comment = comment
 
+    def release_gpu_memory(self):
+        """Explicitly free all GPU tensors held by this model.
+
+        Call this before ``del model`` inside loops to ensure CUDA memory is
+        returned to the allocator immediately, rather than waiting for the
+        Python garbage collector.
+        """
+        _gpu_attrs = [
+            k for k, v in list(self.__dict__.items())
+            if torch.is_tensor(v) and v.is_cuda
+        ]
+        for _attr in _gpu_attrs:
+            if hasattr(self, _attr):
+                delattr(self, _attr)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def __del__(self):
+        try:
+            self.release_gpu_memory()
+        except Exception:
+            pass
+
     @classmethod
     def from_params(cls, V, I, device='cuda'):
         """
@@ -152,6 +175,10 @@ class PackBoost(BaseEstimator, RegressorMixin):
             reductions on already-resident tensors).
         """
         assert X.dtype == np.int8 and y.dtype == np.float32
+
+        # ---------- release GPU state from any previous fit() call ----------
+        self.release_gpu_memory()
+
         device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
         encode_device = torch.device(
             encode_cut_device if (encode_cut_device != "cuda" or torch.cuda.is_available()) else "cpu"
