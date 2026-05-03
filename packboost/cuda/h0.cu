@@ -197,8 +197,8 @@ __global__ void _h0_sm_butterfly(
             if (d > 0) lk >>= d;
             const int node = to + tk;  // 0..used_nodes-1
 
-            s_hist[SH_idx(node, 0, lane)] += g;   // sum(G)
-            s_hist[SH_idx(node, 1, lane)] += w;   // sum(W)
+            s_hist[SH_idx(node, 0, lane)] += g * w;   // sum(W*G)
+            s_hist[SH_idx(node, 1, lane)] += w;       // sum(W)
         }
     }
 
