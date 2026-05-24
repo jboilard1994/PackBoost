@@ -143,7 +143,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         era_ends = torch.from_numpy(ends_np).to(device=device, dtype=torch.int32).contiguous()
 
         # ---------- encode_cuts(X) ----------
-        X_t = torch.from_numpy(X).to(device=encode_device, dtype=torch.int8)
+        X_t = torch.from_numpy(X)
         XB  = self.encode_cuts(X_t).contiguous().to(device=device)              # [4F, M] uint32
         bF, M = XB.shape
         Np = 32 * M
@@ -212,7 +212,7 @@ class PackBoost(BaseEstimator, RegressorMixin):
         if use_val:
             assert Xv.dtype == np.int8 and Yv.dtype == np.float32
             Nv = int(Xv.shape[0]); self.val_N = Nv
-            Xv_t = torch.from_numpy(Xv).to(device=encode_device, dtype=torch.int8)
+            Xv_t = torch.from_numpy(Xv)
             XBv  = self.encode_cuts(Xv_t).contiguous().to(device=device)
             Pv   = torch.zeros(Nv, dtype=torch.int32, device=device)
             yvq30  = (Yv * (1 << 30)).astype(np.int64)
@@ -344,12 +344,11 @@ class PackBoost(BaseEstimator, RegressorMixin):
         device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
         if isinstance(X, np.ndarray):
             assert X.dtype == np.int8, "X must be int8"
-            X_t = torch.from_numpy(X).to(device=device, dtype=torch.int8)
+            X_t = torch.from_numpy(X)
             return_numpy = True
         else:
-            # torch path
             assert torch.is_tensor(X) and X.dtype == torch.int8, "X must be torch.int8"
-            X_t = X.to(device=device, dtype=torch.int8, copy=False)
+            X_t = X.contiguous()
             return_numpy = False
 
         N = X_t.shape[0]
@@ -387,10 +386,37 @@ class PackBoost(BaseEstimator, RegressorMixin):
 
     
     def encode_cuts(self, X: torch.Tensor) -> torch.Tensor:
-        # X: [N, F], int8 expected
-        if X.device.type != 'cpu' and torch.cuda.is_available():
-            return kernels.encode_cuts(X.contiguous())
 
+        # Chunked GPU path: X lives on CPU -> stream chunks to GPU.
+        if self.device == 'cuda':
+            N, F = X.shape
+            M = (N + 31) // 32
+            target = torch.device('cuda')
+
+            # Allocate the full output on GPU exactly once.
+            XB = torch.empty((4 * F, M), dtype=torch.uint32, device=target)
+
+            CHUNK = 102_400  # 32 * 3200; ~100k samples, divisible by 32
+            assert CHUNK % 32 == 0, "CHUNK must be a multiple of 32 for bit-packing alignment"
+
+            for start in range(0, N, CHUNK):
+                end = min(start + CHUNK, N)
+                # Move only this slice to the GPU. Because start is always a
+                # multiple of 32 (CHUNK % 32 == 0), the corresponding output
+                # word offset is simply start // 32 -- no cross-chunk word
+                # straddling.
+                x_chunk = X[start:end].to(
+                    device=target, dtype=torch.int8, non_blocking=True
+                ).contiguous()
+                xb_chunk = kernels.encode_cuts(x_chunk)  # [4F, m_chunk] uint32
+                m_start = start // 32
+                m_end = m_start + xb_chunk.shape[1]
+                XB[:, m_start:m_end].copy_(xb_chunk)
+                del x_chunk, xb_chunk
+
+            return XB
+
+        # ---------- CPU-only fallback (unchanged) ----------
         N, F = X.shape
         M = (N + 31) // 32
         Np = M * 32
